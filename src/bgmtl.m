@@ -132,6 +132,8 @@ bg_ctx_init(void)
    pthread_mutexattr_t a;
    pthread_mutexattr_init(&a);
    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+   // jasmine: fair hand-off, so CoreAnimation's thread gets the context between the replay worker's work items (commit)
+   pthread_mutexattr_setpolicy_np(&a, PTHREAD_MUTEX_POLICY_FAIRSHARE_NP);
    pthread_mutex_init(&bg_ctx_mutex, &a);
    pthread_mutexattr_destroy(&a);
 }
@@ -329,6 +331,7 @@ bg_install_fallback(Class c)
    NSInteger _status;
    NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
    dispatch_group_t _done;                                 // left when the completion (fence) has run: waitUntilCompleted
+   dispatch_group_t _sched;                                // left when the replay has submitted: waitUntilScheduled
    uint64_t _tgen[8], _tepoch[8];                          // jasmine: render tickets opened for this command buffer
    uint32_t _tsurf[8];
    unsigned _tcount;
@@ -1015,6 +1018,7 @@ bg_air_slice(NSData *d)
    _scheduled = [[NSMutableArray alloc] init];
    _presents = [[NSMutableArray alloc] init];
    _done = dispatch_group_create();
+   _sched = dispatch_group_create();
    _status = 1;   // MTLCommandBufferStatusEnqueued
    if (bg_timing()) bg_tm(BG_TM_CREATE, 0, 0, 0);
    return self;
@@ -1029,6 +1033,7 @@ bg_air_slice(NSData *d)
    }
    [_queue release]; [_work release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
    if (_done) dispatch_release(_done);
+   if (_sched) dispatch_release(_sched);
    [super dealloc];
 }
 /* jasmine: a render ticket (kernel j0110) for each IOSurface this command buffer draws into, opened when the pass is
@@ -1062,7 +1067,9 @@ bg_air_slice(NSData *d)
 - (void)addScheduledHandler:(void (^)(id))block
 {
    if (!block) return;
-   if (_status >= 3) block(self); else [_scheduled addObject:[[block copy] autorelease]];   // delivered when submitted (compositor: when finished)
+   BOOL now;
+   @synchronized (self) { now = _status >= 3; if (!now) [_scheduled addObject:[[block copy] autorelease]]; }   // delivered when submitted (compositor: when finished)
+   if (now) block(self);
 }
 - (void)presentDrawable:(id)drawable { if (drawable) [_presents addObject:@[ drawable, @0.0, @0.0 ]]; }
 - (void)presentDrawable:(id)drawable atTime:(CFTimeInterval)t { if (drawable) [_presents addObject:@[ drawable, @(t), @0.0 ]]; }
@@ -1070,12 +1077,15 @@ bg_air_slice(NSData *d)
 - (void)addCompletedHandler:(void (^)(id))block
 {
    if (!block) return;
-   if (_status >= 4) block(self); else [_completed addObject:[[block copy] autorelease]];
+   BOOL now;
+   @synchronized (self) { now = _status >= 4; if (!now) [_completed addObject:[[block copy] autorelease]]; }
+   if (now) block(self);
 }
 - (void)waitUntilScheduled
 {
    uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    if (_status >= 2 && getenv("BGMTL_BB") && bg_defer_scheduled()) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+   else if (_status >= 2) dispatch_group_wait(_sched, DISPATCH_TIME_FOREVER);   // the replay worker submitted it (commit)
    if (bg_timing()) bg_tm(BG_TM_WAITS, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t, 0, 0);
 }
 
@@ -1114,7 +1124,7 @@ bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_s
    BG_LOG("command buffer failed: %s\n", [why UTF8String]);
    bgmtl_note_failure([why UTF8String]);   // the injection dylib counts these (its dead-man)
    _error = [[NSError errorWithDomain:@"BGMTL" code:code userInfo:@{ NSLocalizedDescriptionKey : why }] retain];
-   _status = 5;   // MTLCommandBufferStatusError
+   @synchronized (self) { _status = 5; }   // MTLCommandBufferStatusError
 }
 
 // texture blits run on the CPU through the textures' own read/write paths (shared memory; everything before it is finished).
@@ -1229,13 +1239,54 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
    os_unfair_lock_unlock(&l);
 }
 
+// jasmine: the recorded work is replayed into Mesa on one serial queue, in commit order, rather than on the committing
+// thread, as Metal's commit is asynchronous and GL's glthread does for the same driver: CoreAnimation's render thread
+// did its own frame and then all of the driver's work for it (step 7: on GL its driver work runs on gdrv0, and the
+// render thread is 61 % QuartzCore; on Metal ours was 1.3-1.5x QuartzCore's time on that thread). In the compositor
+// only (BGMTL_BB); BGMTL_ASYNC=0 replays inline, as tracing and BGMTL_SYNC do.
+static int
+bg_async_replay(void)
+{
+   static int on = -1;
+   if (on < 0) on = getenv("BGMTL_BB") && !(getenv("BGMTL_ASYNC") && getenv("BGMTL_ASYNC")[0] == '0');
+   return on;
+}
+static int
+bg_sync_commit(void)
+{
+   static int sync_commit = -1;     // BGMTL_SYNC=1 (the inject sets it when /private/var/tmp/bgmtl-bb.sync exists): wait inline, as before
+   if (sync_commit < 0)   // or /private/var/tmp/bgmtl.sync for every process (posters, plugin clients) launchd starts
+      sync_commit = (getenv("BGMTL_SYNC") && getenv("BGMTL_SYNC")[0] == '1') || access("/private/var/tmp/bgmtl.sync", F_OK) == 0;
+   return sync_commit;
+}
 - (void)commit
 {
    bgmtl_note_committed();
-   BG_TRACE("commit: %lu recorded commands\n", (unsigned long)[_work count]);
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   @synchronized (self) { _status = 2; }   // Committed
+   dispatch_group_enter(_done);
+   dispatch_group_enter(_sched);
+   if (bg_async_replay() && !bg_trace() && !bg_sync_commit()) {
+      static dispatch_queue_t replay;
+      static dispatch_once_t once;
+      dispatch_once(&once, ^{
+         replay = dispatch_queue_create("chlorophyll.replay",
+                                        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+      });
+      [self retain];
+      dispatch_async(replay, ^{
+         @autoreleasepool { [self bgReplayFrom:t_begin]; }
+         [self release];
+      });
+      return;
+   }
+   [self bgReplayFrom:t_begin];
+}
+- (void)bgReplayFrom:(uint64_t)t_begin
+{
+   BG_TRACE("commit: %lu recorded commands\n", (unsigned long)[_work count]);
+   uint64_t t_replay = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
-   _status = 2;   // Committed
    char why[512] = { 0 };
    bg_lock();
    bg_refresh_epoch = ++bg_refresh_epochs;
@@ -1247,7 +1298,9 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
       } else if ([w->dst isKindOfClass:[BGMTLTexture class]])
          [(BGMTLTexture *)w->dst bgShadowLocked];
    }
+   int async = bg_async_replay();
    for (BGWork *w in _work) {
+      if (async) { bg_unlock(); bg_lock(); }   // let the encoding thread in (bg_ctx_init: fair hand-off)
       if (w->kind == BG_WORK_DISPATCH) {
          struct rwa_buffer *bufs[BG_MAX_BINDINGS] = { NULL };
          struct rwa_buffer_bind table[BG_MAX_BINDINGS] = { { NULL, 0 } };
@@ -1399,7 +1452,6 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
    // completed handlers), in submission order. BGMTL_TRACE keeps it synchronous: the trace reads attachments back through the
    // drawing context, which belongs to the encoding thread.
    bg_refresh_epoch = 0;
-   dispatch_group_enter(_done);
    // In the compositor "scheduled" is reported only when the GPU has FINISHED: the render server hands a framebuffer to the
    // display from the scheduled notification / waitUntilScheduled, and this display path has no GPU write fence on the surface,
    // so an earlier notice let the panel scan a half-drawn buffer (its previous frame showed: motion stepping back and forth).
@@ -1408,8 +1460,7 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
    // passed (step 7 r16: no tearing without the deferral). Deferring here made the render server wait for the GPU before
    // every swap, so the next frame's encoding could not overlap the GPU at all.
    int defer_scheduled = bg_defer_scheduled();
-   if (_status != 5 && !defer_scheduled)
-      _status = 3;   // Scheduled
+   @synchronized (self) { if (_status != 5 && !defer_scheduled) _status = 3; }   // Scheduled
    struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
    if (_tcount) {   // jasmine: seal this command buffer's render tickets with its submit (bgTicketFor)
       uint32_t seqno = fence ? rwa_fence_seqno([dev rwa], fence) : 0;
@@ -1419,18 +1470,14 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
    }
    uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    bg_unlock();
-   if (!defer_scheduled) {
-      for (void (^h)(id) in _scheduled) h(self);
-      [_scheduled removeAllObjects];
-   }
-   static int sync_commit = -1;     // BGMTL_SYNC=1 (the inject sets it when /private/var/tmp/bgmtl-bb.sync exists): wait inline, as before
-   if (sync_commit < 0)   // or /private/var/tmp/bgmtl.sync for every process (posters, plugin clients) launchd starts
-      sync_commit = (getenv("BGMTL_SYNC") && getenv("BGMTL_SYNC")[0] == '1') || access("/private/var/tmp/bgmtl.sync", F_OK) == 0;
-   if (bg_trace() || sync_commit || _status == 5) {
+   dispatch_group_leave(_sched);
+   if (!defer_scheduled)
+      for (void (^h)(id) in [self bgTake:_scheduled]) h(self);
+   if (bg_trace() || bg_sync_commit() || _status == 5) {
       if (_status != 5 && bg_fence_wait(dev, fence, why, sizeof(why)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5)
-         _status = 4;
+         @synchronized (self) { _status = 4; }
       {
          unsigned nd = 0;
          for (BGWork *w in _work)
@@ -1442,7 +1489,7 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
       dispatch_group_leave(_done);
       return;
    }
-   if (bg_timing()) bg_tm(BG_TM_COMMIT, t_begin, clock_gettime_nsec_np(CLOCK_MONOTONIC), 0);
+   if (bg_timing()) bg_tm(BG_TM_COMMIT, t_replay, clock_gettime_nsec_np(CLOCK_MONOTONIC), 0);
    static dispatch_queue_t completion;
    static dispatch_once_t once;
    dispatch_once(&once, ^{ completion = dispatch_queue_create("chlorophyll.completion", DISPATCH_QUEUE_SERIAL); });
@@ -1452,7 +1499,7 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
       if (bg_fence_wait(dev, fence, w2, sizeof(w2)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:w2] code:3];
       else
-         _status = 4;   // Completed: the fence has been paid
+         @synchronized (self) { _status = 4; }   // Completed: the fence has been paid
       uint64_t t_fence = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       rwa_fence_release([dev rwa], fence);
       [self bgCompleteFrom:t_begin];
@@ -1467,8 +1514,7 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
 {
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    (void)dev;
-   for (void (^h)(id) in _scheduled) h(self);    // left here by the compositor's deferral (see commit)
-   [_scheduled removeAllObjects];
+   for (void (^h)(id) in [self bgTake:_scheduled]) h(self);    // left here by the compositor's deferral (see commit)
    // what the GPU wrote into an IOSurface becomes visible to the compositor before the drawable is presented
    // In the compositor (backboardd, BGMTL_BB) the IOSurfaces drawn into are its own framebuffers: the GPU writes DRAM, the display
    // reads DRAM, the CPU never touches them, so neither the cache clean nor the seed bump below is needed -- and each was a kernel
@@ -1603,8 +1649,14 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
       }
    }
    [_presents removeAllObjects];
-   for (void (^h)(id) in _completed) h(self);
-   [_completed removeAllObjects];
+   for (void (^h)(id) in [self bgTake:_completed]) h(self);
+}
+// The handlers of a list, taken out of it under the lock addScheduledHandler: / addCompletedHandler: use.
+- (NSArray *)bgTake:(NSMutableArray *)list
+{
+   NSArray *a;
+   @synchronized (self) { a = [[list copy] autorelease]; [list removeAllObjects]; }
+   return a;
 }
 
 - (void)waitUntilCompleted
