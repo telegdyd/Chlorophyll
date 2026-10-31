@@ -122,17 +122,55 @@ main(int argc, char **argv)
    printf("NIR OK: %s stage=%s constants=%u (zero defaults)\n",
           info.entry_point, mesa_shader_stage_name(nir->info.stage), count);
    fflush(stdout);
-   if (gpu < 600 && nir->info.stage == MESA_SHADER_FRAGMENT &&
-       nir->info.fs.uses_fbfetch_output) {
-      fprintf(stderr, "ir3 FAIL: a5xx framebuffer fetch requires attachment-texture lowering\n");
-      goto done;
+   /* jasmine: from here on the same steps as the runtime (air_metal.c) on a
+    * freedreno screen, so a function compiles here exactly when the device would
+    * compile it: rwa_render_create's a5xx lowerings, compute_state_for's fixed
+    * threadgroup, finalize_for_gallium (fs_position_is_sysval: only the shared
+    * passes), then freedreno's ir3_shader_state_create, which runs no
+    * ir3_finalize_nir, and the initial variant with a zero key. */
+   if (gpu < 600 && nir->info.stage == MESA_SHADER_FRAGMENT && info.fbfetch_targets) {
+      unsigned units[4];
+      int read = air_nir_lower_attachment_reads(nir, 16, units);
+      if (read < 0) {
+         fprintf(stderr, "ir3 FAIL: a5xx attachment feedback supports color targets 0..3, each on a "
+                         "texture/sampler unit the shader leaves free\n");
+         goto done;
+      }
+      printf("a5xx: attachment reads of targets 0x%x lowered to texture units", (unsigned)read);
+      for (unsigned i = 0; i < 4; i++)
+         if (read & (1 << i))
+            printf(" %u", units[i]);
+      printf("\n");
    }
-   NIR_PASS(_, nir, nir_lower_system_values);
-   NIR_PASS(_, nir, nir_lower_compute_system_values, NULL);
-   ir3_nir_lower_io_vars_to_temporaries(nir);
-   ir3_nir_lower_io(nir);
-   ir3_finalize_nir(compiler, &(struct ir3_shader_nir_options){}, nir);
-   shader = ir3_shader_from_nir(compiler, nir, &(struct ir3_shader_options){});
+   if (gpu < 600 && nir->info.stage == MESA_SHADER_VERTEX) {
+      unsigned ubos = nir->info.num_ubos;
+      for (unsigned i = 0; i < info.num_resources; i++) {
+         const struct air_resource *r = &info.resources[i];
+         if (r->kind != AIR_RESOURCE_DEVICE_BUFFER)
+            continue;
+         if (r->write && air_nir_writes_ssbo(nir, r->index)) {
+            fprintf(stderr, "ir3 FAIL: a5xx vertex device buffer %u cannot be represented as a read-only UBO\n",
+                    r->index);
+            goto done;
+         }
+         ubos = MAX2(ubos, r->index + 1);
+      }
+      air_nir_lower_vertex_ssbo_to_ubo(nir);
+      nir->info.num_ssbos = 0;
+      nir->info.num_ubos = ubos;
+   }
+   if (nir->info.stage == MESA_SHADER_COMPUTE) {
+      /* Metal's threadgroup size is a dispatch argument; the runtime compiles per
+       * size. 8x8x1 stands in for the device's choice (a512 allows 512 threads). */
+      nir->info.workgroup_size[0] = nir->info.workgroup_size[1] = 8;
+      nir->info.workgroup_size[2] = 1;
+      nir->info.workgroup_size_variable = false;
+   }
+   air_nir_lower_for_gallium(nir);
+   shader = ir3_shader_from_nir(compiler, nir, &(struct ir3_shader_options){
+      .api_wavesize = IR3_SINGLE_OR_DOUBLE, .real_wavesize = IR3_SINGLE_OR_DOUBLE,
+   });
+   shader->cs.req_local_mem = nir->info.shared_size;
    struct ir3_shader_variant *variant = ir3_shader_get_variant(
       shader, &(struct ir3_shader_key){}, false, true, NULL, NULL);
    if (!variant) {

@@ -68,6 +68,15 @@ enum air_val_kind {
     */
    AIR_VAL_PTR_SELECT,
 
+   /* jasmine: a LOCAL HOLDING ONE POINTER, kept at translation time: .elems[0]
+    * is what was stored (NULL before the store), .num_elems how many stores,
+    * .fnv a constant pointer initializer (a constant program-scope global such
+    * as QuartzCore's `unused_sampler`, a metal::sampler wrapping the address of
+    * an inline sampler state). Sound only for a single store in the entry
+    * block, which is what translate_instruction accepts.
+    */
+   AIR_VAL_SLOT,
+
    /* Bergamota: function pointers (Mercury's shippou kernels keep their materials in a `[4 x ptr]` local filled with function addresses and call
     * through it). A function address is AIR_VAL_FUNC (.fnv); the table is AIR_VAL_FTABLE (.table); an element of it, with a constant or run-time
     * index (.def, NULL when constant: .num_elems), is AIR_VAL_FTABLE_ELEM; a load of an element with a run-time index is AIR_VAL_FUNC_SELECT. A call
@@ -154,6 +163,7 @@ struct air_ctx {
    struct hash_table *sc_known;  /* program-scope global -> struct sc_val, after the static initializers ran */
    bool sc_known_ok;
    unsigned pk_used[2];   /* varying packing: components used in the last slot, [0] fragment inputs, [1] vertex outputs */
+   unsigned cur_block;    /* jasmine: the AIR block being translated (0 = the entry block), for AIR_VAL_SLOT */
    /* Where this function's constants are built: the top of its entry block,
     * which dominates every use of them. air_get caches a constant the first
     * time it is asked for, so the def has to be somewhere every later block
@@ -209,6 +219,7 @@ struct air_ctx {
       unsigned offset;      /* bytes, when has_offset */
       bool has_offset;
       bool skip;            /* llvm.* lists, and anything that failed */
+      bool slot;            /* jasmine: a constant global holding one pointer (AIR_VAL_SLOT) */
    } *global_plan;
 
    /* what the entry point's parameters are */

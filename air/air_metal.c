@@ -411,18 +411,6 @@ say(char *why, size_t why_size, const char *fmt, ...)
    va_end(ap);
 }
 
-/* What a Gallium driver expects of a shader it is handed: NIR's own system values
- * lowered to the hardware's, and I/O as intrinsics rather than variables. This is
- * air_run.c's finalize_for_gallium, and the same three passes are in
- * tools/mesa/air-ir3.patch; a fourth copy would be the point at which they should
- * become one function of the frontend.
- */
-static unsigned
-type_size_vec4(const struct glsl_type *type, bool bindless)
-{
-   return glsl_count_attribute_slots(type, false);
-}
-
 /* Bergamota: softpipe's texture instruction (nir_to_tgsi) has ONE unit for the view and the sampler, `sampler_index`; texture(3) with
  * sampler(0) therefore samples view 0. For such a screen the instruction is made to use the texture's own index, and bind_stage binds the
  * paired sampler there (air_shader_info.tex_sampler). The Adreno has separate indices and needs none of this.
@@ -440,51 +428,8 @@ lower_tex_unit_cb(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
-/* jasmine: a5xx Gallium has no VS SSBO bindings. Read-only vertex buffers
- * can use UBO loads; writes remain refused, and bindings are bounded below. */
-static bool
-vertex_ssbo_to_ubo(nir_builder *b, nir_intrinsic_instr *in, void *data)
-{
-   (void)data;
-   if (in->intrinsic != nir_intrinsic_load_ssbo)
-      return false;
-   b->cursor = nir_before_instr(&in->instr);
-   nir_def *v = nir_load_ubo(b, in->def.num_components, in->def.bit_size,
-                           in->src[0].ssa, in->src[1].ssa,
-                           .align_mul = nir_intrinsic_align_mul(in),
-                           .align_offset = nir_intrinsic_align_offset(in),
-                           .range_base = 0, .range = ~0u);
-   nir_def_rewrite_uses(&in->def, v);
-   nir_instr_remove(&in->instr);
-   return true;
-}
-
-/* jasmine: a5xx attachment reads use reserved texture units 12..15. */
-static bool
-lower_attachment_read(nir_builder *b, nir_intrinsic_instr *in, void *data)
-{
-   (void)data;
-   if (in->intrinsic != nir_intrinsic_load_output ||
-       !nir_intrinsic_io_semantics(in).fb_fetch_output) return false;
-   unsigned target = nir_intrinsic_io_semantics(in).location - FRAG_RESULT_DATA0;
-   b->cursor = nir_before_instr(&in->instr);
-   nir_def *pos = nir_f2i32(b, nir_channels(b, nir_load_frag_coord(b), 3));
-   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 2);
-   tex->op = nir_texop_txf;
-   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
-   tex->dest_type = nir_type_float32;
-   tex->coord_components = 2;
-   tex->texture_index = tex->sampler_index = 12 + target;
-   tex->src[0].src_type = nir_tex_src_coord;
-   tex->src[0].src = nir_src_for_ssa(pos);
-   tex->src[1].src_type = nir_tex_src_lod;
-   tex->src[1].src = nir_src_for_ssa(nir_imm_int(b, 0));
-   nir_def_init(&tex->instr, &tex->def, 4, 32);
-   nir_builder_instr_insert(b, &tex->instr);
-   nir_def_rewrite_uses(&in->def, &tex->def);
-   nir_instr_remove(&in->instr);
-   return true;
-}
+/* jasmine: the a5xx lowerings (vertex SSBO -> UBO, attachment reads) are in
+ * air_lower.c, shared with the offline compiler air2ir3. */
 
 static void
 finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
@@ -511,41 +456,9 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
                var->data.driver_location = nir->num_inputs++;
       }
    }
-   NIR_PASS(_, nir, nir_lower_system_values);
-   /* An options struct of all-false and not NULL, which are not the same thing here and
-    * the difference is a trap. nir_lower_system_values *introduces*
-    * load_base_workgroup_id when it lowers SYSTEM_VALUE_WORKGROUP_ID, and the only
-    * thing that removes it again is
-    *
-    *     if (options && !options->has_base_workgroup_id)
-    *        return nir_imm_zero(...);
-    *
-    * so NULL reads as "the driver has base workgroup ids" -- the opposite of what is
-    * wanted -- and the intrinsic survives into the backend. With softpipe that is an
-    * assertion in nir_to_tgsi rather than a message, and it stopped every kernel that
-    * asks for its workgroup id. Zero is also the right answer here: rwa_dispatch
-    * launches its grid from the origin, as Metal's own dispatch does.
-    */
-   static const nir_lower_compute_system_values_options cs_options = { 0 };
-   NIR_PASS(_, nir, nir_lower_compute_system_values, &cs_options);
-   /*
-    * nir_lower_io_use_interpolated_input_intrinsics, and WITHOUT it every varying this
-    * library drew was FLAT on the Adreno while softpipe interpolated it -- the mistake
-    * that looked like a vertically flipped picture for three boots (docs/metal.md 10.26,
-    * 10.32). Mesa's own comment on the flag says why: without it nir_lower_io "generates
-    * regular load_input intrinsics and interpolation information must be inferred from
-    * the list of input nir_variables", and the two consumers infer it from different
-    * places. nir_to_tgsi reads each FS input's variable (INTERP_MODE_SMOOTH, as the
-    * frontend sets it); ir3's setup_input does `so->inputs[n].flat = !coord` and builds
-    * `coord` only for load_interpolated_input, so a plain load_input is flat.
-    *
-    * Nothing caught it because the only draws whose varying VARIES are Apple's
-    * texturedVertex2D/3D feeding texturedFragment*: the generated vertex stage hands
-    * every vertex the same texture coordinate (RWA_TEX_* below), and over a constant
-    * flat and smooth are the same number.
-    */
-   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
-            type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
+   /* jasmine: the system-value and I/O lowering every Gallium driver needs is in
+    * air_lower.c (air_nir_lower_for_gallium), shared with air2ir3. */
+   air_nir_lower_for_gallium(nir);
 }
 
 struct rwa_device *
@@ -5745,6 +5658,7 @@ struct rwa_render {
 
    struct air_shader_info finfo;
    struct air_shader_info vinfo;      /* valid only when a vertex module was supplied */
+   unsigned fbfetch_unit[4];          /* jasmine: the unit each attachment read samples on a5xx */
    bool generated_vertex;
 
    struct rwa_render_shape shape;
@@ -6820,26 +6734,20 @@ rwa_render_create(struct rwa_device *device,
       goto fail;
    }
    if (render->finfo.fbfetch_targets && !device->screen->caps.fbfetch) {
-      if (samples != 1 || (render->finfo.fbfetch_targets & ~15u)) {
+      const struct pipe_shader_caps *fcaps = &device->screen->shader_caps[MESA_SHADER_FRAGMENT];
+      unsigned units = MIN3(fcaps->max_sampler_views, fcaps->max_texture_samplers, RWA_MAX_TEXTURES);
+      int read = air_nir_lower_attachment_reads(fs, units, render->fbfetch_unit);
+      if (read < 0) {
+         say(why, why_size, "a5xx attachment feedback supports color targets 0..3, each on a "
+                            "texture/sampler unit the shader leaves free");
+         goto fail;
+      }
+      if (read && samples != 1) {
          say(why, why_size, "a5xx attachment feedback supports single-sample color targets 0..3");
          goto fail;
       }
-      for (unsigned i = 0; i < render->finfo.num_resources; i++) {
-         const struct air_resource *r = &render->finfo.resources[i];
-         if ((r->kind == AIR_RESOURCE_TEXTURE || r->kind == AIR_RESOURCE_SAMPLER) && r->index >= 12) {
-            say(why, why_size, "attachment feedback reserves texture/sampler units 12..15");
-            goto fail;
-         }
-      }
-      nir_shader_intrinsics_pass(fs, lower_attachment_read, nir_metadata_control_flow, NULL);
-      fs->info.fs.uses_fbfetch_output = false;
-      fs->info.fs.fbfetch_coherent = false;
-      for (unsigned i = 0; i < 4; i++)
-         if (render->finfo.fbfetch_targets & (1u << i)) {
-            fs->info.outputs_read &= ~BITFIELD64_BIT(FRAG_RESULT_DATA0 + i);
-            BITSET_SET(fs->info.textures_used, 12 + i);
-            BITSET_SET(fs->info.samplers_used, 12 + i);
-         }
+      /* only what is read: reads the function constants removed need no barrier */
+      render->finfo.fbfetch_targets = (unsigned)read;
    }
    slot_shapes(fs, render->frag_slots, render->frag_compare_sampler);
    count_resources(&render->finfo, render->frag_slots, &out.fragment_buffers,
@@ -6939,7 +6847,9 @@ rwa_render_create(struct rwa_device *device,
          for (unsigned i = 0; i < render->vinfo.num_resources; i++) {
             struct air_resource *r = &render->vinfo.resources[i];
             if (r->kind != AIR_RESOURCE_DEVICE_BUFFER) continue;
-            if (r->write || r->index >= device->screen->shader_caps[MESA_SHADER_VERTEX].max_const_buffers) {
+            /* declared read_write is not written: CA's fixed_vert_*_gen only read buffer 1 */
+            if ((r->write && air_nir_writes_ssbo(vs, r->index)) ||
+                r->index >= device->screen->shader_caps[MESA_SHADER_VERTEX].max_const_buffers) {
                say(why, why_size, "a5xx vertex device buffer %u cannot be represented as a read-only UBO", r->index);
                goto fail;
             }
@@ -6947,7 +6857,7 @@ rwa_render_create(struct rwa_device *device,
             r->jasmine_vertex_ubo = true;
             ubos = MAX2(ubos, r->index + 1);
          }
-         nir_shader_intrinsics_pass(vs, vertex_ssbo_to_ubo, nir_metadata_control_flow, NULL);
+         air_nir_lower_vertex_ssbo_to_ubo(vs);
          vs->info.num_ssbos = 0;
          vs->info.num_ubos = ubos;
       }
@@ -7929,7 +7839,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 
    if (render->finfo.fbfetch_targets && !device->screen->caps.fbfetch) {
       /* After clear and every preceding draw: use the same a5xx sysmem feedback
-       * barrier as sweetca. Keep the binding cache in sync with these reserved slots. */
+       * barrier as sweetca. Keep the binding cache in sync with these units (free in
+       * this shader, air_nir_lower_attachment_reads). */
       for (unsigned i = 0; i < 4; i++) {
          if (!(render->finfo.fbfetch_targets & (1u << i))) continue;
          struct rwa_texture *t = i < draw->color_count ? draw->color[i] : NULL;
@@ -7944,7 +7855,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          }
          void *sampler = default_sampler(device);
          if (!t->view || !sampler) { say(why, why_size, "attachment feedback view failed"); goto unbind; }
-         unsigned unit = 12 + i;
+         unsigned unit = render->fbfetch_unit[i];
          pipe->set_sampler_views(pipe, MESA_SHADER_FRAGMENT, unit, 1, 0, &t->view);
          pipe->bind_sampler_states(pipe, MESA_SHADER_FRAGMENT, unit, 1, &sampler);
          device->bound_views[MESA_SHADER_FRAGMENT][unit] = t->view;

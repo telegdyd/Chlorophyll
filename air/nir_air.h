@@ -414,6 +414,20 @@ unsigned air_module_function_constants(void *mem_ctx, const void *bitcode, size_
 int air_module_stage(void *mem_ctx, const void *bitcode, size_t size, const char **calls,
                      const char **error);
 
+/* jasmine (air_lower.c): lowerings for screens without framebuffer fetch
+ * or vertex-stage SSBOs. Attachment reads become texel fetches of a texture/sampler
+ * unit below num_units that no texture instruction uses, units[n] for color target
+ * n, which the caller binds. Returns the targets read (0 when none survived the
+ * function constants), or -1 for a target above 3 or no free unit. */
+int air_nir_lower_attachment_reads(nir_shader *fs, unsigned num_units, unsigned units[4]);
+bool air_nir_lower_vertex_ssbo_to_ubo(nir_shader *vs);
+/* Whether the shader writes SSBO index (or one chosen at run time): a buffer Metal
+ * declares read_write that the shader only reads can still become a UBO. */
+bool air_nir_writes_ssbo(nir_shader *nir, unsigned index);
+/* The system-value and I/O lowering a Gallium driver expects of a NIR shader,
+ * with image loads marked so ir3 reads them correctly on a5xx. */
+void air_nir_lower_for_gallium(nir_shader *nir);
+
 #ifdef __cplusplus
 }
 #endif

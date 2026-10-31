@@ -9,6 +9,7 @@ files_libair = files(
   'air_bitcode.c',
   'air_bitcode.h',
   'air_layout.c',
+  'air_lower.c',
   'air_metallib.c',
   'air_module.c',
   'air_module.h',

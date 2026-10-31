@@ -143,6 +143,25 @@ is_signed_part(const char *s)
  * single disagreement with this machine's libm has |x/y| >= 2^24, and over
  * 376 438 random pairs whose quotient IS representable there is none.
  */
+/* jasmine: a multiply-add for Mesa 26, which split NIR's one opcode in two:
+ * ffma is now always fused (a single rounding) and ffma_weak "either fused or
+ * unfused", which is what nir_ffma meant when this frontend was written against
+ * Mesa 25 (a backend without a fused multiply-add lowered it). ir3 has none
+ * (float_mul_add32 is fmad), so on Mesa 26 every ffma reached its emitter and
+ * was refused there ("Unhandled ALU op: ffma"; QuartzCore's downsample shaders).
+ * `fused` asks for the single rounding: kept wherever the GPU has a fused
+ * multiply-add, and on one that has not (Adreno 5xx) the weak form -- the one
+ * answer such a GPU gives short of emulating fma in software, and the one a
+ * GLSL multiply-add gets on it.
+ */
+static nir_def *
+air_ffma(nir_builder *b, nir_def *x, nir_def *y, nir_def *z, bool fused)
+{
+   if (fused && nir_has_ffma(b->shader, x->bit_size))
+      return nir_ffma(b, x, y, z);
+   return nir_ffma_weak(b, x, y, z);
+}
+
 static nir_def *
 air_fmod(nir_builder *b, nir_def *x, nir_def *y)
 {
@@ -159,7 +178,7 @@ air_fmod(nir_builder *b, nir_def *x, nir_def *y)
    nir_def *y_as_x = nir_ior(b, ay, sx);              /* copysign(|y|, x) */
 
    nir_def *q = nir_ftrunc(b, nir_fdiv(b, x, y));
-   nir_def *r = nir_ffma(b, nir_fneg(b, y), q, x);
+   nir_def *r = air_ffma(b, nir_fneg(b, y), q, x, true);
 
    /* |r| >= |y|: the quotient was one too small. A NaN fails this comparison
     * (an ordered fge is false for one) and fails the feq against zero at the
@@ -472,7 +491,8 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "fast_ldexp") || !strcmp(op, "ldexp")) {
       r = nir_ldexp(&c->b, a[0], nir_i2i32(&c->b, a[1]));
    } else if (!strcmp(op, "fast_fma") || !strcmp(op, "fma") || !strcmp(op, "mad")) {
-      r = nir_ffma(&c->b, a[0], a[1], a[2]);
+      /* jasmine: only the precise fma asks for one rounding */
+      r = air_ffma(&c->b, a[0], a[1], a[2], !strcmp(op, "fma"));
    } else if (!strcmp(op, "abs")) {
       r = is_float ? nir_fabs(&c->b, a[0]) : nir_iabs(&c->b, a[0]);
    } else if (!strcmp(op, "abs_diff")) {
@@ -1152,6 +1172,9 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
     * first and its interpreter does -- which is why tools/air/intrincheck.py
     * sets air.fma aside on softpipe and leaves it to the phone. The same
     * applies to every llvm.fmuladd this translates.
+    *
+    * jasmine: on Mesa 26 that is nir_ffma_weak (air_ffma), since nir_ffma
+    * there is fused by definition and no backend lowers it any more.
     */
    if (!strncmp(name, "llvm.fmuladd.", 13)) {
       nir_def *a = air_get_ssa(c, in->operands[1]);
@@ -1159,7 +1182,7 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       nir_def *d = air_get_ssa(c, in->operands[3]);
       if (!a || !b || !d)
          return false;
-      air_set(c, &in->base, air_val_ssa(c, nir_ffma(&c->b, a, b, d)));
+      air_set(c, &in->base, air_val_ssa(c, air_ffma(&c->b, a, b, d, false)));   /* jasmine: may be fused: ffma_weak */
       return true;
    }
    if (!strncmp(name, "llvm.fabs.", 10)) {
@@ -1660,6 +1683,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
       if (!coord)
          return false;
+      /* jasmine: a write returns nothing, so its type is the value's, not the
+       * call's (which made every write a 0-bit "uint" store) */
+      nir_alu_type src_type = tex_dest_type(c, in->operands[arg]->type, n);
       nir_def *value = air_get_ssa(c, in->operands[arg++]);
       if (!value)
          return false;
@@ -1677,7 +1703,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
                       nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, value, 4),
                       nir_imm_int(&c->b, 0),
                       .image_dim = t.dim, .image_array = t.is_array,
-                      .src_type = dest_type);
+                      .src_type = src_type);
       return true;
    }
 

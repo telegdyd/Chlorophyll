@@ -88,7 +88,37 @@ air_val_ptr_select(struct air_ctx *c, nir_def *cond,
 static bool
 val_is_pointerish(const struct air_val *v)
 {
-   return v && (v->kind == AIR_VAL_PTR || v->kind == AIR_VAL_PTR_SELECT);
+   return v && (v->kind == AIR_VAL_PTR || v->kind == AIR_VAL_PTR_SELECT || v->kind == AIR_VAL_SLOT);
+}
+
+/* jasmine: the pointer a constant initializer holds when it is nothing but one
+ * pointer, bare or as the only member of wrappers (a metal::sampler is
+ * `{ ptr addrspace(2) }`); NULL for anything else. */
+static const struct air_value *
+const_pointer_init(const struct air_value *v)
+{
+   for (unsigned depth = 0; v && depth < 8; depth++) {
+      if (v->type && v->type->kind == AIR_TYPE_POINTER)
+         return v;
+      const struct air_constant *k = air_value_as_constant(v);
+      if (!k || k->ckind != AIR_CONST_AGGREGATE || k->num_elems != 1)
+         return NULL;
+      v = k->elems[0];
+   }
+   return NULL;
+}
+
+/* jasmine: a getelementptr whose indices are all constant zero, which on a
+ * one-pointer slot (or a wrapper of one) names the slot itself. */
+static bool
+gep_is_zero(const struct air_inst *in)
+{
+   for (unsigned i = 1; i < in->num_operands; i++) {
+      uint64_t k;
+      if (!air_const_uint(in->operands[i], &k) || k)
+         return false;
+   }
+   return true;
 }
 
 /* Two resolutions that are the same resolution.
@@ -2362,6 +2392,12 @@ translate_gep(struct air_ctx *c, const struct air_inst *in)
       air_set(c, &in->base, ev);
       return true;
    }
+   if (base->kind == AIR_VAL_SLOT) {
+      if (!gep_is_zero(in))
+         return air_error(c, "instruction: a getelementptr into a pointer local at a non-zero offset");
+      air_set(c, &in->base, base);
+      return true;
+   }
    if (base->kind == AIR_VAL_FTABLE) {
       /* element k of a function table: `gep [N x ptr], t, 0, k` or `gep ptr, t, k` */
       const struct air_value *ix = in->operands[in->num_operands - 1];
@@ -2436,8 +2472,9 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
 
    if (in->sub == AIR_CAST_BITCAST && dt->kind == AIR_TYPE_POINTER) {
       struct air_val *v = air_get(c, in->operands[0]);
-      if (v && (v->kind == AIR_VAL_FTABLE || v->kind == AIR_VAL_FTABLE_ELEM || v->kind == AIR_VAL_FUNC)) {
-         air_set(c, &in->base, v);   /* a pointer to a function table, cast to a pointer */
+      if (v && (v->kind == AIR_VAL_FTABLE || v->kind == AIR_VAL_FTABLE_ELEM || v->kind == AIR_VAL_FUNC ||
+                v->kind == AIR_VAL_SLOT)) {
+         air_set(c, &in->base, v);   /* a pointer to a function table or a pointer local, cast to a pointer */
          return true;
       }
       if (!v || v->kind != AIR_VAL_PTR)
@@ -2749,6 +2786,9 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             air_set(c, &in->base, known_cond ? pa : pb);   /* decided by the function constants */
             return true;
          }
+         if (pa->kind == AIR_VAL_SLOT || pb->kind == AIR_VAL_SLOT)
+            return air_error(c, "instruction: a run-time choice of a pointer local, which only "
+                                "function constants may decide here");
          nir_def *pc = air_get_ssa(c, in->operands[0]);
          if (!pc)
             return false;
@@ -2903,6 +2943,17 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
          air_set(c, &in->base, tv);
          return true;
       }
+      if (in->aux_type && in->aux_type->kind == AIR_TYPE_POINTER && count == 1) {
+         /* jasmine: the slot the comment above describes. QuartzCore's uber
+          * fragment shader keeps each sampler argument in such a local and
+          * chooses between it and a constant `unused_sampler`. */
+         struct air_val *sv = rzalloc(c->mem_ctx, struct air_val);
+         sv->kind = AIR_VAL_SLOT;
+         sv->ptr.pointee = in->aux_type;
+         sv->elems = rzalloc_array(c->mem_ctx, struct air_val *, 1);
+         air_set(c, &in->base, sv);
+         return true;
+      }
       uint64_t size = air_type_alloc_size(c->m, in->aux_type) * count;
       unsigned align = MAX2(in->align, air_type_abi_align(c->m, in->aux_type));
       c->scratch_size = ALIGN_POT(c->scratch_size, MAX2(align, 1));
@@ -2932,6 +2983,16 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             fv->def = p->def;
          }
          air_set(c, &in->base, fv);
+         return true;
+      }
+      if (p->kind == AIR_VAL_SLOT) {
+         struct air_val *held = p->elems ? p->elems[0] : NULL;
+         if (!held && p->fnv)
+            held = air_get(c, p->fnv);
+         if (!held)
+            return c->error[0] ? false
+                               : air_error(c, "instruction: a load of a pointer local before anything was stored");
+         air_set(c, &in->base, held);
          return true;
       }
       if (p->kind == AIR_VAL_PTR_SELECT) {
@@ -2981,6 +3042,16 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *sv = air_get(c, in->operands[0]);
       if (!sv)
          return false;
+      if (p->kind == AIR_VAL_SLOT) {
+         /* One store, in the entry block, before any load in translation order:
+          * then every load sees it, because the entry block dominates them. */
+         if (!p->elems || p->fnv || p->num_elems || c->cur_block != 0 || !val_is_pointerish(sv))
+            return air_error(c, "instruction: a store into a pointer local that is not its one "
+                                "store of a pointer in the entry block");
+         p->elems[0] = sv;
+         p->num_elems = 1;
+         return true;
+      }
       if (val_is_pointerish(sv))
          return air_error(c, "instruction: a store of a pointer into memory, which this "
                              "frontend has no address to write");
@@ -4399,6 +4470,7 @@ translate_body(struct air_ctx *c)
       const struct air_block *blk = &f->blocks[bi];
       nir_block *nb = nir_block_of(c, blk);
       c->b.cursor = nir_after_block(nb);
+      c->cur_block = bi;
 
       /* the phis of this block are its first instructions */
       for (unsigned i = 0; i < blk->num_insts; i++) {
@@ -4738,6 +4810,10 @@ plan_globals(struct air_ctx *c)
          pl->offset = c->shared_size;
          pl->has_offset = true;
          c->shared_size += air_type_alloc_size(c->m, g->value_type);
+      } else if (g->is_const && g->init && const_pointer_init(g->init)) {
+         /* jasmine: a constant that is one pointer has no bytes for scratch
+          * (a pointer here is a resolution), so it is a slot holding it */
+         pl->slot = true;
       } else {
          /* a program-scope variable: private to the invocation, written by
           * the static initializers below
@@ -4766,6 +4842,15 @@ materialise_globals(struct air_ctx *c)
       if (pl->skip)
          continue;
       const struct air_global *g = c->m->globals[i];
+      if (pl->slot) {
+         struct air_val *sv = rzalloc(c->mem_ctx, struct air_val);
+         sv->kind = AIR_VAL_SLOT;
+         sv->ptr.pointee = g->value_type;
+         sv->elems = rzalloc_array(c->mem_ctx, struct air_val *, 1);
+         sv->fnv = const_pointer_init(g->init);
+         air_set(c, &g->base, sv);
+         continue;
+      }
       struct air_ptr p = {
          .pointee = g->value_type,
          .class = pl->class,
