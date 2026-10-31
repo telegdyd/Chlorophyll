@@ -135,6 +135,11 @@ bg_ctx_init(void)
    pthread_mutex_init(&bg_ctx_mutex, &a);
    pthread_mutexattr_destroy(&a);
 }
+// jasmine: a texture over CPU memory (_linSrc, _ncBytes) is refreshed from it once per stretch of a commit in which that
+// memory cannot change: the replay of a command buffer, cut where a CPU blit writes buffers. It was refreshed at every draw
+// that sampled it, each upload after the first into a texture the open batch already read (freedreno shadows or flushes),
+// 4 % of the compositor's commit. 0 outside a commit: refresh every time. Under bg_lock.
+static uint64_t bg_refresh_epoch, bg_refresh_epochs;
 static void bg_lock(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, bg_ctx_init); pthread_mutex_lock(&bg_ctx_mutex); }
 static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 
@@ -370,6 +375,7 @@ bg_install_fallback(Class c)
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
+   uint64_t _refreshEpoch;  // bg_refresh_epoch at the last refresh of _linSrc/_ncBytes
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
@@ -1232,6 +1238,7 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
    _status = 2;   // Committed
    char why[512] = { 0 };
    bg_lock();
+   bg_refresh_epoch = ++bg_refresh_epochs;
    // jasmine: surfaces this command buffer renders or blits into draw in their shared shadow (bgShadowLocked)
    for (BGWork *w in _work) {
       if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
@@ -1362,6 +1369,7 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
             memmove((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, (uint8_t *)[(BGMTLBuffer *)w->src contents] + w->src_off, w->size);
          else
             memset((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, w->fill, w->size);
+         bg_refresh_epoch = ++bg_refresh_epochs;   // CPU memory may have changed under a texture
       }
    }
    // jasmine: drawables written through their shadow (texture init) get the frame in one GPU blit, in order after the draws.
@@ -1390,6 +1398,7 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
    // a serial completion queue, which waits for it and then runs what follows a completed command buffer (surface sync, presents,
    // completed handlers), in submission order. BGMTL_TRACE keeps it synchronous: the trace reads attachments back through the
    // drawing context, which belongs to the encoding thread.
+   bg_refresh_epoch = 0;
    dispatch_group_enter(_done);
    // In the compositor "scheduled" is reported only when the GPU has FINISHED: the render server hands a framebuffer to the
    // display from the scheduled notification / waitUntilScheduled, and this display path has no GPU write fence on the surface,
@@ -1968,6 +1977,13 @@ bg_shadow_release(struct rwa_texture *sh)
 
 - (struct rwa_texture *)rwaTexture
 {
+   if ((_ncBytes || _linSrc) && _tex) {
+      bg_lock();
+      BOOL fresh = bg_refresh_epoch && _refreshEpoch == bg_refresh_epoch;
+      _refreshEpoch = bg_refresh_epoch;
+      bg_unlock();
+      if (fresh) return _tex;
+   }
    if (_ncBytes && _tex) {
       bg_lock();
       char why[256] = { 0 };
@@ -2249,12 +2265,12 @@ bg_shadow_release(struct rwa_texture *sh)
    w->render = [_pipeline retain];
    w->vcount = _vhigh > _fhigh ? _vhigh : _fhigh;
    w->count = _fhigh;
-   for (unsigned i = 0; i < BG_MAX_BINDINGS; i++) {
-      w->vbuffers[i] = [_vbuf[i] retain]; w->voffsets[i] = _voff[i];
-      w->buffers[i] = [_fbuf[i] retain]; w->offsets[i] = _foff[i];
-   }
+   // jasmine: only the slots up to the highest bound (the replay reads no further); all 16 of each table were retained
+   for (unsigned i = 0; i < _vhigh; i++) { w->vbuffers[i] = [_vbuf[i] retain]; w->voffsets[i] = _voff[i]; }
+   for (unsigned i = 0; i < _fhigh; i++) { w->buffers[i] = [_fbuf[i] retain]; w->offsets[i] = _foff[i]; }
    w->vcount = _vhigh;
-   for (unsigned i = 0; i < BG_MAX_TEX; i++) { w->textures[i] = [_tex[i] retain]; w->samplers[i] = [_smp[i] retain]; }
+   for (unsigned i = 0; i < _thigh; i++) w->textures[i] = [_tex[i] retain];
+   for (unsigned i = 0; i < _shigh; i++) w->samplers[i] = [_smp[i] retain];
    w->texture_count = _thigh; w->sampler_count = _shigh;
    // Metal reads zeros from a texture slot nothing was bound to; this library asks for a texture, so give it one that is zero
    for (unsigned i = 0; i < _pipeline->_ndecls; i++) {

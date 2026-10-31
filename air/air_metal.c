@@ -149,7 +149,48 @@ struct rwa_device {
    struct pipe_sampler_view *bound_views[MESA_SHADER_STAGES][RWA_MAX_TEXTURES];
    void *bound_samplers[MESA_SHADER_STAGES][RWA_MAX_TEXTURES];
    unsigned n_bound_views[MESA_SHADER_STAGES], n_bound_samplers[MESA_SHADER_STAGES];
+
+   /* Chlorophyll: the rest of the graphics state the last draw bound (no references: the context holds its own, so a
+    * pointer here cannot be freed and reused while it is bound). freedreno marks state dirty on every bind, equal or
+    * not, and a dirty program re-emits the shaders and re-tracks every resource: binding the same pipeline again for
+    * each of CoreAnimation's draws was a fifth of the commit. An equal bind is skipped; anything else that binds or
+    * deletes graphics state calls gs_invalidate. RWA_STATE_CACHE=0 binds everything every draw, as before. */
+   struct {
+      bool valid;
+      void *blend, *dsa, *rast, *vs, *fs, *velem;
+      struct pipe_viewport_state vp;
+      struct pipe_scissor_state sc;
+      struct pipe_stencil_ref ref;
+      unsigned nvb;
+      struct { struct pipe_resource *res; unsigned offset; } vb[PIPE_MAX_ATTRIBS];
+      /* Constant buffers per stage and slot, buffers only. A user buffer (a pointer freedreno keeps and reads when it
+       * emits) is always bound again: comparing CoreAnimation's bytes cost more than the binds it saved (step 7 r22). */
+      struct rwa_cb_cache {
+         bool set;
+         struct pipe_resource *res;
+         unsigned offset, size;
+      } cb[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
+   } gs;
 };
+
+static bool
+gs_cache_on(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = !getenv("RWA_STATE_CACHE") || getenv("RWA_STATE_CACHE")[0] != '0';
+   return on;
+}
+
+/* Forget what the last draw bound: the next draw binds all of it. */
+static void
+gs_invalidate(struct rwa_device *device)
+{
+   device->gs.valid = false;
+   for (unsigned st = 0; st < MESA_SHADER_STAGES; st++)
+      for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++)
+         device->gs.cb[st][i].set = false;
+}
 
 /* Unbind every stage's views and samplers if `p` (a sampler view or a sampler state) is among them, before it is freed. */
 static void
@@ -1950,6 +1991,8 @@ rwa_texture_generate_mipmaps(struct rwa_texture *texture)
    if (!texture || !texture->res || texture->res->last_level == 0)
       return -1;
    struct pipe_resource *res = texture->res;
+   /* The blitter saves and restores what it binds, but nothing here depends on that. */
+   gs_invalidate(texture->device);
    return util_gen_mipmap(texture->device->pipe, res, res->format, 0, res->last_level, 0, util_max_layer(res, 0),
                           PIPE_TEX_FILTER_LINEAR) ? 0 : -1;
 }
@@ -3979,9 +4022,13 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
             if (direct_buffer_offset(r, bindings, table, table_count, name, &moffset, why,
                                      why_size) != 0)
                return -1;
-            snprintf(what, sizeof(what), "buffer %u of %s", r->index, name);
-            if (buffer_offset_ok(b->device, r, b, moffset, name, what, why, why_size) != 0)
+            /* Chlorophyll: named only when it is refused; the snprintf on every buffer of every draw was 4 % of the
+             * compositor's commit. */
+            if (buffer_offset_ok(b->device, r, b, moffset, name, "", NULL, 0) != 0) {
+               snprintf(what, sizeof(what), "buffer %u of %s", r->index, name);
+               buffer_offset_ok(b->device, r, b, moffset, name, what, why, why_size);
                return -1;
+            }
          }
          /* `r->size` is air.buffer_size, which a member never carries: the frontend
           * adds a member's resource with a size of zero because the nested descriptor
@@ -4242,7 +4289,14 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
             cb.buffer_offset = 0;
             cb.buffer_size = (unsigned)want;
          }
+         /* Chlorophyll: an equal binding of a buffer is skipped (rwa_device.gs). */
+         struct rwa_cb_cache *c = &device->gs.cb[stage][r->index];
+         if (!cb.user_buffer && gs_cache_on() && c->set && c->res == cb.buffer && c->offset == cb.buffer_offset &&
+             c->size == cb.buffer_size)
+            break;
          pipe->set_constant_buffer(pipe, stage, r->index, &cb);
+         *c = (struct rwa_cb_cache){ .set = !cb.user_buffer, .res = cb.buffer, .offset = cb.buffer_offset,
+                                     .size = cb.buffer_size };
          break;
       }
 
@@ -4378,6 +4432,7 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
    if (info->cb_delta_ubo) {
       struct pipe_constant_buffer dcb = { .user_buffer = cb_deltas, .buffer_size = sizeof(cb_deltas) };
       pipe->set_constant_buffer(pipe, stage, info->cb_delta_ubo - 1, &dcb);
+      device->gs.cb[stage][info->cb_delta_ubo - 1].set = false;
    }
    const struct pipe_shader_caps *caps = &device->screen->shader_caps[stage];
    unsigned gpu = device->software ? 0 : fd_screen(device->screen)->gpu_id;
@@ -5353,6 +5408,7 @@ rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
     * -- the same trap delete_compute_state is about.
     */
    state->device->pipe->bind_depth_stencil_alpha_state(state->device->pipe, NULL);
+   gs_invalidate(state->device);
    state->device->pipe->delete_depth_stencil_alpha_state(state->device->pipe, state->cso);
    free(state);
 }
@@ -7270,6 +7326,7 @@ rwa_render_destroy(struct rwa_render *render)
    if (!render)
       return;
    struct pipe_context *pipe = render->device->pipe;
+   gs_invalidate(render->device);   /* everything below is bound to NULL */
 
    /* Unbound before deleted, each of them, for the reason delete_compute_state and
     * rwa_sampler_destroy give: a Gallium context holds a pointer to the state bound in
@@ -7712,9 +7769,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * cbuf). The wallpaper poster's passes have one, and failing them tripped its watchdog. */
       if (!t)
          continue;
-      snprintf(what, sizeof(what), "colour attachment %u", i);
-      if (!attachment_shape_fits(t, samples, what, why, why_size))
+      /* Chlorophyll: named only when it does not fit; the snprintf on every draw was 1 % of the compositor's commit. */
+      if (!attachment_shape_fits(t, samples, "", NULL, 0)) {
+         snprintf(what, sizeof(what), "colour attachment %u", i);
+         attachment_shape_fits(t, samples, what, why, why_size);
          return -1;
+      }
       if (!(t->res->bind & PIPE_BIND_RENDER_TARGET)) {
          say(why, why_size, "colour attachment %u (%s) was made without "
                             "MTLTextureUsageRenderTarget", i, t->format_name);
@@ -7860,7 +7920,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    float znear = draw->depth_range ? draw->depth_range[0] : 0.0f;
    float zfar = draw->depth_range ? draw->depth_range[1] : 1.0f;
-   pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
+   /* Chlorophyll: an equal bind is skipped (rwa_device.gs). */
+   bool gs_ok = gs_cache_on() && device->gs.valid;
+   struct pipe_viewport_state vp = {
       /* The y scale is NEGATIVE, and that is Metal's rule rather than a convention picked
        * here. Metal's render-target origin is the top left and its NDC y points up, so clip
        * y = +1 belongs in memory row 0; a positive y scale puts clip y = -1 there, which is
@@ -7874,7 +7936,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * (100+x, 200+(3-y), ...), the texture mirrored vertically, on both back ends.
        */
       .scale = { w / 2.0f, -(h / 2.0f), zfar - znear },
-      .translate = { w / 2.0f, h / 2.0f, znear } });
+      .translate = { w / 2.0f, h / 2.0f, znear } };
+   if (!gs_ok || memcmp(vp.scale, device->gs.vp.scale, sizeof(vp.scale)) ||
+       memcmp(vp.translate, device->gs.vp.translate, sizeof(vp.translate))) {
+      pipe->set_viewport_states(pipe, 0, 1, &vp);
+      device->gs.vp = vp;
+   }
 
    {
       /* Chlorophyll: Metal's scissor test (see rwa_draw.scissor), clamped to the attachment as Metal requires. */
@@ -7885,24 +7952,37 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          unsigned y1 = MIN2((uint64_t)draw->scissor[1] + draw->scissor[3], h);
          sc = (struct pipe_scissor_state){ .minx = x0, .miny = y0, .maxx = x1, .maxy = y1 };
       }
-      pipe->set_scissor_states(pipe, 0, 1, &sc);
+      if (!gs_ok || sc.minx != device->gs.sc.minx || sc.miny != device->gs.sc.miny ||
+          sc.maxx != device->gs.sc.maxx || sc.maxy != device->gs.sc.maxy) {
+         pipe->set_scissor_states(pipe, 0, 1, &sc);
+         device->gs.sc = sc;
+      }
    }
-   pipe->bind_blend_state(pipe, render->blend);
+   if (!gs_ok || device->gs.blend != render->blend)
+      pipe->bind_blend_state(pipe, device->gs.blend = render->blend);
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
     * behaviour with no MTLDepthStencilState set: no test and no write.
     */
-   pipe->bind_depth_stencil_alpha_state(pipe, draw->depth_stencil ? draw->depth_stencil->cso
-                                                                  : render->dsa);
+   void *dsa = draw->depth_stencil ? draw->depth_stencil->cso : render->dsa;
+   if (!gs_ok || device->gs.dsa != dsa)
+      pipe->bind_depth_stencil_alpha_state(pipe, device->gs.dsa = dsa);
    /* Metal keeps the reference value on the encoder and not in the state object, so it
     * is set per draw. Gallium's is one byte per face, which is the stencil buffer's
     * width; Metal's is a uint32 and only those bits can match anything.
     */
-   pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){
+   struct pipe_stencil_ref ref = {
       .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
-                     (uint8_t)(draw->stencil_reference[1] & 0xff) } });
-   pipe->bind_rasterizer_state(pipe, render->rast);
-   pipe->bind_vs_state(pipe, render->vs_cso);
-   pipe->bind_fs_state(pipe, render->fs_cso);
+                     (uint8_t)(draw->stencil_reference[1] & 0xff) } };
+   if (!gs_ok || memcmp(&ref, &device->gs.ref, sizeof(ref))) {
+      pipe->set_stencil_ref(pipe, ref);
+      device->gs.ref = ref;
+   }
+   if (!gs_ok || device->gs.rast != render->rast)
+      pipe->bind_rasterizer_state(pipe, device->gs.rast = render->rast);
+   if (!gs_ok || device->gs.vs != render->vs_cso)
+      pipe->bind_vs_state(pipe, device->gs.vs = render->vs_cso);
+   if (!gs_ok || device->gs.fs != render->fs_cso)
+      pipe->bind_fs_state(pipe, device->gs.fs = render->fs_cso);
 
    /*
     * The vertex state, bound on BOTH paths and never NULL.
@@ -7949,32 +8029,48 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * where the placeholder for a gated, unconfigured attribute reads this library's own
     * quad.
     */
+   /* Chlorophyll: each slot is worked out first and referenced only if it is bound (rwa_device.gs). */
    struct pipe_vertex_buffer vbs[PIPE_MAX_ATTRIBS] = { 0 };
    unsigned nvb = 1;
    if (vst->count) {
       nvb = MIN2(vst->stream_count, (unsigned)PIPE_MAX_ATTRIBS);
       for (unsigned k = 0; k < nvb; k++) {
          if (k == RWA_MAX_VERTEX_BUFFERS) {
-            pipe_resource_reference(&vbs[k].buffer.resource, render->vbuf);
+            vbs[k].buffer.resource = render->vbuf;
             continue;
          }
          if (!(vst->stream_mask & (1u << k)))
             continue;
          const struct rwa_vertex_stream *s = &draw->vertex_streams[k];
          vbs[k].buffer_offset = (unsigned)s->offset;
-         pipe_resource_reference(&vbs[k].buffer.resource, s->buffer->res);
+         vbs[k].buffer.resource = s->buffer->res;
       }
    } else {
-      pipe_resource_reference(&vbs[0].buffer.resource, render->vbuf);
+      vbs[0].buffer.resource = render->vbuf;
    }
+   bool vb_same = gs_ok && device->gs.velem == render->velem && device->gs.nvb == nvb;
+   for (unsigned k = 0; vb_same && k < nvb; k++)
+      vb_same = device->gs.vb[k].res == vbs[k].buffer.resource && device->gs.vb[k].offset == vbs[k].buffer_offset;
    /* Elements first, buffers second, which is the order p_context.h requires of a
     * frontend: "Frontends MUST call set_vertex_buffers after bind_vertex_elements_state
     * and before the next draw", because a driver is allowed to merge the two in
     * set_vertex_buffers rather than in draw_vbo. Neither driver here does, so the
     * other order worked; it worked by permission and not by contract.
     */
-   pipe->bind_vertex_elements_state(pipe, render->velem);
-   pipe->set_vertex_buffers(pipe, nvb, vbs);
+   if (!vb_same) {
+      if (!gs_ok || device->gs.velem != render->velem)
+         pipe->bind_vertex_elements_state(pipe, device->gs.velem = render->velem);
+      for (unsigned k = 0; k < nvb; k++) {
+         struct pipe_resource *res = vbs[k].buffer.resource;
+         vbs[k].buffer.resource = NULL;
+         pipe_resource_reference(&vbs[k].buffer.resource, res);   /* the driver's, given away below */
+         device->gs.vb[k].res = res;
+         device->gs.vb[k].offset = vbs[k].buffer_offset;
+      }
+      pipe->set_vertex_buffers(pipe, nvb, vbs);
+      device->gs.nvb = nvb;
+   }
+   device->gs.valid = true;
 
    struct rwa_bound fbound = { 0 }, vbound = { 0 };
    int rc = -1;
