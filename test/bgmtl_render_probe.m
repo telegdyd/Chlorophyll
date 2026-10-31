@@ -83,7 +83,9 @@ main(int argc, char **argv)
          return ok ? 0 : 1;
       }
 #endif
-      if (argc < 3) { printf("usage: bgmtl_render_probe kernels.metallib render.metallib\n"); return 2; }
+      // jasmine: --bb as a third argument runs the suite in compositor mode (BGMTL_BB: drawables drawn through a shadow)
+      if (argc > 3 && !strcmp(argv[3], "--bb")) setenv("BGMTL_BB", "1", 1);
+      if (argc < 3) { printf("usage: bgmtl_render_probe kernels.metallib render.metallib [--bb]\n"); return 2; }
       printf("== BGMTLDevice textures/render probe (iOS %s)\n", [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String]);
       g_dev = bgmtl_create_device();
 #ifdef BGMTL_REGISTERED_PROBE
@@ -582,6 +584,46 @@ main(int argc, char **argv)
          }
          CHECK(rounds==12 && !bad,"IOSurface: %u rounds, %u wrong",rounds,bad);
          printf("  IOSurface: %u rounds, %u wrong\n",rounds,bad);
+         if(surf) CFRelease(surf);
+      }
+      // jasmine P13: a GPU blit from a private texture into an imported IOSurface (the compositor's shadow copy-back),
+      // at a swap-surface-like size and a 64-byte-multiple pitch that is not a power of two.
+      printf("== P13 GPU blit into an imported IOSurface\n");
+      {
+         const unsigned W = 200, H = 64;
+         NSDictionary *props = @{ (id)kIOSurfaceWidth:@(W), (id)kIOSurfaceHeight:@(H),
+            (id)kIOSurfaceBytesPerElement:@4, (id)kIOSurfaceBytesPerRow:@832,
+            (id)kIOSurfacePixelFormat:@(0x42475241u) };
+         IOSurfaceRef surf = IOSurfaceCreate((CFDictionaryRef)props);
+         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W height:H mipmapped:NO];
+         td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+         id src = [g_dev newTextureWithDescriptor:td];
+         td.storageMode = MTLStorageModeShared;
+         id dst = surf ? [g_dev newTextureWithDescriptor:td iosurface:(id)surf plane:0] : nil;
+         unsigned bad = 0;
+         if (src && dst) {
+            MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture=src; rp.colorAttachments[0].loadAction=MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor=MTLClearColorMake(0.25,0.5,0.75,1);
+            rp.colorAttachments[0].storeAction=MTLStoreActionStore;
+            id cb=[g_queue commandBuffer], e=[cb renderCommandEncoderWithDescriptor:rp]; [e endEncoding];
+            id b=[cb blitCommandEncoder];
+            [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(W,H,1)
+                     toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+            [b endEncoding];
+            if (!run(cb,"blit into surface")) bad++;
+            IOSurfaceLock(surf,kIOSurfaceLockReadOnly,NULL);
+            uint8_t *base=IOSurfaceGetBaseAddress(surf); size_t pitch=IOSurfaceGetBytesPerRow(surf);
+            for(unsigned y=0;y<H;y++) for(unsigned x=0;x<W;x++) {
+               uint8_t *p=base+y*pitch+x*4;
+               if(abs(p[0]-191)>1 || abs(p[1]-128)>1 || abs(p[2]-64)>1 || p[3]!=255) bad++;
+            }
+            printf("  first texel b=%u g=%u r=%u a=%u\n", base[0], base[1], base[2], base[3]);
+            IOSurfaceUnlock(surf,kIOSurfaceLockReadOnly,NULL);
+         } else bad++;
+         CHECK(!bad,"blit into IOSurface: %u wrong",bad);
+         printf("  blit into IOSurface: %u wrong\n",bad);
+         [src release]; [dst release];
          if(surf) CFRelease(surf);
       }
       // jasmine P12: a read-only vertex buffer beyond UBO capacity fails explicitly.

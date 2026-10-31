@@ -253,6 +253,7 @@ struct rwa_texture {
     * lenient one.
     */
    bool shader_read, shader_write;
+   bool imported;                   /* jasmine: the memory is an IOSurface's (rwa_texture_copy) */
 
    /* Bergamota: the kernel's BO handle when the memory is an IOSurface (rwa_texture_from_surface), for the clean+invalidate that makes the GPU's
     * pixels visible to whoever composites the surface (rwa_texture_flush_surface) */
@@ -1734,6 +1735,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          .modifier = DRM_FORMAT_MOD_LINEAR,
       };
       texture->surface_handle = sb.handle;
+      texture->imported = true;
       struct rwa_surface_import real = { .id = import->id, .offset = sb.offset, .row_bytes = sb.bytes_per_row };
       import = &real;
 
@@ -1900,6 +1902,35 @@ rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, cons
    struct pipe_box box;
    u_box_3d((int)so[0], (int)so[1], (int)(so[2] + sslice), (int)size[0], (int)size[1], (int)(size[2] ? size[2] : 1), &box);
    struct pipe_context *pipe = src->device->pipe;
+   /* jasmine: on the a512 the a5xx 2D blitter's copies come out empty: into an imported IOSurface and into a private
+    * texture alike (render probe P13, plain and --bb: every texel still zero), while drawing into either works (P11).
+    * A 2D copy the 3D engine can draw goes there instead: fd5_blitter declines a scissored blit, and fd_blit then draws
+    * it with u_blitter. Same format, same size, nearest. Anything else keeps resource_copy_region. */
+   struct pipe_screen *ps = src->device->screen;
+   if (src->res->format == dst->res->format && src->res->target == PIPE_TEXTURE_2D &&
+       dst->res->target == PIPE_TEXTURE_2D && box.depth == 1 && src->res->nr_samples <= 1 && dst->res->nr_samples <= 1 &&
+       ps->is_format_supported(ps, dst->res->format, PIPE_TEXTURE_2D, 0, 0, PIPE_BIND_RENDER_TARGET) &&
+       ps->is_format_supported(ps, src->res->format, PIPE_TEXTURE_2D, 0, 0, PIPE_BIND_SAMPLER_VIEW)) {
+      struct pipe_blit_info info;
+      memset(&info, 0, sizeof(info));
+      info.src.resource = src->res;
+      info.src.level = slevel;
+      info.src.box = box;
+      info.src.format = src->res->format;
+      info.dst.resource = dst->res;
+      info.dst.level = dlevel;
+      u_box_3d((int)dorg[0], (int)dorg[1], (int)(dorg[2] + dslice), box.width, box.height, 1, &info.dst.box);
+      info.dst.format = dst->res->format;
+      info.mask = util_format_get_mask(src->res->format);
+      info.filter = PIPE_TEX_FILTER_NEAREST;
+      info.scissor_enable = true;
+      info.scissor.minx = info.dst.box.x;
+      info.scissor.miny = info.dst.box.y;
+      info.scissor.maxx = info.dst.box.x + info.dst.box.width;
+      info.scissor.maxy = info.dst.box.y + info.dst.box.height;
+      pipe->blit(pipe, &info);
+      return 0;
+   }
    pipe->resource_copy_region(pipe, dst->res, dlevel, dorg[0], dorg[1], dorg[2] + dslice, src->res, slevel, &box);
    return 0;
 }

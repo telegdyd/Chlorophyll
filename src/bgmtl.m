@@ -338,6 +338,9 @@ bg_install_fallback(Class c)
    struct rwa_texture_shape _shape;
    CFTypeRef _surface;   // retained IOSurface, when the memory is one
    NSUInteger _plane;
+   @public
+   struct rwa_texture *_surfTex;  // jasmine: the imported surface when _tex is its shadow (compositor drawables)
+   @protected
    CFTypeRef _copySurface;  // jasmine: a sampled IOSurface whose pitch the a5xx cannot import, copied in (retained)
    uint32_t _copySeed;      // the surface's seed at the last copy
    BOOL _copied;
@@ -1235,6 +1238,28 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
             memset((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, w->fill, w->size);
       }
    }
+   // jasmine: drawables written through their shadow (texture init) get the frame in one GPU blit, in order after the draws.
+   if (_status != 5) {
+      NSMutableSet *shadowed = nil;
+      for (BGWork *w in _work) {
+         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
+            for (unsigned i = 0; i < w->color_count; i++)
+               if (w->color[i] && ((BGMTLTexture *)w->color[i])->_surfTex) {
+                  if (!shadowed) shadowed = [NSMutableSet set];
+                  [shadowed addObject:w->color[i]];
+               }
+         } else if ([w->dst isKindOfClass:[BGMTLTexture class]] && ((BGMTLTexture *)w->dst)->_surfTex) {
+            if (!shadowed) shadowed = [NSMutableSet set];
+            [shadowed addObject:w->dst];
+         }
+      }
+      for (BGMTLTexture *t in shadowed) {
+         const unsigned z[3] = { 0, 0, 0 };
+         const unsigned all[3] = { [t width], [t height], 1 };
+         if (rwa_texture_copy([t rwaTexture], 0, 0, z, t->_surfTex, 0, 0, z, all) != 0)
+            BG_LOG("drawable shadow: copy to IOSurface %u refused\n", IOSurfaceGetID((IOSurfaceRef)[t iosurface]));
+      }
+   }
    // Asynchronous completion (Chlorophyll: CPU and GPU overlap, as Metal's own do): the work is submitted and its fence handed to
    // a serial completion queue, which waits for it and then runs what follows a completed command buffer (surface sync, presents,
    // completed handlers), in submission order. BGMTL_TRACE keeps it synchronous: the trace reads attachments back through the
@@ -1658,6 +1683,24 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          size_t n = strlen(why);
          snprintf(why + n, sizeof(why) - n, " (usage asked 0x%lx)", (unsigned long)asked);
       }
+      /* jasmine: in the compositor a drawable is drawn in a shadow of the same shape and copied to the surface in one GPU
+       * blit at the end of each command buffer that wrote it (commit), as libsweetca's GL path does. The panel's scaler reads
+       * the surface itself, and the render server draws into one it still shows: drawn there directly over a whole frame
+       * of passes, the panel showed the half-drawn frame (a black band rolling down the screen, first backboardd runs).
+       * BGMTL_SHADOW=0 draws into the surface again. */
+      static int shadow = -1;
+      if (shadow < 0) shadow = getenv("BGMTL_BB") && !(getenv("BGMTL_SHADOW") && getenv("BGMTL_SHADOW")[0] == '0');
+      if (_tex && !_copySurface && shadow) {
+         struct rwa_texture *sh = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+         const unsigned z[3] = { 0, 0, 0 }, all[3] = { _shape.width, _shape.height, 1 };
+         if (sh && rwa_texture_copy(_tex, 0, 0, z, sh, 0, 0, z, all) == 0) {
+            _surfTex = _tex;
+            _tex = sh;
+         } else {
+            if (sh) rwa_texture_destroy(sh);
+            BG_LOG("drawable shadow refused: %s\n", why);
+         }
+      }
       bg_unlock();
       if (_tex && !_copySurface) {
          _surface = CFRetain(surface);
@@ -1674,7 +1717,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 }
 - (void)dealloc
 {
-   bg_lock(); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
+   bg_lock(); if (_tex) rwa_texture_destroy(_tex); if (_surfTex) rwa_texture_destroy(_surfTex); bg_unlock();
    if (_surface) CFRelease(_surface);
    if (_copySurface) CFRelease(_copySurface);
    [_linSrc release];
