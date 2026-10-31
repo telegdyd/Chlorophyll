@@ -42,8 +42,19 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "util/blend.h"
+#ifndef RWA_SWEETGPU
 #include "target-helpers/inline_sw_helper.h"
 #include "null/null_sw_winsys.h"
+#else
+/* jasmine: use the same SweetGPU screen/import ABI as sweetgl. */
+#include <fcntl.h>
+#include <unistd.h>
+#include <mach/mach.h>
+#include <mach/vm_page_size.h>
+#include <IOSurface/IOSurfaceRef.h>
+struct renderonly;
+struct pipe_screen *fd_screen_create(int, const struct pipe_screen_config *, struct renderonly *);
+#endif
 #ifdef GALLIUM_FREEDRENO
 #include "freedreno/drm/freedreno_drm_public.h"
 /* for rwa_texture_from_surface: a resource over memory somebody else allocated is a
@@ -258,8 +269,31 @@ struct rwa_sbo {
    uint64_t size, iova;
    uint32_t offset, bytes_per_row, width, height, pixel_format, planes;
 };
+#ifdef RWA_SWEETGPU
+static int
+sweet_drm_surface_bo(int fd, struct rwa_sbo *io)
+{
+   IOSurfaceRef surface = IOSurfaceLookup(io->surface_id);
+   if (!surface) return -1;
+   io->handle = io->surface_id;
+   io->size = IOSurfaceGetAllocSize(surface);
+   io->offset = (uintptr_t)IOSurfaceGetBaseAddress(surface) & vm_page_mask;
+   io->bytes_per_row = IOSurfaceGetBytesPerRow(surface);
+   io->width = IOSurfaceGetWidth(surface);
+   io->height = IOSurfaceGetHeight(surface);
+   io->pixel_format = IOSurfaceGetPixelFormat(surface);
+   io->planes = IOSurfaceGetPlaneCount(surface);
+   CFRelease(surface);
+   return 0;
+}
+/* jasmine: SweetGPU has no cache-sync selector. Callers must finish GPU work
+ * before CPU access; imported-surface coherence still needs separate testing. */
+static int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size)
+{ return 0; }
+#else
 extern int sweet_drm_surface_bo(int fd, struct rwa_sbo *io);
 extern int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
+#endif
 
 /* A sampler is a Gallium state object and nothing more. The state it was built from is
  * not kept: a refusal about a sampler happens while it is being created, where the
@@ -494,7 +528,11 @@ rwa_device_open(char *why, size_t why_size)
 
 #ifdef GALLIUM_FREEDRENO
    if (!software) {
+      #ifdef RWA_SWEETGPU
+      int fd = open("/dev/null", O_RDWR);
+#else
       int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
+#endif
       if (fd < 0) {
          /* The ordinary case on this port, and not an error anybody should be
           * surprised by: without gpu=1 the kernel starts no HKGPU service, so
@@ -533,7 +571,12 @@ rwa_device_open(char *why, size_t why_size)
          options_parsed = true;
       }
 
+      #ifdef RWA_SWEETGPU
+      device->screen = fd_screen_create(fd, &config, NULL);
+      close(fd); /* fd_screen_create duplicates it. */
+#else
       device->screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
+#endif
       if (!device->screen) {
          say(why, why_size, "the kernel's msm device opened but freedreno made no screen "
                             "for it, so this GPU is present and unusable");
@@ -548,8 +591,15 @@ rwa_device_open(char *why, size_t why_size)
    }
 #endif
 
+#ifndef RWA_SWEETGPU
    if (!device->screen)
       device->screen = sw_screen_create(null_sw_create());
+#else
+   if (software) {
+      say(why, why_size, "jasmine libbgair contains only the SweetGPU driver");
+      goto fail;
+   }
+#endif
    if (!device->screen) {
       say(why, why_size, "no Gallium screen could be created at all");
       goto fail;
@@ -1642,7 +1692,11 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          return NULL;
       }
       struct winsys_handle whandle = {
+         #ifdef RWA_SWEETGPU
+         .type = WINSYS_HANDLE_TYPE_FD,
+#else
          .type = WINSYS_HANDLE_TYPE_KMS,
+#endif
          .handle = sb.handle,
          .stride = sb.bytes_per_row,
          .offset = sb.offset,
@@ -7201,7 +7255,12 @@ fail:
 
 /* Chlorophyll: freedreno's debug flags, present only in a build that links the freedreno driver (the host build runs
  * softpipe). FD_DBG_SYSMEM (bit 9) makes every batch render in sysmem instead of tiling through GMEM. */
+/* jasmine: linked into this dylib, so a missing backend symbol must fail the link. */
+#ifdef RWA_SWEETGPU
+extern int fd_mesa_debug;
+#else
 extern int fd_mesa_debug __attribute__((weak_import));
+#endif
 
 int
 rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
