@@ -466,6 +466,7 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
 }
 
 static bool bgr5a1_exchanged;   /* jasmine: see pixel_format */
+static bool cb_delta_gpu = true; /* jasmine: see add_cb_deltas */
 
 struct rwa_device *
 rwa_device_open(char *why, size_t why_size)
@@ -577,6 +578,7 @@ rwa_device_open(char *why, size_t why_size)
       bgr5a1_exchanged =
          !ps->is_format_supported(ps, PIPE_FORMAT_R5G5B5A1_UNORM, PIPE_TEXTURE_2D, 0, 0, b) &&
          ps->is_format_supported(ps, PIPE_FORMAT_B5G5R5A1_UNORM, PIPE_TEXTURE_2D, 0, 0, b);
+      cb_delta_gpu = device->software || fd_screen(ps)->gen >= 6;
    }
 
    device->nir_options =
@@ -6612,14 +6614,16 @@ size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
 
 /* Chlorophyll: the constant buffers size_unsized_constants left unbounded read through a delta (air_shader_info,
  * cb_delta_mask): every load from one becomes load(offset + delta[index]), the deltas living in the last of the 16 constant
- * buffer slots a6xx has, when the shader leaves it free. RWA_CB_DELTA=0 turns it off. */
+ * buffer slots a6xx has, when the shader leaves it free. RWA_CB_DELTA=0 turns it off. jasmine: off on a5xx (cb_delta_gpu):
+ * on the a512 the shapes drawn through it (CA's corner masks, the camera button's blur, Control Center platters) came out
+ * wrong in some frames and right in others (step 7 r6-r9, r15); not understood yet. RWA_CB_DELTA=1 forces it on. */
 #define CB_DELTA_SLOT 15
 static void
 add_cb_deltas(nir_shader *nir, struct air_shader_info *info)
 {
    static int on = -1;
    if (on < 0)
-      on = !(getenv("RWA_CB_DELTA") && getenv("RWA_CB_DELTA")[0] == '0');
+      on = getenv("RWA_CB_DELTA") ? getenv("RWA_CB_DELTA")[0] != '0' : cb_delta_gpu;
    unsigned mask = 0;
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];

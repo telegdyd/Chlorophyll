@@ -106,6 +106,16 @@ bg_trace(void)
 }
 #define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
 
+// BGMTL_DEFER_SCHEDULED=1: "scheduled" only once the GPU finished (commit). Off by default: the kernel's render tickets
+// keep a framebuffer off the panel until the GPU work drawing it passed, so the render server need not wait.
+static int
+bg_defer_scheduled(void)
+{
+   static int d = -1;
+   if (d < 0) d = getenv("BGMTL_DEFER_SCHEDULED") && getenv("BGMTL_DEFER_SCHEDULED")[0] == '1';
+   return d;
+}
+
 // One Gallium context serves every thread of the process, and QuartzCore commits from several (the render thread and
 // com.apple.coreanimation.asynchronous at once crashed in fd6_draw_vbos). Every call that reaches the context runs under this
 // recursive lock; only the fence wait of the completion queue stays outside (it uses the screen).
@@ -1049,7 +1059,7 @@ bg_air_slice(NSData *d)
    if (!block) return;
    if (_status >= 4) block(self); else [_completed addObject:[[block copy] autorelease]];
 }
-- (void)waitUntilScheduled { if (_status >= 2 && getenv("BGMTL_BB")) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
+- (void)waitUntilScheduled { if (_status >= 2 && getenv("BGMTL_BB") && bg_defer_scheduled()) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
 
 // The fence wait of a commit. A failed wait is not yet a failed command buffer: backboardd's CoreAnimation exits on the
 // first failed one (one "fence timeout" and the compositor restarted, while the kernel counted every submission completed
@@ -1312,12 +1322,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    // display from the scheduled notification / waitUntilScheduled, and this display path has no GPU write fence on the surface,
    // so an earlier notice let the panel scan a half-drawn buffer (its previous frame showed: motion stepping back and forth).
    // The encoding of the next frame still overlaps the GPU; only the hand-off waits.
-   // Now opt-in (BGMTL_DEFER_SCHEDULED=1, set by the inject when /private/var/tmp/bgmtl-bb.defersched exists): the kernel
-   // holds a swap until the GPU work before it completed (0229), and with its GPU scan-out copy (0240) the copy runs after
-   // that work on the same ring anyway. Deferring here made the render server wait for the GPU before every swap, so the
-   // next frame's encoding could not overlap the GPU at all.
-   static int defer_scheduled = -1;
-   if (defer_scheduled < 0) defer_scheduled = getenv("BGMTL_DEFER_SCHEDULED") && getenv("BGMTL_DEFER_SCHEDULED")[0] == '1';
+   // Now opt-in (bg_defer_scheduled): the render tickets sealed below hold the framebuffer off the panel until this work
+   // passed (step 7 r16: no tearing without the deferral). Deferring here made the render server wait for the GPU before
+   // every swap, so the next frame's encoding could not overlap the GPU at all.
+   int defer_scheduled = bg_defer_scheduled();
    if (_status != 5 && !defer_scheduled)
       _status = 3;   // Scheduled
    struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
@@ -1812,12 +1820,13 @@ bg_shadow_release(struct rwa_texture *sh)
  * (a black band rolling down the screen). Made when the texture is first a render target (surfaces CA only samples keep
  * reading the live surface), and one per surface, shared by every texture CA makes over it: CA redraws only the damaged
  * part of a framebuffer and expects the rest to be that framebuffer's previous frame, which a shadow per texture object
- * did not hold (motion jumped back and forth). BGMTL_SHADOW=0 draws into the surface again. Caller holds bg_lock. */
+ * did not hold (motion jumped back and forth). Opt-in since the render tickets (BGMTL_SHADOW=1; step 7 r17: no band and
+ * no tearing without it, 6 MB less copied per frame). Caller holds bg_lock. */
 - (struct rwa_texture *)rwaSurfaceTexture { return _surfTex ? _surfTex : (_surface ? _tex : NULL); }
 - (void)bgShadowLocked
 {
    static int on = -1;
-   if (on < 0) on = getenv("BGMTL_BB") && !(getenv("BGMTL_SHADOW") && getenv("BGMTL_SHADOW")[0] == '0');
+   if (on < 0) on = getenv("BGMTL_BB") && getenv("BGMTL_SHADOW") && getenv("BGMTL_SHADOW")[0] == '1';
    if (!on || _surfTex || !_surface || !_tex) return;
    struct rwa_texture *sh = bg_shadow_get(_owner, (IOSurfaceRef)_surface, &_shape, _tex);
    if (!sh) return;

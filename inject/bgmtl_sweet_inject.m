@@ -29,6 +29,8 @@ bgmtl_sweet_init(void)
    if (!enable || strcmp(enable, "1") ||
        (strcmp(name, "bgmtl_registered_probe") && strcmp(name, "backboardd"))) return;
    fprintf(stderr, "BGMTL registration: enabled in %s\n", name);
+   // The compositor's paths in libbgmtl (render tickets, odd-pitch sampled surfaces, BGR5A1): backboardd always wants them.
+   if (!strcmp(name, "backboardd")) setenv("BGMTL_BB", "1", 0);
    // A/B switches without a new boot image: KEY=VALUE lines (FD_MESA_DEBUG=inorder, BGMTL_SHADOW=0, ...), set before
    // the device and its Mesa screen exist. The boot command line has no room left for them.
    FILE *ab = fopen("/private/var/tmp/bgmtl-bb.env", "r");
