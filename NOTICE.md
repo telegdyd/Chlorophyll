@@ -13,6 +13,9 @@ Nothing of the third-party repository was built from its own scripts or run; the
 jasmine changes (2026-10-31): AIR frontend and runtime adapted to Mesa 26.2.5's
 NIR and Gallium APIs, under the same MIT licence. Marked "jasmine" in the changed
 source files. The original licence and attribution remain intact.
+`air/air2ir3.c`, `test/jasmine_compile.metal`, and `tools/jasmine-corpus.py` are
+new jasmine offline compiler tools/probes, also MIT. The corpus runner reuses
+Chlorophyll's existing MIT `corpus.py` container-slice reader.
 
 Credit: the AIR front end and the AIR-to-ir3 path that Chlorophyll is built on are the work of the hackios / Darwin on redwood
 contributors (OOSEX GANG, https://github.com/oosexgang/hackios-xnu-userland). Chlorophyll's Metal device (`src/bgmtl.m`), the

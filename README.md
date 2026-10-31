@@ -36,6 +36,21 @@ GPU_METAL_WORK=/scratch GPU_EAGL_VENV=/path/to/venv GPU_EAGL_CROSS=/path/to/ios-
 `build-host.sh` makes a patched copy of the Mesa tree in `$GPU_METAL_WORK/mesa-air` (the submodule is never modified) and
 builds the host tools; `build-ios.sh` cross-builds `libbgair.dylib` for iOS arm64e.
 
+## jasmine offline tools (Mesa 26.2.5)
+
+In ios-jasmine, `tools/vm-mesa.sh metal-host TAG` builds native macOS `air2nir`
+and `air2ir3` in a separate build directory, then runs synthetic compiler probes.
+The tools create no GPU device or Gallium screen. `air2ir3 FILE FUNCTION 512`
+compiles one plain MTLB slice or AIR bitcode module with zero-default function
+constants and prints the captured ir3 disassembly. Compilation does not establish
+runtime correctness. a5xx framebuffer fetch is explicitly refused until emulated.
+
+`tools/jasmine-corpus.py --air2nir BIN --air2ir3 BIN --out DIR LIB...` handles
+fat metallib containers and writes one isolated result per function, JSON/TSV
+tables and diagnostics. Keep Apple inputs, extracted slices and outputs in
+ios-jasmine's ignored `research/` storage. The original build scripts above still
+target Bergamota's Mesa 25 tree; use the parent project's VM scripts for jasmine.
+
 ## Licence
 
 MIT. The AIR front end and the AIR-to-ir3 library in `air/` (including `air_metal.c`/`air_metal.h`) and the Mesa patches
