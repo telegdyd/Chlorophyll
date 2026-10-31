@@ -10,6 +10,10 @@ cache, render passes, refused-draw handling and the other Chlorophyll-marked blo
 (iOS 18 two-word inline sampler state, `AIR_FC_FILL` stress switch) and are under the same licence.
 Nothing of the third-party repository was built from its own scripts or run; the files were read, copied and built with our own build script.
 
+jasmine changes (2026-10-31): AIR frontend and runtime adapted to Mesa 26.2.5's
+NIR and Gallium APIs, under the same MIT licence. Marked "jasmine" in the changed
+source files. The original licence and attribution remain intact.
+
 Credit: the AIR front end and the AIR-to-ir3 path that Chlorophyll is built on are the work of the hackios / Darwin on redwood
 contributors (OOSEX GANG, https://github.com/oosexgang/hackios-xnu-userland). Chlorophyll's Metal device (`src/bgmtl.m`), the
 system plugin (`plugin/`), the backboardd injection (`inject/`) and the libdrm stand-in (`libdrm` / Bergamota's `sweet_drm.c`)

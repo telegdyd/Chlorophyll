@@ -1,6 +1,7 @@
 /*
  * Copyright © 2026 Darwin on redwood contributors
  * SPDX-License-Identifier: MIT
+ * jasmine: adapted to Mesa 26.2.5 APIs (2026-10-31).
  */
 
 /*
@@ -130,9 +131,9 @@ struct rwa_device {
     * them after itself and the next draw bound the same ones again, which re-dirtied freedreno's texture state and
     * rebuilt it every draw; now an equal binding is skipped, and a view or sampler is unbound (unbind_tex_state) before
     * it is destroyed, which is the safety the per-draw unbind gave. */
-   struct pipe_sampler_view *bound_views[PIPE_SHADER_TYPES][RWA_MAX_TEXTURES];
-   void *bound_samplers[PIPE_SHADER_TYPES][RWA_MAX_TEXTURES];
-   unsigned n_bound_views[PIPE_SHADER_TYPES], n_bound_samplers[PIPE_SHADER_TYPES];
+   struct pipe_sampler_view *bound_views[MESA_SHADER_STAGES][RWA_MAX_TEXTURES];
+   void *bound_samplers[MESA_SHADER_STAGES][RWA_MAX_TEXTURES];
+   unsigned n_bound_views[MESA_SHADER_STAGES], n_bound_samplers[MESA_SHADER_STAGES];
 };
 
 /* Unbind every stage's views and samplers if `p` (a sampler view or a sampler state) is among them, before it is freed. */
@@ -141,7 +142,7 @@ unbind_tex_state(struct rwa_device *device, const void *p)
 {
    if (!device || !p)
       return;
-   for (unsigned st = 0; st < PIPE_SHADER_TYPES; st++) {
+   for (unsigned st = 0; st < MESA_SHADER_STAGES; st++) {
       bool hit = false;
       for (unsigned i = 0; i < device->n_bound_views[st] && !hit; i++)
          hit = device->bound_views[st][i] == p;
@@ -150,7 +151,7 @@ unbind_tex_state(struct rwa_device *device, const void *p)
       if (!hit)
          continue;
       if (device->n_bound_views[st])
-         device->pipe->set_sampler_views(device->pipe, st, 0, 0, device->n_bound_views[st], false, NULL);
+         device->pipe->set_sampler_views(device->pipe, st, 0, 0, device->n_bound_views[st], NULL);
       if (device->n_bound_samplers[st]) {
          void *none[RWA_MAX_TEXTURES] = { 0 };
          device->pipe->bind_sampler_states(device->pipe, st, 0, device->n_bound_samplers[st], none);
@@ -375,45 +376,13 @@ say(char *why, size_t why_size, const char *fmt, ...)
    va_end(ap);
 }
 
-/* What the screen answers about compute, as one number. Returns false when it declines,
- * which softpipe does for most of them.
- *
- * The scratch is four words wide and not one: get_compute_param writes before it
- * returns the width, and some of these caps are a vector of three (the maximum block
- * size), so a one-word buffer would be written past by a cap nobody here asks for yet.
- */
-static bool
-compute_cap(struct pipe_screen *screen, enum pipe_compute_cap cap, uint64_t *out)
-{
-   uint64_t v[4] = { 0 };
-
-   if (!screen->get_compute_param)
-      return false;
-
-   int bytes = screen->get_compute_param(screen, PIPE_SHADER_IR_NIR, cap, v);
-   if (bytes == sizeof(uint64_t)) {
-      *out = v[0];
-   } else if (bytes == sizeof(uint32_t)) {
-      /* memcpy and not a cast: some of these caps are 32 bits wide and some 64, and
-       * reading a word of one through a pointer to the other is what the compiler is
-       * allowed to assume never happens.
-       */
-      uint32_t narrow;
-      memcpy(&narrow, v, sizeof(narrow));
-      *out = narrow;
-   } else {
-      return false;
-   }
-   return true;
-}
-
 /* What a Gallium driver expects of a shader it is handed: NIR's own system values
  * lowered to the hardware's, and I/O as intrinsics rather than variables. This is
  * air_run.c's finalize_for_gallium, and the same three passes are in
  * tools/mesa/air-ir3.patch; a fourth copy would be the point at which they should
  * become one function of the frontend.
  */
-static int
+static unsigned
 type_size_vec4(const struct glsl_type *type, bool bindless)
 {
    return glsl_count_attribute_slots(type, false);
@@ -556,7 +525,9 @@ rwa_device_open(char *why, size_t why_size)
 
       if (!options_parsed) {
          driParseOptionInfo(&info, freedreno_options, ARRAY_SIZE(freedreno_options));
-         driParseConfigFiles(&cache, &info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
+         driParseConfigFiles(&cache, &info, &(driConfigFileParseParams){
+            .driverName = "msm",
+         });
          config.options = &cache;
          config.options_info = &info;
          options_parsed = true;
@@ -585,8 +556,7 @@ rwa_device_open(char *why, size_t why_size)
    }
 
    device->nir_options =
-      device->screen->get_compiler_options(device->screen, PIPE_SHADER_IR_NIR,
-                                           PIPE_SHADER_COMPUTE);
+      device->screen->nir_options[MESA_SHADER_COMPUTE];
    if (!device->nir_options) {
       say(why, why_size, "%s takes no NIR, so no Metal shader can be given to it",
           device->screen->get_name(device->screen));
@@ -621,11 +591,8 @@ rwa_device_open(char *why, size_t why_size)
     * threadgroup size, and the dispatch below checks the size it is actually given
     * against the compiled variant, where the number is the hardware's.
     */
-   uint64_t v;
-   device->max_threads_per_group =
-      compute_cap(device->screen, PIPE_COMPUTE_CAP_MAX_THREADS_PER_BLOCK, &v) ? v : 0;
-   device->thread_execution_width =
-      compute_cap(device->screen, PIPE_COMPUTE_CAP_SUBGROUP_SIZES, &v) ? v : 1;
+   device->max_threads_per_group = device->screen->compute_caps.max_threads_per_block;
+   device->thread_execution_width = MAX2(device->screen->compute_caps.subgroup_sizes, 1);
 
    /* And what a bound buffer's offset has to be a multiple of, which an argument
     * buffer's member is the only thing here to have one. Taken from the screen and not
@@ -1414,7 +1381,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
                          "frontend refuses on the shader side too", type_name);
       return NULL;
    default:
-      unreachable("texture_type_name admitted a type this switch does not");
+      UNREACHABLE("texture_type_name admitted a type this switch does not");
    }
 
    if (width == 0) {
@@ -1869,9 +1836,11 @@ rwa_texture_generate_mipmaps(struct rwa_texture *texture)
 static struct pipe_surface *
 texture_surface(struct rwa_texture *t)
 {
-   if (!t->surface)
-      t->surface = t->device->pipe->create_surface(t->device->pipe, t->res,
-                                                   &(struct pipe_surface){ .format = t->res->format });
+   if (!t->surface) {
+      t->surface = calloc(1, sizeof(*t->surface));
+      if (t->surface)
+         pipe_surface_init(t->device->pipe, t->surface, t->res, 0, 0);
+   }
    return t->surface;
 }
 
@@ -1910,7 +1879,9 @@ rwa_texture_destroy(struct rwa_texture *texture)
    /* The framebuffer may still hold its surface (draws leave it bound): let go of it first. */
    if (texture->surface) {
       fb_release_texture(texture->device, texture);
-      pipe_surface_reference(&texture->surface, NULL);
+      pipe_resource_reference(&texture->surface->texture, NULL);
+      free(texture->surface);
+      texture->surface = NULL;
    }
    argbuf_scrub(texture->device, NULL, texture, NULL);
    /* The view first: it holds a reference of its own on the resource. Nothing has to
@@ -3976,7 +3947,7 @@ struct rwa_bound {
  * sampler's two state objects is bound.
  */
 static int
-bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
+bind_stage(struct rwa_device *device, mesa_shader_stage stage,
            const struct air_shader_info *info, void **own_sampler,
            const bool *compare_sampler,
            const struct rwa_bindings *bindings, const struct rwa_buffer_bind *table,
@@ -4122,7 +4093,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             cb.buffer_offset = 0;
             cb.buffer_size = (unsigned)want;
          }
-         pipe->set_constant_buffer(pipe, stage, r->index, false, &cb);
+         pipe->set_constant_buffer(pipe, stage, r->index, &cb);
          break;
       }
 
@@ -4257,14 +4228,14 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
 
    if (info->cb_delta_ubo) {
       struct pipe_constant_buffer dcb = { .user_buffer = cb_deltas, .buffer_size = sizeof(cb_deltas) };
-      pipe->set_constant_buffer(pipe, stage, info->cb_delta_ubo - 1, false, &dcb);
+      pipe->set_constant_buffer(pipe, stage, info->cb_delta_ubo - 1, &dcb);
    }
    if (num_ssbo)
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
    if (num_views || device->n_bound_views[stage]) {
       unsigned had = device->n_bound_views[stage];
       if (num_views != had || memcmp(views, device->bound_views[stage], num_views * sizeof(views[0]))) {
-         pipe->set_sampler_views(pipe, stage, 0, num_views, had > num_views ? had - num_views : 0, false, views);
+         pipe->set_sampler_views(pipe, stage, 0, num_views, had > num_views ? had - num_views : 0, views);
          memset(device->bound_views[stage], 0, sizeof(device->bound_views[stage]));
          memcpy(device->bound_views[stage], views, num_views * sizeof(views[0]));
          device->n_bound_views[stage] = num_views;
@@ -4298,12 +4269,12 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
  * buffers are left bound (see struct rwa_bound).
  */
 static void
-unbind_stage(struct rwa_device *device, enum pipe_shader_type stage,
+unbind_stage(struct rwa_device *device, mesa_shader_stage stage,
              const struct rwa_bound *bound)
 {
    struct pipe_context *pipe = device->pipe;
    if (device->n_bound_views[stage])
-      pipe->set_sampler_views(pipe, stage, 0, 0, device->n_bound_views[stage], false, NULL);
+      pipe->set_sampler_views(pipe, stage, 0, 0, device->n_bound_views[stage], NULL);
    if (bound->num_images)
       pipe->set_shader_images(pipe, stage, 0, 0, bound->num_images, NULL);
    if (device->n_bound_samplers[stage]) {
@@ -4394,7 +4365,7 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
     * the next dispatch or dropped at delete, as before.
     */
    struct rwa_bound bound = { 0 };
-   if (bind_stage(device, PIPE_SHADER_COMPUTE, &compute->info, compute->own_sampler,
+   if (bind_stage(device, MESA_SHADER_COMPUTE, &compute->info, compute->own_sampler,
                   compute->compare_sampler,
                   bindings, table, table_count, name, &bound, why, why_size) != 0)
       return -1;
@@ -4413,7 +4384,7 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
     * wait for work dispatched through another pipeline of the same device.
     */
    int rc = finish_or_say_why(device, true, "dispatch", why, why_size);
-   unbind_stage(device, PIPE_SHADER_COMPUTE, &bound);
+   unbind_stage(device, MESA_SHADER_COMPUTE, &bound);
    return rc;
 }
 
@@ -5718,7 +5689,7 @@ strip_depth_stores(nir_shader *fs)
                colour++;
          }
       }
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
+      nir_progress(true, impl, nir_metadata_control_flow);
    }
    nir_foreach_shader_out_variable_safe(var, fs)
       if (var->data.location == FRAG_RESULT_DEPTH)
@@ -6409,11 +6380,6 @@ size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
 {
    /* Chlorophyll: a computed offset is bounded with NIR's range analysis where it can be (an index clamped or masked
     * by the shader, a loop counter): the binding then uploads up to that bound instead of the 4 KB cap. */
-   static const nir_unsigned_upper_bound_config ub_cfg = {
-      .min_subgroup_size = 1, .max_subgroup_size = 128, .max_workgroup_invocations = 1024,
-      .max_workgroup_count = { 65535, 65535, 65535 }, .max_workgroup_size = { 1024, 1024, 64 },
-      .vertex_attrib_max = { [0 ... 31] = UINT32_MAX },
-   };
    struct hash_table *range_ht = NULL;
    for (unsigned i = 0; i < info->num_resources; i++) {
       struct air_resource *r = &info->resources[i];
@@ -6434,7 +6400,7 @@ size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
                if (!nir_src_is_const(in->src[1])) {
                   if (!range_ht)
                      range_ht = _mesa_pointer_hash_table_create(NULL);
-                  uint32_t ub = nir_unsigned_upper_bound(nir, range_ht, nir_get_scalar(in->src[1].ssa, 0), &ub_cfg);
+                  uint32_t ub = nir_unsigned_upper_bound(nir, range_ht, nir_get_scalar(in->src[1].ssa, 0));
                   if (ub >= 65536) {
                      bounded = false;
                      continue;
@@ -6504,7 +6470,7 @@ add_cb_deltas(nir_shader *nir, struct air_shader_info *info)
             nir_intrinsic_set_range(in, ~0);
          }
       }
-      nir_metadata_preserve(impl, nir_metadata_control_flow);
+      nir_progress(true, impl, nir_metadata_control_flow);
    }
    nir->info.num_ubos = MAX2(nir->info.num_ubos, CB_DELTA_SLOT + 1);
    info->cb_delta_mask = mask;
@@ -7193,7 +7159,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
       if (present++ == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
       surf[i] = texture_surface(t);
       if (!surf[i]) { say(why, why_size, "no render surface for colour attachment %u", i); goto fail; }
-      fb.cbufs[i] = surf[i];
+      fb.cbufs[i] = *surf[i];
    }
    if (present == 0 && !clear->depth) {
       return 0;            /* only empty slots: nothing to clear */
@@ -7203,18 +7169,18 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
       if (present == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
       zsurf = texture_surface(t);
       if (!zsurf) { say(why, why_size, "no render surface for the depth attachment"); goto fail; }
-      fb.zsbuf = zsurf;
+      fb.zsbuf = *zsurf;
    }
    fb.width = w;
    fb.height = h;
    fb_bind(device, &fb, clear->color, clear->color_count, clear->depth);
    for (unsigned i = 0; i < clear->color_count; i++) {
-      if (!(clear->color_mask & (1u << i)) || !fb.cbufs[i])
+      if (!(clear->color_mask & (1u << i)) || !fb.cbufs[i].texture)
          continue;
       union pipe_color_union cv;
       for (unsigned c = 0; c < 4; c++)
          cv.f[c] = clear->color_value[i][c];
-      pipe->clear(pipe, PIPE_CLEAR_COLOR0 << i, NULL, &cv, 0.0, 0);
+      pipe->clear(pipe, PIPE_CLEAR_COLOR0 << i, UINT32_MAX, 0xff, NULL, &cv, 0.0, 0);
    }
    if (clear->depth) {
       unsigned mask = 0;
@@ -7224,7 +7190,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
          mask |= PIPE_CLEAR_STENCIL;
       if (mask) {
          union pipe_color_union none = { 0 };
-         pipe->clear(pipe, mask, NULL, &none, clear->clear_depth ? (double)*clear->clear_depth : 0.0,
+         pipe->clear(pipe, mask, UINT32_MAX, 0xff, NULL, &none, clear->clear_depth ? (double)*clear->clear_depth : 0.0,
                      clear->clear_stencil ? *clear->clear_stencil & 0xff : 0);
       }
    }
@@ -7554,7 +7520,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
              rwa_device_name(device), i);
          return -1;
       }
-      fb.cbufs[i] = surf[i];
+      fb.cbufs[i] = *surf[i];
    }
    if (draw->depth) {
       zsurf = texture_surface(draw->depth);
@@ -7563,7 +7529,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
              rwa_device_name(device));
          return -1;
       }
-      fb.zsbuf = zsurf;
+      fb.zsbuf = *zsurf;
    }
    /*
     * Chlorophyll: a shader that reads a colour attachment ([[color(n)]] framebuffer fetch) is drawn in SYSMEM.
@@ -7717,13 +7683,13 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 
    struct rwa_bound fbound = { 0 }, vbound = { 0 };
    int rc = -1;
-   if (bind_stage(device, PIPE_SHADER_FRAGMENT, &render->finfo, render->frag_own_sampler,
+   if (bind_stage(device, MESA_SHADER_FRAGMENT, &render->finfo, render->frag_own_sampler,
                   render->frag_compare_sampler,
                   &draw->fragment, draw->fragment_buffer_table, draw->fragment_buffer_table_count,
                   fname, &fbound, why, why_size) != 0)
       goto unbind;
    if (!render->generated_vertex &&
-       bind_stage(device, PIPE_SHADER_VERTEX, &render->vinfo, render->vert_own_sampler,
+       bind_stage(device, MESA_SHADER_VERTEX, &render->vinfo, render->vert_own_sampler,
                   render->vert_compare_sampler,
                   &draw->vertex, draw->vertex_buffer_table, draw->vertex_buffer_table_count, vname,
                   &vbound, why, why_size) != 0)
@@ -7758,7 +7724,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
           format_has_stencil(draw->depth->res->format))
          mask |= PIPE_CLEAR_STENCIL;
       if (mask)
-         pipe->clear(pipe, mask, NULL, &clear,
+         pipe->clear(pipe, mask, UINT32_MAX, 0xff, NULL, &clear,
                      draw->clear_depth ? (double)*draw->clear_depth : 0.0,
                      draw->clear_stencil ? *draw->clear_stencil & 0xff : 0);
    }
@@ -7812,9 +7778,9 @@ unbind:
    /* Chlorophyll: views and samplers stay bound for the next draw (rwa_device.bound_views; unbind_tex_state frees them
     * safely); shader images do not. */
    if (fbound.num_images)
-      pipe->set_shader_images(pipe, PIPE_SHADER_FRAGMENT, 0, 0, fbound.num_images, NULL);
+      pipe->set_shader_images(pipe, MESA_SHADER_FRAGMENT, 0, 0, fbound.num_images, NULL);
    if (!render->generated_vertex && vbound.num_images)
-      pipe->set_shader_images(pipe, PIPE_SHADER_VERTEX, 0, 0, vbound.num_images, NULL);
+      pipe->set_shader_images(pipe, MESA_SHADER_VERTEX, 0, 0, vbound.num_images, NULL);
    /* The framebuffer is released before the surfaces are destroyed, and both before the
     * caller's next call, which may be rwa_texture_destroy on one of these attachments:
     * a context still holding a surface of a freed resource is the same trap as a bound

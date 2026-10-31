@@ -1,6 +1,7 @@
 /*
  * Copyright © 2026 Darwin on redwood contributors
  * SPDX-License-Identifier: MIT
+ * jasmine: adapted to Mesa 26.2.5 APIs (2026-10-31).
  */
 
 /*
@@ -252,7 +253,7 @@ struct air_vertex_attribute {
 };
 
 struct air_shader_info {
-   gl_shader_stage stage;     /* MESA_SHADER_NONE for an air.visible function */
+   mesa_shader_stage stage;     /* MESA_SHADER_NONE for an air.visible function */
    const char *entry_point;
    unsigned num_resources;
    struct air_resource *resources;
