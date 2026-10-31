@@ -308,8 +308,12 @@ bg_install_fallback(Class c)
    NSInteger _status;
    NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
    dispatch_group_t _done;                                 // left when the completion (fence) has run: waitUntilCompleted
+   uint64_t _tgen[8], _tepoch[8];                          // jasmine: render tickets opened for this command buffer
+   uint32_t _tsurf[8];
+   unsigned _tcount;
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
+- (void)bgTicketFor:(id)texture;
 - (void)bgRecord:(BGWork *)work;
 @end
 
@@ -354,7 +358,9 @@ bg_install_fallback(Class c)
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
 - (struct rwa_texture *)rwaTexture;
-- (struct rwa_texture *)rwaTextureSampled;   // also cleans the CPU cache of a surface another process wrote since
+- (void)bgShadowLocked;   // jasmine: compositor render targets over an IOSurface draw in a shared shadow
+- (struct rwa_texture *)rwaSurfaceTexture;   // jasmine: the imported IOSurface itself (under a shadow too), or NULL
+- (struct rwa_texture *)rwaTextureSampled;  // also cleans the CPU cache of a surface another process wrote since
 @end
 
 @interface BGMTLSampler : _MTLSamplerState {
@@ -992,9 +998,38 @@ bg_air_slice(NSData *d)
 }
 - (void)dealloc
 {
+   if (_tcount) {   // opened and never committed: give the generations up, or the display waits its 1 s bound for them
+      bg_lock();
+      for (unsigned i = 0; i < _tcount; i++)
+         rwa_ticket_end([(BGMTLDevice *)[_queue device] rwa], _tgen[i], _tepoch[i], true, 0);
+      bg_unlock();
+   }
    [_queue release]; [_work release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
    if (_done) dispatch_release(_done);
    [super dealloc];
+}
+/* jasmine: a render ticket (kernel j0110) for each IOSurface this command buffer draws into, opened when the pass is
+ * encoded: CoreAnimation hands the framebuffer to the display without waiting for the GPU (Apple's display waits on the
+ * GPU itself), and the kernel's presenter only knows the jobs already submitted, so it flipped frames the GPU then drew
+ * (black bands rolling down the panel, tearing once drawn through a shadow). With a ticket the presenter shows the
+ * surface only once commit sealed it and the GPU passed that submit. Refused (-EBUSY) while the surface is still on the
+ * display: counted, as that is CA drawing into the frame being shown. */
+- (void)bgTicketFor:(id)texture
+{
+   if (!texture || _status >= 2 || _tcount == 8) return;
+   IOSurfaceRef s = (IOSurfaceRef)[(BGMTLTexture *)texture iosurface];
+   struct rwa_texture *imp = [(BGMTLTexture *)texture rwaSurfaceTexture];
+   if (!s || !imp) return;
+   uint32_t id = IOSurfaceGetID(s);
+   for (unsigned i = 0; i < _tcount; i++)
+      if (_tsurf[i] == id) return;
+   static unsigned busy, other, opened;
+   bg_lock();
+   int r = rwa_texture_ticket_begin(imp, &_tgen[_tcount], &_tepoch[_tcount]);
+   bg_unlock();
+   if (r == 0) { _tsurf[_tcount++] = id; if (++opened == 1) BG_LOG("render tickets: first opened (IOSurface %u)\n", id); }
+   else if (r == -EBUSY) { if (++busy % 100 == 1) BG_LOG("render tickets: %u refused busy (IOSurface %u still open or on the display)\n", busy, id); }
+   else if (++other <= 3) BG_LOG("render tickets: begin failed %d (IOSurface %u)\n", r, id);
 }
 - (id)device { return [_queue device]; }
 - (void)bgRecord:(BGWork *)w { [_work addObject:w]; }
@@ -1114,6 +1149,14 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    _status = 2;   // Committed
    char why[512] = { 0 };
    bg_lock();
+   // jasmine: surfaces this command buffer renders or blits into draw in their shared shadow (bgShadowLocked)
+   for (BGWork *w in _work) {
+      if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
+         for (unsigned i = 0; i < w->color_count; i++)
+            if (w->color[i]) [(BGMTLTexture *)w->color[i] bgShadowLocked];
+      } else if ([w->dst isKindOfClass:[BGMTLTexture class]])
+         [(BGMTLTexture *)w->dst bgShadowLocked];
+   }
    for (BGWork *w in _work) {
       if (w->kind == BG_WORK_DISPATCH) {
          struct rwa_buffer *bufs[BG_MAX_BINDINGS] = { NULL };
@@ -1278,6 +1321,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    if (_status != 5 && !defer_scheduled)
       _status = 3;   // Scheduled
    struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
+   if (_tcount) {   // jasmine: seal this command buffer's render tickets with its submit (bgTicketFor)
+      uint32_t seqno = fence ? rwa_fence_seqno([dev rwa], fence) : 0;
+      for (unsigned i = 0; i < _tcount; i++)
+         rwa_ticket_end([dev rwa], _tgen[i], _tepoch[i], !seqno, seqno);
+      _tcount = 0;
+   }
    uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    bg_unlock();
    if (!defer_scheduled) {
@@ -1491,6 +1540,8 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       if (d.stencilAttachment.texture) BG_LOG("  stencil fmt %lu load %lu clear %u\n", (unsigned long)d.stencilAttachment.texture.pixelFormat,
                                              (unsigned long)d.stencilAttachment.loadAction, d.stencilAttachment.clearStencil);
    }
+   for (unsigned i = 0; i < 8; i++)
+      if (d.colorAttachments[i].texture) [self bgTicketFor:d.colorAttachments[i].texture];
    return [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease];
 }
 - (id)blitCommandEncoder { return [[[BGMTLBlitEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
@@ -1635,6 +1686,51 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 @end
 
 
+// jasmine: the compositor's shadows, one per IOSurface (bgShadowLocked), shared by every texture over it. Under bg_lock.
+enum { BG_SHADOWS = 16 };
+static struct { uint32_t id; struct rwa_texture_shape shape; struct rwa_texture *tex; unsigned refs; } bg_shadows[BG_SHADOWS];
+
+static struct rwa_texture *
+bg_shadow_get(BGMTLDevice *dev, IOSurfaceRef surface, const struct rwa_texture_shape *shape, struct rwa_texture *import)
+{
+   uint32_t id = IOSurfaceGetID(surface);
+   int free_slot = -1;
+   for (int i = 0; i < BG_SHADOWS; i++) {
+      if (bg_shadows[i].tex && bg_shadows[i].id == id && !memcmp(&bg_shadows[i].shape, shape, sizeof(*shape))) {
+         bg_shadows[i].refs++;
+         return bg_shadows[i].tex;
+      }
+      if (!bg_shadows[i].tex && free_slot < 0) free_slot = i;
+   }
+   char why[512] = { 0 };
+   if (free_slot < 0) { BG_LOG("drawable shadow: table full, IOSurface %u drawn in place\n", id); return NULL; }
+   struct rwa_texture *sh = rwa_texture_create([dev rwa], shape, why, sizeof(why));
+   const unsigned z[3] = { 0, 0, 0 }, all[3] = { shape->width, shape->height, 1 };
+   if (!sh || rwa_texture_copy(import, 0, 0, z, sh, 0, 0, z, all) != 0) {
+      if (sh) rwa_texture_destroy(sh);
+      BG_LOG("drawable shadow refused for IOSurface %u: %s\n", id, why);
+      return NULL;
+   }
+   bg_shadows[free_slot].id = id;
+   bg_shadows[free_slot].shape = *shape;
+   bg_shadows[free_slot].tex = sh;
+   bg_shadows[free_slot].refs = 1;
+   return sh;
+}
+
+static void
+bg_shadow_release(struct rwa_texture *sh)
+{
+   for (int i = 0; i < BG_SHADOWS; i++)
+      if (bg_shadows[i].tex == sh) {
+         if (--bg_shadows[i].refs == 0) {
+            rwa_texture_destroy(sh);
+            bg_shadows[i].tex = NULL;
+         }
+         return;
+      }
+}
+
 // ---- texture / sampler / render pipeline ----------------------------------------------------------------------------
 @implementation BGMTLTexture
 + (void)load { ensure_protocol(self, "MTLTexture"); ensure_protocol(self, "MTLTextureImplementation"); }
@@ -1683,24 +1779,6 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          size_t n = strlen(why);
          snprintf(why + n, sizeof(why) - n, " (usage asked 0x%lx)", (unsigned long)asked);
       }
-      /* jasmine: in the compositor a drawable is drawn in a shadow of the same shape and copied to the surface in one GPU
-       * blit at the end of each command buffer that wrote it (commit), as libsweetca's GL path does. The panel's scaler reads
-       * the surface itself, and the render server draws into one it still shows: drawn there directly over a whole frame
-       * of passes, the panel showed the half-drawn frame (a black band rolling down the screen, first backboardd runs).
-       * BGMTL_SHADOW=0 draws into the surface again. */
-      static int shadow = -1;
-      if (shadow < 0) shadow = getenv("BGMTL_BB") && !(getenv("BGMTL_SHADOW") && getenv("BGMTL_SHADOW")[0] == '0');
-      if (_tex && !_copySurface && shadow) {
-         struct rwa_texture *sh = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
-         const unsigned z[3] = { 0, 0, 0 }, all[3] = { _shape.width, _shape.height, 1 };
-         if (sh && rwa_texture_copy(_tex, 0, 0, z, sh, 0, 0, z, all) == 0) {
-            _surfTex = _tex;
-            _tex = sh;
-         } else {
-            if (sh) rwa_texture_destroy(sh);
-            BG_LOG("drawable shadow refused: %s\n", why);
-         }
-      }
       bg_unlock();
       if (_tex && !_copySurface) {
          _surface = CFRetain(surface);
@@ -1717,7 +1795,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 }
 - (void)dealloc
 {
-   bg_lock(); if (_tex) rwa_texture_destroy(_tex); if (_surfTex) rwa_texture_destroy(_surfTex); bg_unlock();
+   bg_lock();
+   if (_surfTex) { bg_shadow_release(_tex); rwa_texture_destroy(_surfTex); }
+   else if (_tex) rwa_texture_destroy(_tex);
+   bg_unlock();
    if (_surface) CFRelease(_surface);
    if (_copySurface) CFRelease(_copySurface);
    [_linSrc release];
@@ -1725,6 +1806,24 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    [super dealloc];
 }
 - (void *)iosurface { return (void *)(_surface ? _surface : _copySurface); }
+/* jasmine: in the compositor a surface CA renders into is drawn in a shadow and copied to the surface in one GPU blit at
+ * the end of each command buffer that wrote it (commit). The panel's scaler reads the surface itself, and the render
+ * server draws into one it still shows: drawn there directly over a frame's passes, the panel showed the half-drawn frame
+ * (a black band rolling down the screen). Made when the texture is first a render target (surfaces CA only samples keep
+ * reading the live surface), and one per surface, shared by every texture CA makes over it: CA redraws only the damaged
+ * part of a framebuffer and expects the rest to be that framebuffer's previous frame, which a shadow per texture object
+ * did not hold (motion jumped back and forth). BGMTL_SHADOW=0 draws into the surface again. Caller holds bg_lock. */
+- (struct rwa_texture *)rwaSurfaceTexture { return _surfTex ? _surfTex : (_surface ? _tex : NULL); }
+- (void)bgShadowLocked
+{
+   static int on = -1;
+   if (on < 0) on = getenv("BGMTL_BB") && !(getenv("BGMTL_SHADOW") && getenv("BGMTL_SHADOW")[0] == '0');
+   if (!on || _surfTex || !_surface || !_tex) return;
+   struct rwa_texture *sh = bg_shadow_get(_owner, (IOSurfaceRef)_surface, &_shape, _tex);
+   if (!sh) return;
+   _surfTex = _tex;
+   _tex = sh;
+}
 // jasmine: (re)copy a sampled surface's pixels; the caller holds bg_lock.
 - (void)copySurfaceLocked
 {

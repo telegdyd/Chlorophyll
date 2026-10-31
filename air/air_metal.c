@@ -70,6 +70,9 @@ struct pipe_screen *fd_screen_create(int, const struct pipe_screen_config *, str
 #include "util/half_float.h"
 #include "util/u_inlines.h"
 #include "freedreno_screen.h"
+#include "freedreno_resource.h"   /* jasmine: render tickets name the BO */
+#include "freedreno_fence.h"
+#include <errno.h>
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/u_gen_mipmap.h"
@@ -4554,6 +4557,39 @@ rwa_flush(struct rwa_device *device)
    struct pipe_fence_handle *fence = NULL;
    device->pipe->flush(device->pipe, &fence, 0);
    return (struct rwa_fence *)fence;
+}
+
+/* jasmine: render tickets, as libsweetca's mode 2 (sweetgl_tickets.inc) uses them, from the darwin winsys. */
+uint64_t darwin_ticket_query(struct fd_device *dev, uint64_t *epoch);
+int darwin_ticket_begin(struct fd_device *, const uint32_t *, unsigned, uint64_t *, uint64_t *);
+int darwin_ticket_end(struct fd_device *, uint64_t, uint64_t, bool, uint32_t);
+
+int
+rwa_texture_ticket_begin(struct rwa_texture *texture, uint64_t *generation, uint64_t *epoch)
+{
+   if (!texture || !texture->imported || !texture->res || texture->device->software)
+      return -ENOTSUP;
+   uint32_t handle = fd_resource(texture->res)->bo->handle;
+   return darwin_ticket_begin(fd_screen(texture->device->screen)->dev, &handle, 1, generation, epoch);
+}
+
+int
+rwa_ticket_end(struct rwa_device *device, uint64_t generation, uint64_t epoch, int abort, uint32_t seqno)
+{
+   return darwin_ticket_end(fd_screen(device->screen)->dev, generation, epoch, abort, seqno);
+}
+
+uint32_t
+rwa_fence_seqno(struct rwa_device *device, struct rwa_fence *fence)
+{
+   struct pipe_fence_handle *f = (struct pipe_fence_handle *)fence;
+   if (!f)
+      return 0;
+   /* drains the submit queue (timeout 0), so the kernel has the submit and its number */
+   (void)device->screen->fence_finish(device->screen, device->pipe, f, 0);
+   while (f->last_fence)
+      f = f->last_fence;
+   return f->fence ? f->fence->kfence : 0;
 }
 
 int

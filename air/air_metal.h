@@ -591,6 +591,13 @@ struct rwa_fence;
 struct rwa_fence *rwa_flush(struct rwa_device *device);
 int rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why, size_t why_size);
 void rwa_fence_release(struct rwa_device *device, struct rwa_fence *fence);
+/* jasmine: the kernel's render tickets (j0110) for an imported IOSurface the GPU is about to draw: the display shows it
+ * only once the ticket is sealed and the GPU has passed the sealed submit. begin: 0, -EBUSY (the surface's previous
+ * ticket is open or it is on the display), -ENOTSUP (tickets off, or not an import), or another error. */
+int rwa_texture_ticket_begin(struct rwa_texture *texture, uint64_t *generation, uint64_t *epoch);
+int rwa_ticket_end(struct rwa_device *device, uint64_t generation, uint64_t epoch, int abort, uint32_t seqno);
+/* The kernel sequence number of a flushed fence's submit, after draining the submit queue; 0 if none. */
+uint32_t rwa_fence_seqno(struct rwa_device *device, struct rwa_fence *fence);
 int rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, const unsigned so[3],
                      struct rwa_texture *dst, unsigned dlevel, unsigned dslice, const unsigned dorg[3], const unsigned size[3]);
 /* Chlorophyll: generateMipmapsForTexture on the GPU, levels 1..last from level 0 (0 or -1). */

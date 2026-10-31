@@ -29,6 +29,21 @@ bgmtl_sweet_init(void)
    if (!enable || strcmp(enable, "1") ||
        (strcmp(name, "bgmtl_registered_probe") && strcmp(name, "backboardd"))) return;
    fprintf(stderr, "BGMTL registration: enabled in %s\n", name);
+   // A/B switches without a new boot image: KEY=VALUE lines (FD_MESA_DEBUG=inorder, BGMTL_SHADOW=0, ...), set before
+   // the device and its Mesa screen exist. The boot command line has no room left for them.
+   FILE *ab = fopen("/private/var/tmp/bgmtl-bb.env", "r");
+   if (ab) {
+      char line[256];
+      while (fgets(line, sizeof(line), ab)) {
+         line[strcspn(line, "\r\n")] = 0;
+         char *eq = strchr(line, '=');
+         if (!eq || eq == line) continue;
+         *eq = 0;
+         setenv(line, eq + 1, 1);
+         fprintf(stderr, "BGMTL registration: %s=%s (bgmtl-bb.env)\n", line, eq + 1);
+      }
+      fclose(ab);
+   }
    @autoreleasepool {
       void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
       if (!add) { fprintf(stderr, "BGMTL registration: MTLAddDevice missing\n"); return; }
