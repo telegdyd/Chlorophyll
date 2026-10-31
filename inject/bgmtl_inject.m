@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: MIT
+#ifdef RWA_SWEETGPU
+// jasmine: isolated iOS 16 registration experiment; no system-process path.
+#include "bgmtl_sweet_inject.m"
+#else
 // bgmtl-inject.dylib: puts BGMTLDevice into ONE process, MercuryPosterExtension, and nowhere else.
 //
 // Linked into the extension's executable as an extra LC_LOAD_DYLIB (like sweetfp.dylib into PosterBoard: Renegade's `bgmtl` feature, OFF by
@@ -400,3 +404,4 @@ bgmtl_inject_init(void)
       pthread_detach(th);
    }
 }
+#endif /* RWA_SWEETGPU */

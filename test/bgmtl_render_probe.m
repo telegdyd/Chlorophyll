@@ -13,7 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef BGMTL_REGISTERED_PROBE
+// jasmine: this executable links only Apple's frameworks, never libbgmtl.
+#include <mach-o/dyld.h>
+#define bgmtl_create_device MTLCreateSystemDefaultDevice
+#else
 extern id bgmtl_create_device(void);
+#endif
 
 static int g_pass, g_fail;
 #define CHECK(cond, ...) do { if (cond) { g_pass++; } else { g_fail++; printf("  FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
@@ -64,9 +70,29 @@ int
 main(int argc, char **argv)
 {
    @autoreleasepool {
+#ifdef BGMTL_REGISTERED_PROBE
+      if (argc == 2 && (!strcmp(argv[1], "--expect-stock") || !strcmp(argv[1], "--expect-inert"))) {
+         id dev = MTLCreateSystemDefaultDevice();
+         BOOL stock = !dev || strcmp(object_getClassName(dev), "BGMTLDevice");
+         BOOL inserted = NO;
+         for (uint32_t i = 0; i < _dyld_image_count(); i++)
+            if (strstr(_dyld_get_image_name(i), "/bgmtl_inject.dylib")) inserted = YES;
+         BOOL ok = stock && (strcmp(argv[1], "--expect-inert") || inserted);
+         printf("registration gate: device=%s inserted=%d %s\n", dev ? object_getClassName(dev) : "nil", inserted, ok ? "PASS" : "FAIL");
+         [dev release];
+         return ok ? 0 : 1;
+      }
+#endif
       if (argc < 3) { printf("usage: bgmtl_render_probe kernels.metallib render.metallib\n"); return 2; }
       printf("== BGMTLDevice textures/render probe (iOS %s)\n", [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String]);
       g_dev = bgmtl_create_device();
+#ifdef BGMTL_REGISTERED_PROBE
+      id again = MTLCreateSystemDefaultDevice();
+      BOOL registered = g_dev && !strcmp(object_getClassName(g_dev), "BGMTLDevice") && again == g_dev && [g_dev registryID] == 0x10000b512ULL;
+      printf("system default registration: class=%s stable=%d registry=%llx %s\n", g_dev ? object_getClassName(g_dev) : "nil", again == g_dev, (unsigned long long)[g_dev registryID], registered ? "PASS" : "FAIL");
+      [again release];
+      if (!registered) return 4;
+#endif
       g_queue = [g_dev newCommandQueue];
       id klib = load_lib(argv[1]), rlib = load_lib(argv[2]);
       if (!g_dev || !g_queue || !klib || !rlib) return 3;
