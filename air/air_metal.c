@@ -7435,6 +7435,69 @@ extern int fd_mesa_debug;
 extern int fd_mesa_debug __attribute__((weak_import));
 #endif
 
+#ifdef RWA_SWEETGPU
+#include "a5xx/fd5_emit.h"
+/* jasmine: the a5xx attachment-feedback barrier inside the batch. freedreno's texture_barrier on a5xx is a whole context
+ * flush (only a6xx has an in-batch one), and CoreAnimation fetches at every rounded corner: each fetching draw ended
+ * the batch, began a new one and re-emitted all state -- the largest share of backboardd's commit in step 7 r19
+ * (Control Center: commit 54 % of the render thread). These are libsweetca's SWEETCA_SYS_BARRIER=2 commands (Mesa
+ * patch 0008, in GL's production setting): colour written back, prior work done, colour cache and UCHE invalidated, in
+ * draw order. Forced sysmem only (Chlorophyll's fbfetch rule), so the draw ring runs once. Wider than GL's: up to four
+ * colour attachments and a depth one (CoreAnimation's corner clip draws into two); compressed or UBWC attachments, an
+ * empty or missing batch, queries and a pending fence still take the flush. RWA_FB_BARRIER=0 always flushes. */
+static bool
+fd5_feedback_barrier(struct pipe_context *pipe) in_dt
+{
+   static int on = -1;
+   static unsigned kept, refused[4];
+   if (on < 0) on = !(getenv("RWA_FB_BARRIER") && getenv("RWA_FB_BARRIER")[0] == '0');
+   struct fd_context *ctx = fd_context(pipe);
+   struct fd_batch *batch = ctx->batch;
+   int why = -1;
+   if (!on || !FD_DBG(SYSMEM))
+      why = 0;
+   else if (!batch || batch->flushed || batch->nondraw || !batch->num_draws || batch->prologue || batch->tessellation ||
+            ctx->stats_users || ctx->occlusion_queries_active || ctx->streamout.num_targets ||
+            !list_is_empty(&ctx->acc_active_queries) || !list_is_empty(&ctx->hw_active_queries))
+      why = 1;
+   else if (ctx->last_fence)
+      why = 2;
+   else {
+      const struct pipe_framebuffer_state *fb = &batch->framebuffer;
+      if (!fb->nr_cbufs || fb->samples > 1 || fb->layers > 1)
+         why = 3;
+      for (unsigned i = 0; why < 0 && i < fb->nr_cbufs; i++) {
+         const struct pipe_surface *s = &fb->cbufs[i];
+         if (!s->texture)
+            continue;
+         if (s->level || s->first_layer || s->last_layer || s->texture->target != PIPE_TEXTURE_2D ||
+             s->texture->nr_samples > 1 || fd_resource_ubwc_enabled(fd_resource(s->texture), 0) ||
+             util_format_is_compressed(s->format) || util_format_is_depth_or_stencil(s->format))
+            why = 3;
+      }
+   }
+   if (why >= 0) {
+      if (++refused[why] == 1 || refused[why] % 5000 == 0)
+         fprintf(stderr, "libbgair: feedback barrier flushed (reason %d: %u off, %u batch, %u fence, %u attachments; %u kept)\n",
+                 why, refused[0], refused[1], refused[2], refused[3], kept);
+      return false;
+   }
+   struct fd_ringbuffer *ring = batch->draw;
+   fd5_event_write(batch, ring, PC_CCU_FLUSH_COLOR_TS, true);
+   if (batch->framebuffer.zsbuf.texture)
+      fd5_event_write(batch, ring, PC_CCU_FLUSH_DEPTH_TS, true);
+   fd5_event_write(batch, ring, CACHE_FLUSH_TS, true);
+   OUT_PKT7(ring, CP_WAIT_FOR_IDLE, 0);
+   fd5_event_write(batch, ring, PC_CCU_INVALIDATE_COLOR, false);
+   fd5_cache_flush(batch, ring);   /* UCHE invalidate, then wait for idle */
+   fd_batch_needs_flush(batch);
+   if (++kept == 1 || kept % 20000 == 0)
+      fprintf(stderr, "libbgair: feedback barrier kept in the batch (%u; %u/%u/%u/%u flushed)\n", kept, refused[0],
+              refused[1], refused[2], refused[3]);
+   return true;
+}
+#endif
+
 int
 rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                 char *why, size_t why_size)
@@ -7987,7 +8050,10 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          device->n_bound_views[MESA_SHADER_FRAGMENT] = MAX2(device->n_bound_views[MESA_SHADER_FRAGMENT], unit + 1);
          device->n_bound_samplers[MESA_SHADER_FRAGMENT] = MAX2(device->n_bound_samplers[MESA_SHADER_FRAGMENT], unit + 1);
       }
-      pipe->texture_barrier(pipe, PIPE_TEXTURE_BARRIER_FRAMEBUFFER);
+#ifdef RWA_SWEETGPU
+      if (!fd5_feedback_barrier(pipe))
+#endif
+         pipe->texture_barrier(pipe, PIPE_TEXTURE_BARRIER_FRAMEBUFFER);
    }
 
    {

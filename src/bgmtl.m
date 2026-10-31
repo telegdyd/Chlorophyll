@@ -21,6 +21,7 @@
 #include <pthread.h>
 #include <Block.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -115,6 +116,11 @@ bg_defer_scheduled(void)
    if (d < 0) d = getenv("BGMTL_DEFER_SCHEDULED") && getenv("BGMTL_DEFER_SCHEDULED")[0] == '1';
    return d;
 }
+
+// BGMTL_TIMING=1: the commit timeline (bg_tm, beside -commit)
+enum { BG_TM_CREATE, BG_TM_COMMIT, BG_TM_DONE, BG_TM_WAITC, BG_TM_WAITS };
+static int bg_timing(void);
+static void bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c);
 
 // One Gallium context serves every thread of the process, and QuartzCore commits from several (the render thread and
 // com.apple.coreanimation.asynchronous at once crashed in fd6_draw_vbos). Every call that reaches the context runs under this
@@ -1004,6 +1010,7 @@ bg_air_slice(NSData *d)
    _presents = [[NSMutableArray alloc] init];
    _done = dispatch_group_create();
    _status = 1;   // MTLCommandBufferStatusEnqueued
+   if (bg_timing()) bg_tm(BG_TM_CREATE, 0, 0, 0);
    return self;
 }
 - (void)dealloc
@@ -1059,7 +1066,12 @@ bg_air_slice(NSData *d)
    if (!block) return;
    if (_status >= 4) block(self); else [_completed addObject:[[block copy] autorelease]];
 }
-- (void)waitUntilScheduled { if (_status >= 2 && getenv("BGMTL_BB") && bg_defer_scheduled()) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
+- (void)waitUntilScheduled
+{
+   uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   if (_status >= 2 && getenv("BGMTL_BB") && bg_defer_scheduled()) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+   if (bg_timing()) bg_tm(BG_TM_WAITS, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t, 0, 0);
+}
 
 // The fence wait of a commit. A failed wait is not yet a failed command buffer: backboardd's CoreAnimation exits on the
 // first failed one (one "fence timeout" and the compositor restarted, while the kernel counted every submission completed
@@ -1148,6 +1160,67 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       bgmtl_note_line(line);
       win_start = t_waited; n = draws = enc = wait = gap = enc_max = wait_max = 0;
    }
+}
+
+// jasmine (step 7, the 29 ms frame): asynchronous commits' timeline, one line a second while committing, with
+// BGMTL_TIMING=1 (bgmtl-bb.env). What CoreAnimation does between commits (gap), our commit (translation, Mesa flush,
+// kernel submit), submit to fence observed on the completion queue, the completion's own work, how many command
+// buffers were in flight when one was created (0 with a creation soon after a completion: CA waited for it), CA's
+// waitUntil* calls, and the process's CPU time.
+static int
+bg_timing(void)
+{
+   static int on = -1;
+   if (on < 0) on = getenv("BGMTL_TIMING") && getenv("BGMTL_TIMING")[0] == '1';
+   return on;
+}
+static void
+bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
+{
+   static os_unfair_lock l = OS_UNFAIR_LOCK_INIT;
+   static uint64_t win, last_end, last_done, inflight, cpu0;
+   static uint64_t ncreate, idle_create, after_done, ncommit, commit_ns, commit_max, gap_ns, gap_max, ndone, gpu_ns, gpu_max,
+                   done_ns, nwaitc, waitc_ns, nwaits, waits_ns;
+   uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   os_unfair_lock_lock(&l);
+   switch (ev) {
+   case BG_TM_CREATE:
+      ncreate++;
+      if (!inflight) { idle_create++; if (last_done && now - last_done < 2000000) after_done++; }
+      break;
+   case BG_TM_COMMIT:   // a = commit start, b = commit end
+      ncommit++; inflight++;
+      commit_ns += b - a; if (b - a > commit_max) commit_max = b - a;
+      if (last_end && a > last_end) { gap_ns += a - last_end; if (a - last_end > gap_max) gap_max = a - last_end; }
+      last_end = b;
+      break;
+   case BG_TM_DONE:     // a = flushed, b = fence observed, c = completion work finished
+      ndone++; if (inflight) inflight--;
+      gpu_ns += b - a; if (b - a > gpu_max) gpu_max = b - a;
+      done_ns += c - b; last_done = c;
+      break;
+   case BG_TM_WAITC: nwaitc++; waitc_ns += a; break;
+   case BG_TM_WAITS: nwaits++; waits_ns += a; break;
+   }
+   struct rusage ru;
+   if (!win) { win = now; getrusage(RUSAGE_SELF, &ru); cpu0 = ru.ru_utime.tv_sec * 1000000ull + ru.ru_utime.tv_usec + ru.ru_stime.tv_sec * 1000000ull + ru.ru_stime.tv_usec; }
+   if (ev == BG_TM_COMMIT && now - win >= 1000000000ull) {
+      getrusage(RUSAGE_SELF, &ru);
+      uint64_t cpu = ru.ru_utime.tv_sec * 1000000ull + ru.ru_utime.tv_usec + ru.ru_stime.tv_sec * 1000000ull + ru.ru_stime.tv_usec;
+      double s = (now - win) / 1e9;
+      char line[512];
+      snprintf(line, sizeof(line), "timing: %.1f s: %llu created (%llu with none in flight, %llu of them <2 ms after a completion), "
+               "%llu commits: commit %.1f ms avg %.1f max, CA between commits %.1f avg %.1f max, submit->fence %.1f avg %.1f max, "
+               "completion work %.2f avg; waitUntilCompleted %llu (%.0f ms), waitUntilScheduled %llu (%.0f ms); process CPU %.0f %%",
+               s, ncreate, idle_create, after_done, ncommit, ncommit ? commit_ns / 1e6 / ncommit : 0, commit_max / 1e6,
+               ncommit ? gap_ns / 1e6 / ncommit : 0, gap_max / 1e6, ndone ? gpu_ns / 1e6 / ndone : 0, gpu_max / 1e6,
+               ndone ? done_ns / 1e6 / ndone : 0, nwaitc, waitc_ns / 1e6, nwaits, waits_ns / 1e6, (cpu - cpu0) / 1e4 / s);
+      bgmtl_note_line(line);
+      win = now; cpu0 = cpu;
+      ncreate = idle_create = after_done = ncommit = commit_ns = commit_max = gap_ns = gap_max = ndone = gpu_ns = gpu_max =
+         done_ns = nwaitc = waitc_ns = nwaits = waits_ns = 0;
+   }
+   os_unfair_lock_unlock(&l);
 }
 
 - (void)commit
@@ -1360,6 +1433,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       dispatch_group_leave(_done);
       return;
    }
+   if (bg_timing()) bg_tm(BG_TM_COMMIT, t_begin, clock_gettime_nsec_np(CLOCK_MONOTONIC), 0);
    static dispatch_queue_t completion;
    static dispatch_once_t once;
    dispatch_once(&once, ^{ completion = dispatch_queue_create("chlorophyll.completion", DISPATCH_QUEUE_SERIAL); });
@@ -1370,9 +1444,11 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          [self bgFailWith:[NSString stringWithUTF8String:w2] code:3];
       else
          _status = 4;   // Completed: the fence has been paid
+      uint64_t t_fence = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       rwa_fence_release([dev rwa], fence);
       [self bgCompleteFrom:t_begin];
       dispatch_group_leave(_done);
+      if (bg_timing()) bg_tm(BG_TM_DONE, t_flushed, t_fence, clock_gettime_nsec_np(CLOCK_MONOTONIC));
       [self release];
    });
 }
@@ -1522,7 +1598,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    [_completed removeAllObjects];
 }
 
-- (void)waitUntilCompleted { if (_status >= 2) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
+- (void)waitUntilCompleted
+{
+   uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   if (_status >= 2) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+   if (bg_timing()) bg_tm(BG_TM_WAITC, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t, 0, 0);
+}
 
 - (id)computeCommandEncoder { return [[[BGMTLComputeEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
 - (id)computeCommandEncoderWithDescriptor:(id)d { (void)d; return [self computeCommandEncoder]; }
