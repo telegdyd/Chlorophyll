@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // jasmine: process-local registration, enabled through sweetenv or exec env.
-// No state files, preferences, root bundle, or compositor allow-list.
+// No state files, preferences or root bundle. Step 7 adds backboardd to the
+// allowed processes; it still needs BGMTL_ENABLE=1, which only a temporary
+// boot's sweetenv entry for backboardd supplies.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
@@ -23,8 +25,10 @@ __attribute__((constructor)) static void
 bgmtl_sweet_init(void)
 {
    const char *enable = getenv("BGMTL_ENABLE");
+   const char *name = getprogname();
    if (!enable || strcmp(enable, "1") ||
-       strcmp(getprogname(), "bgmtl_registered_probe")) return;
+       (strcmp(name, "bgmtl_registered_probe") && strcmp(name, "backboardd"))) return;
+   fprintf(stderr, "BGMTL registration: enabled in %s\n", name);
    @autoreleasepool {
       void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
       if (!add) { fprintf(stderr, "BGMTL registration: MTLAddDevice missing\n"); return; }

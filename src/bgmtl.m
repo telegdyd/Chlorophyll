@@ -338,6 +338,9 @@ bg_install_fallback(Class c)
    struct rwa_texture_shape _shape;
    CFTypeRef _surface;   // retained IOSurface, when the memory is one
    NSUInteger _plane;
+   CFTypeRef _copySurface;  // jasmine: a sampled IOSurface whose pitch the a5xx cannot import, copied in (retained)
+   uint32_t _copySeed;      // the surface's seed at the last copy
+   BOOL _copied;
    @public
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
    NSUInteger _linOff, _linBpr;
@@ -1637,9 +1640,29 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
       bg_lock();
       _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
+      /* jasmine: the a5xx imports a surface whose rows are a multiple of 64 bytes only, and clients make small ones with
+       * 16-byte rows (288, 352, 544 bytes in the first backboardd run). One CA asked only to sample becomes a texture of this
+       * library's own memory with the surface's pixels copied in, again whenever its seed moves (rwaTextureSampledLocked), as
+       * libsweetca's GL path does (copy_surface). A surface the GPU would write, or of usage Unknown, is still refused. */
+      NSUInteger asked = [d usage];
+      if (!_tex && plane == 0 && IOSurfaceGetPlaneCount((IOSurfaceRef)surface) <= 1 &&
+          IOSurfaceGetBytesPerRow((IOSurfaceRef)surface) % 64 != 0 &&
+          asked != 0 && !(asked & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) {
+         _shape.usage = (unsigned)asked;
+         _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+         if (_tex) {
+            _copySurface = CFRetain(surface);
+            [self copySurfaceLocked];
+         }
+      } else if (!_tex) {
+         size_t n = strlen(why);
+         snprintf(why + n, sizeof(why) - n, " (usage asked 0x%lx)", (unsigned long)asked);
+      }
       bg_unlock();
-      _surface = CFRetain(surface);
-      _plane = plane;
+      if (_tex && !_copySurface) {
+         _surface = CFRetain(surface);
+         _plane = plane;
+      }
    } else {
       bg_lock();
       _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
@@ -1653,11 +1676,28 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 {
    bg_lock(); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
    if (_surface) CFRelease(_surface);
+   if (_copySurface) CFRelease(_copySurface);
    [_linSrc release];
    if (_ncDealloc) { _ncDealloc((void *)_ncBytes, _ncLength); Block_release(_ncDealloc); }
    [super dealloc];
 }
-- (void *)iosurface { return (void *)_surface; }
+- (void *)iosurface { return (void *)(_surface ? _surface : _copySurface); }
+// jasmine: (re)copy a sampled surface's pixels; the caller holds bg_lock.
+- (void)copySurfaceLocked
+{
+   IOSurfaceRef s = (IOSurfaceRef)_copySurface;
+   uint32_t seed = IOSurfaceGetSeed(s);
+   if (_copied && seed == _copySeed) return;
+   if (IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) != 0) return;
+   const unsigned o[3] = { 0, 0, 0 };
+   const unsigned sz[3] = { _shape.width, _shape.height, 1 };
+   char why[256] = { 0 };
+   if (rwa_texture_write(_tex, 0, 0, o, sz, IOSurfaceGetBaseAddress(s), IOSurfaceGetBytesPerRow(s), why, sizeof(why)) != 0)
+      BG_LOG("surface copy of IOSurface %u: %s\n", IOSurfaceGetID(s), why);
+   IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+   _copySeed = seed;
+   _copied = YES;
+}
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (BOOL)isDrawable { return _surface != NULL; }
 // A linear texture over a buffer reads the buffer's current bytes each time it is handed to the GPU (at commit), so CPU
@@ -1690,6 +1730,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       os_unfair_lock_unlock(&lk);
       if (changed) rwa_texture_flush_surface(_tex);
    }
+   if (_copySurface && _tex) [self copySurfaceLocked];
    return [self rwaTexture];
 }
 

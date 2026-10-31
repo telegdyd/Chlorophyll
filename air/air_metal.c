@@ -461,6 +461,8 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
    air_nir_lower_for_gallium(nir);
 }
 
+static bool bgr5a1_exchanged;   /* jasmine: see pixel_format */
+
 struct rwa_device *
 rwa_device_open(char *why, size_t why_size)
 {
@@ -563,6 +565,14 @@ rwa_device_open(char *why, size_t why_size)
    if (!device->screen) {
       say(why, why_size, "no Gallium screen could be created at all");
       goto fail;
+   }
+
+   {
+      unsigned b = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
+      struct pipe_screen *ps = device->screen;
+      bgr5a1_exchanged =
+         !ps->is_format_supported(ps, PIPE_FORMAT_R5G5B5A1_UNORM, PIPE_TEXTURE_2D, 0, 0, b) &&
+         ps->is_format_supported(ps, PIPE_FORMAT_B5G5R5A1_UNORM, PIPE_TEXTURE_2D, 0, 0, b);
    }
 
    device->nir_options =
@@ -894,6 +904,8 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
     * render server builds its deep-colour pipelines in these whatever the device answers, and a refusal aborts the server
     * ("Metal failed to build render pipeline", the first live backboardd runs). */
    { 550, "MTLPixelFormatRGB10A8_2P_XR10 (as BGRA8)",  PIPE_FORMAT_B8G8R8A8_UNORM },
+   /* jasmine: iOS 16's render server also builds the sRGB sibling (first backboardd run on the a512). */
+   { 551, "MTLPixelFormatRGB10A8_2P_XR10_sRGB (as BGRA8 sRGB)", PIPE_FORMAT_B8G8R8A8_SRGB },
    { 552, "MTLPixelFormatBGRA10_XR (as RGBA16Float)",   PIPE_FORMAT_R16G16B16A16_FLOAT },
    { 553, "MTLPixelFormatBGRA10_XR_sRGB (as RGBA16Float)", PIPE_FORMAT_R16G16B16A16_FLOAT },
    { 554, "MTLPixelFormatBGR10_XR (as BGRA8)",         PIPE_FORMAT_B8G8R8A8_UNORM },
@@ -1035,11 +1047,30 @@ packed16_served(void)
    return on != 0;
 }
 
+/* jasmine: the a5xx has BGR5A1's bits only as B5G5R5A1 (blue in the low five bits), the
+ * pure exchange of the R5G5B5A1 the table serves (fd5_format.c lists no R5G5B5A1). What the
+ * GPU writes and samples itself is the same either way; the processor's bytes are not, so
+ * rwa_texture_write and rwa_texture_read exchange the red and blue fields. Decided once per
+ * process, at the first device, from the screen's own answer. */
+static const struct rwa_pixel_format bgr5a1_exchanged_format = {
+   43, "MTLPixelFormatBGR5A1Unorm (as B5G5R5A1, red and blue exchanged in memory)",
+   PIPE_FORMAT_B5G5R5A1_UNORM };
+
+static void
+swap_rb5551(uint8_t *bytes, size_t texels)
+{
+   uint16_t *t = (uint16_t *)bytes;
+   for (size_t i = 0; i < texels; i++)
+      t[i] = (t[i] & 0x83e0) | ((t[i] & 0x1f) << 10) | ((t[i] >> 10) & 0x1f);
+}
+
 static const struct rwa_pixel_format *
 pixel_format(unsigned mtl)
 {
    if (mtl >= 40 && mtl <= 43 && !packed16_served())
       return NULL;
+   if (mtl == 43 && bgr5a1_exchanged)
+      return &bgr5a1_exchanged_format;
    for (unsigned i = 0; i < ARRAY_SIZE(rwa_pixel_formats); i++)
       if (rwa_pixel_formats[i].mtl == mtl)
          return &rwa_pixel_formats[i];
@@ -2111,6 +2142,24 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
     * what -replaceRegion:...bytesPerRow:bytesPerImage: is given when bytesPerImage is
     * the obvious product.
     */
+   if (bgr5a1_exchanged && texture->res->format == PIPE_FORMAT_B5G5R5A1_UNORM) {
+      size_t tight = (size_t)box.width * 2;
+      uint8_t *tmp = malloc(tight * box.height * box.depth);
+      if (!tmp) {
+         say(why, why_size, "out of memory exchanging red and blue for a B5G5R5A1 upload");
+         return -1;
+      }
+      for (int z = 0; z < box.depth; z++)
+         for (int y = 0; y < box.height; y++)
+            memcpy(tmp + ((size_t)z * box.height + y) * tight,
+                   (const uint8_t *)bytes + ((size_t)z * box.height + y) * row, tight);
+      swap_rb5551(tmp, (size_t)box.width * box.height * box.depth);
+      texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
+                                             PIPE_MAP_WRITE, &box, tmp, tight,
+                                             tight * box.height);
+      free(tmp);
+      return 0;
+   }
    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
                                           PIPE_MAP_WRITE, &box, bytes, row,
                                           row * util_format_get_nblocksy(texture->res->format, box.height));
@@ -2183,6 +2232,10 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
       for (int y = 0; y < box.height; y++)
          memcpy(dst + ((size_t)z * box.height + y) * row,
                 map + (size_t)z * xfer->layer_stride + (size_t)y * xfer->stride, texel_row);
+   if (bgr5a1_exchanged && texture->res->format == PIPE_FORMAT_B5G5R5A1_UNORM)
+      for (int z = 0; z < box.depth; z++)
+         for (int y = 0; y < box.height; y++)
+            swap_rb5551(dst + ((size_t)z * box.height + y) * row, box.width);
 
    pipe->texture_unmap(pipe, xfer);
    return 0;
