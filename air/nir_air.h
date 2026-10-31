@@ -113,6 +113,7 @@ struct air_sampler_state {
 
 struct air_resource {
    enum air_resource_kind kind;
+   bool jasmine_vertex_ubo; /* read-only VS SSBO lowered for a5xx */
    unsigned index;   /* Metal's [[buffer(n)]], [[texture(n)]], [[sampler(n)]] --
                       * EXCEPT for an argument-buffer member, where it is the
                       * index this frontend allocated: see argbuf_set below */

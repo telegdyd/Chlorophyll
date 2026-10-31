@@ -5,6 +5,7 @@
 // P5 a textured quad (nearest sampler) against the texture magnified and flipped by Metal's rules.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <math.h>
@@ -458,6 +459,127 @@ main(int argc, char **argv)
             CHECK(red == 1024 && green == 0, "depth test: %u red, %u green pixels (want 1024 red)", red, green);
             printf("  %u red (near), %u green (far) of 1024\n", red, green);
          } else { g_fail++; printf("  setup failed (pso=%d dss=%d dt=%d)\n", pso != nil, dss != nil, dt != nil); }
+      }
+      // jasmine P10: attachment feedback after clear and preceding draws, two targets.
+      printf("== P10 two-attachment feedback\n");
+      {
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_feedback"];
+         pd.colorAttachments[0].pixelFormat = pd.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Float;
+         NSError *err = nil;
+         id pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+         CHECK(pso != nil, "feedback pipeline: %s", err.localizedDescription.UTF8String);
+         pd.rasterSampleCount = 4;
+         NSError *msError = nil;
+         id unsupported = [g_dev newRenderPipelineStateWithDescriptor:pd error:&msError];
+         CHECK(!unsupported && msError != nil, "multisample feedback must be refused");
+         [unsupported release];
+         pd.rasterSampleCount = 1;
+         if (pso) {
+            static const float quad[6 * 8] = {
+               -1,-1,0,1, 1,1,1,1,  1,-1,0,1, 1,1,1,1, -1,1,0,1, 1,1,1,1,
+               -1,1,0,1, 1,1,1,1,   1,-1,0,1, 1,1,1,1, 1,1,0,1, 1,1,1,1 };
+            id vb = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+            id targets[2];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            for (int a = 0; a < 2; a++) {
+               targets[a] = tex2d(MTLPixelFormatRGBA32Float, 37, 19, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+               rp.colorAttachments[a].texture = targets[a];
+               rp.colorAttachments[a].loadAction = MTLLoadActionClear;
+               rp.colorAttachments[a].clearColor = MTLClearColorMake(10+a,20+a,30+a,1);
+               rp.colorAttachments[a].storeAction = MTLStoreActionStore;
+            }
+            id cb = [g_queue commandBuffer], e = [cb renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:pso]; [e setVertexBuffer:vb offset:0 atIndex:0];
+            for (int i = 0; i < 3; i++) [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            [e endEncoding]; CHECK(run(cb, "feedback"), "feedback did not complete");
+            unsigned bad = 0;
+            for (int a = 0; a < 2; a++) {
+               float px[37*19*4];
+               [targets[a] getBytes:px bytesPerRow:37*16 fromRegion:MTLRegionMake2D(0,0,37,19) mipmapLevel:0];
+               float want[4] = { 10+a+3*(a?3:1),20+a+6,30+a+3*(a?1:3),1 };
+               for (unsigned i = 0; i < 37*19*4; i++) if (px[i] != want[i%4]) {
+                  if (bad < 3) printf("    feedback a%d i%u got %g want %g\n",a,i,px[i],want[i%4]); bad++;
+               }
+            }
+            CHECK(!bad, "feedback %u wrong values", bad);
+            printf("  feedback: %u/5624 exact values\n",5624-bad);
+         }
+      }
+      // jasmine P11: repeated CPU writes -> GPU reads, GPU writes -> direct CPU reads.
+      printf("== P11 imported IOSurface visibility\n");
+      {
+         NSDictionary *props = @{ (id)kIOSurfaceWidth:@37, (id)kIOSurfaceHeight:@19,
+            (id)kIOSurfaceBytesPerElement:@4, (id)kIOSurfaceBytesPerRow:@256,
+            (id)kIOSurfacePixelFormat:@(0x42475241u) };
+         IOSurfaceRef surf = IOSurfaceCreate((CFDictionaryRef)props);
+         CHECK(surf != NULL, "IOSurfaceCreate");
+         id pso = compute_pso(klib, "bg_tex_read");
+         id out = [g_dev newBufferWithLength:37*19*16 options:0];
+         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:37 height:19 mipmapped:NO];
+         td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+         td.storageMode = MTLStorageModeShared;
+         unsigned bad = 0, rounds = 0;
+         if (surf && pso && out) for (unsigned r = 0; r < 12; r++) {
+            IOSurfaceLock(surf, 0, NULL);
+            uint8_t *base = IOSurfaceGetBaseAddress(surf); size_t pitch = IOSurfaceGetBytesPerRow(surf);
+            for (unsigned y=0;y<19;y++) for(unsigned x=0;x<37;x++) {
+               uint8_t *p=base+y*pitch+x*4; p[0]=(x+r*17)%256; p[1]=(y+r*23)%256; p[2]=(x+y+r*31)%256; p[3]=255;
+            }
+            IOSurfaceUnlock(surf, 0, NULL);
+            id t = [g_dev newTextureWithDescriptor:td iosurface:(id)surf plane:0];
+            if (!t) { bad++; break; }
+            id cb=[g_queue commandBuffer], e=[cb computeCommandEncoder];
+            [e setComputePipelineState:pso]; [e setTexture:t atIndex:0]; [e setBuffer:out offset:0 atIndex:0];
+            [e dispatchThreads:MTLSizeMake(37,19,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+            [e endEncoding]; if (!run(cb,"surface read")) { bad++; break; }
+            float *got=[out contents];
+            for(unsigned y=0;y<19;y++) for(unsigned x=0;x<37;x++) {
+               unsigned v[4]={(x+y+r*31)%256,(y+r*23)%256,(x+r*17)%256,255};
+               for(unsigned c=0;c<4;c++) if(fabsf(got[(y*37+x)*4+c]-v[c]/255.0f)>0.00001f) bad++;
+            }
+            MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture=t; rp.colorAttachments[0].loadAction=MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor=MTLClearColorMake((r+1)/16.0,0.5,0.25,1);
+            rp.colorAttachments[0].storeAction=MTLStoreActionStore;
+            cb=[g_queue commandBuffer]; e=[cb renderCommandEncoderWithDescriptor:rp]; [e endEncoding];
+            if (!run(cb,"surface clear")) { bad++; break; }
+            IOSurfaceLock(surf,kIOSurfaceLockReadOnly,NULL);
+            base=IOSurfaceGetBaseAddress(surf);
+            for(unsigned y=0;y<19;y++) for(unsigned x=0;x<37;x++) {
+               uint8_t *p=base+y*pitch+x*4;
+               if(abs(p[2]-(int)lroundf((r+1)*255/16.0f))>1 || abs(p[1]-128)>1 || abs(p[0]-64)>1 || p[3]!=255) bad++;
+            }
+            IOSurfaceUnlock(surf,kIOSurfaceLockReadOnly,NULL);
+            [t release]; rounds++;
+         }
+         CHECK(rounds==12 && !bad,"IOSurface: %u rounds, %u wrong",rounds,bad);
+         printf("  IOSurface: %u rounds, %u wrong\n",rounds,bad);
+         if(surf) CFRelease(surf);
+      }
+      // jasmine P12: a read-only vertex buffer beyond UBO capacity fails explicitly.
+      printf("== P12 oversized vertex device buffer refusal\n");
+      {
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_color"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         NSError *err = nil;
+         id pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+         id vb = [g_dev newBufferWithLength:1<<20 options:0];
+         id rt = tex2d(MTLPixelFormatBGRA8Unorm, 16, 16, MTLTextureUsageRenderTarget);
+         if (pso && vb && rt) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id cb=[g_queue commandBuffer], e=[cb renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:pso]; [e setVertexBuffer:vb offset:0 atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [e endEncoding];
+            [cb commit]; [cb waitUntilCompleted];
+            CHECK([cb status]==MTLCommandBufferStatusError && [cb error]!=nil,"oversized VS buffer must fail");
+            printf("  oversized vertex buffer: status=%ld error=%s\n",(long)[cb status],[[[cb error] localizedDescription] UTF8String]);
+         } else { CHECK(NO,"oversized VS refusal setup"); }
       }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;

@@ -69,6 +69,7 @@ struct pipe_screen *fd_screen_create(int, const struct pipe_screen_config *, str
 #include "util/format/u_format.h"
 #include "util/half_float.h"
 #include "util/u_inlines.h"
+#include "freedreno_screen.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/u_gen_mipmap.h"
@@ -436,6 +437,52 @@ lower_tex_unit_cb(nir_builder *b, nir_instr *instr, void *data)
    if (tex->sampler_index == tex->texture_index)
       return false;
    tex->sampler_index = tex->texture_index;
+   return true;
+}
+
+/* jasmine: a5xx Gallium has no VS SSBO bindings. Read-only vertex buffers
+ * can use UBO loads; writes remain refused, and bindings are bounded below. */
+static bool
+vertex_ssbo_to_ubo(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   (void)data;
+   if (in->intrinsic != nir_intrinsic_load_ssbo)
+      return false;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *v = nir_load_ubo(b, in->def.num_components, in->def.bit_size,
+                           in->src[0].ssa, in->src[1].ssa,
+                           .align_mul = nir_intrinsic_align_mul(in),
+                           .align_offset = nir_intrinsic_align_offset(in),
+                           .range_base = 0, .range = ~0u);
+   nir_def_rewrite_uses(&in->def, v);
+   nir_instr_remove(&in->instr);
+   return true;
+}
+
+/* jasmine: a5xx attachment reads use reserved texture units 12..15. */
+static bool
+lower_attachment_read(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   (void)data;
+   if (in->intrinsic != nir_intrinsic_load_output ||
+       !nir_intrinsic_io_semantics(in).fb_fetch_output) return false;
+   unsigned target = nir_intrinsic_io_semantics(in).location - FRAG_RESULT_DATA0;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *pos = nir_f2i32(b, nir_channels(b, nir_load_frag_coord(b), 3));
+   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 2);
+   tex->op = nir_texop_txf;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->dest_type = nir_type_float32;
+   tex->coord_components = 2;
+   tex->texture_index = tex->sampler_index = 12 + target;
+   tex->src[0].src_type = nir_tex_src_coord;
+   tex->src[0].src = nir_src_for_ssa(pos);
+   tex->src[1].src_type = nir_tex_src_lod;
+   tex->src[1].src = nir_src_for_ssa(nir_imm_int(b, 0));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(b, &tex->instr);
+   nir_def_rewrite_uses(&in->def, &tex->def);
+   nir_instr_remove(&in->instr);
    return true;
 }
 
@@ -1086,6 +1133,40 @@ pixel_format(unsigned mtl)
    return NULL;
 }
 
+/* jasmine: query device and format limits. a5xx leaves linear_image_pitch_alignment
+ * unset; fd5_layout uses 64 pixels for linear resources (fdl_cpp_shift + 6). */
+void
+rwa_device_get_limits(struct rwa_device *device, struct rwa_device_limits *out)
+{
+   memset(out, 0, sizeof(*out));
+   if (!device) return;
+   if (!device->software) out->gpu_id = fd_screen(device->screen)->gpu_id;
+   for (unsigned i = 0; i < 3; i++)
+      out->max_threads[i] = MIN2(device->screen->compute_caps.max_block_size[i],
+                                device->screen->compute_caps.max_threads_per_block);
+   out->max_shared_bytes = device->screen->compute_caps.max_local_size;
+}
+
+unsigned
+rwa_device_texture_alignment(struct rwa_device *device, unsigned format, int linear)
+{
+   if (!device) return 64;
+   if (!linear) return MAX2(device->screen->caps.texture_buffer_offset_alignment, 1);
+   unsigned align = device->screen->caps.linear_image_pitch_alignment;
+   if (align) return align;
+   const struct rwa_pixel_format *fmt = pixel_format(format);
+   unsigned cpp = fmt ? util_format_get_blocksize(fmt->pipe) : 16;
+   return 64 * cpp;
+}
+
+int
+rwa_device_supports_samples(struct rwa_device *device, unsigned samples)
+{
+   if (!device || !samples) return 0;
+   return device->screen->is_format_supported(device->screen, PIPE_FORMAT_B8G8R8A8_UNORM,
+      PIPE_TEXTURE_2D, samples, samples, PIPE_BIND_RENDER_TARGET);
+}
+
 /* What a format this library declines is, so the refusal can say it instead of
  * printing a number. The ranges are Metal's own enumeration, grouped the way Metal
  * groups them, and each carries the reason it is not in the table above -- the reason
@@ -1663,6 +1744,10 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
        * is cached per surface ID together with a reference to the first resource made from it, which keeps that GEM handle
        * open, so a later import of the same surface asks the kernel nothing and freedreno's handle table hands back the same
        * BO. IOSurface IDs come from an increasing counter; the size and pixel format are part of the key besides. */
+#ifdef RWA_SWEETGPU
+      /* SweetGPU imports by stable IOSurface ID; no Bergamota GEM-handle pinning. */
+      int sr = sweet_drm_surface_bo(-1, &sb);
+#else
       enum { SBO_CACHE = 24 };   /* each entry pins its surface's memory: 128 screen-sized ones exhausted what the GPU maps (full-screen allocations refused, no backdrop for blur) */
       static struct { struct rwa_device *dev; int id; unsigned w, h; enum pipe_format f; struct rwa_sbo sb; struct pipe_resource *res;
                       uint64_t used; } sbo_cache[SBO_CACHE];
@@ -1680,6 +1765,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       } else {
          sr = sweet_drm_surface_bo(-1, &sb);
       }
+#endif
       if (sr != 0 || sb.planes > 1 || sb.bytes_per_row == 0) {
          say(why, why_size, "the kernel would not describe IOSurface %d (error %d, planes %u, %u bytes a row): it knows nothing of an ID that "
                             "was never made shareable", import->id, sr, sb.planes, sb.bytes_per_row);
@@ -1758,6 +1844,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
 
       texture->res = device->screen->resource_from_handle(device->screen, &templ, &whandle,
                                                           PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+#ifndef RWA_SWEETGPU
       if (texture->res && sbo_slot < 0) {
          sweet_drm_bo_sync(-1, texture->surface_handle, 0, 0);   /* clean the CPU's dirty lines before the GPU first writes */
          pipe_resource_reference(&sbo_cache[sbo_victim].res, NULL);  /* evict the least recently used entry */
@@ -1766,6 +1853,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          sbo_cache[sbo_victim].used = ++sbo_clock;
          pipe_resource_reference(&sbo_cache[sbo_victim].res, texture->res);
       }
+#endif
       if (!texture->res) {
          /*
           * Everything this side could check has been checked, so no reason is invented
@@ -4101,6 +4189,11 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
             return -1;
          }
          size_t left = b->size - MIN2(b->size, boffset);
+         if (r->jasmine_vertex_ubo && left > device->screen->shader_caps[stage].max_const_buffer0_size) {
+            say(why, why_size, "vertex device buffer %u has %zu bytes, beyond the %u-byte UBO limit",
+                r->index, left, device->screen->shader_caps[stage].max_const_buffer0_size);
+            return -1;
+         }
          /*
           * AN OFFSET THIS GPU CANNOT FETCH FROM, served rather than refused.
           *
@@ -4283,6 +4376,13 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
    if (info->cb_delta_ubo) {
       struct pipe_constant_buffer dcb = { .user_buffer = cb_deltas, .buffer_size = sizeof(cb_deltas) };
       pipe->set_constant_buffer(pipe, stage, info->cb_delta_ubo - 1, &dcb);
+   }
+   const struct pipe_shader_caps *caps = &device->screen->shader_caps[stage];
+   unsigned gpu = device->software ? 0 : fd_screen(device->screen)->gpu_id;
+   if (num_ssbo > caps->max_shader_buffers || num_images > caps->max_shader_images ||
+       (gpu >= 400 && gpu < 600 && num_ssbo + num_images > caps->max_shader_buffers)) {
+      say(why, why_size, "%s exceeds stage image/SSBO limits (%u buffers, %u images)", name, num_ssbo, num_images);
+      return -1;
    }
    if (num_ssbo)
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
@@ -6719,6 +6819,28 @@ rwa_render_create(struct rwa_device *device,
              ? _mesa_shader_stage_to_string(render->finfo.stage) : "non-fragment");
       goto fail;
    }
+   if (render->finfo.fbfetch_targets && !device->screen->caps.fbfetch) {
+      if (samples != 1 || (render->finfo.fbfetch_targets & ~15u)) {
+         say(why, why_size, "a5xx attachment feedback supports single-sample color targets 0..3");
+         goto fail;
+      }
+      for (unsigned i = 0; i < render->finfo.num_resources; i++) {
+         const struct air_resource *r = &render->finfo.resources[i];
+         if ((r->kind == AIR_RESOURCE_TEXTURE || r->kind == AIR_RESOURCE_SAMPLER) && r->index >= 12) {
+            say(why, why_size, "attachment feedback reserves texture/sampler units 12..15");
+            goto fail;
+         }
+      }
+      nir_shader_intrinsics_pass(fs, lower_attachment_read, nir_metadata_control_flow, NULL);
+      fs->info.fs.uses_fbfetch_output = false;
+      fs->info.fs.fbfetch_coherent = false;
+      for (unsigned i = 0; i < 4; i++)
+         if (render->finfo.fbfetch_targets & (1u << i)) {
+            fs->info.outputs_read &= ~BITFIELD64_BIT(FRAG_RESULT_DATA0 + i);
+            BITSET_SET(fs->info.textures_used, 12 + i);
+            BITSET_SET(fs->info.samplers_used, 12 + i);
+         }
+   }
    slot_shapes(fs, render->frag_slots, render->frag_compare_sampler);
    count_resources(&render->finfo, render->frag_slots, &out.fragment_buffers,
                    &out.fragment_textures, &out.fragment_samplers);
@@ -6812,6 +6934,23 @@ rwa_render_create(struct rwa_device *device,
        * Metal ignores it: the module's interface decides what is fetched, and an
        * attribute nothing reads has no fetch to configure.
        */
+      if (!device->screen->shader_caps[MESA_SHADER_VERTEX].max_shader_buffers) {
+         unsigned ubos = vs->info.num_ubos;
+         for (unsigned i = 0; i < render->vinfo.num_resources; i++) {
+            struct air_resource *r = &render->vinfo.resources[i];
+            if (r->kind != AIR_RESOURCE_DEVICE_BUFFER) continue;
+            if (r->write || r->index >= device->screen->shader_caps[MESA_SHADER_VERTEX].max_const_buffers) {
+               say(why, why_size, "a5xx vertex device buffer %u cannot be represented as a read-only UBO", r->index);
+               goto fail;
+            }
+            r->kind = AIR_RESOURCE_CONSTANT_BUFFER;
+            r->jasmine_vertex_ubo = true;
+            ubos = MAX2(ubos, r->index + 1);
+         }
+         nir_shader_intrinsics_pass(vs, vertex_ssbo_to_ubo, nir_metadata_control_flow, NULL);
+         vs->info.num_ssbos = 0;
+         vs->info.num_ubos = ubos;
+      }
       slot_shapes(vs, render->vert_slots, render->vert_compare_sampler);
       unsigned vtex = 0, vsamp = 0;
       count_resources(&render->vinfo, render->vert_slots, &out.vertex_buffers, &vtex, &vsamp);
@@ -7612,7 +7751,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * colour cache had not written back yet (the pass's clear colour): Control Center's blur passes came out with one
     * triangle of each quad white (CoreAnimation's Tc3sA2Xhf_Idst after the downsample draw), and which half depended on
     * timing. FRAMEBUFFER: wait for idle, flush CCU colour/depth, flush and invalidate the texture cache. */
-   if (render->finfo.fbfetch_targets)
+   if (render->finfo.fbfetch_targets && device->screen->caps.fbfetch)
       pipe->texture_barrier(pipe, PIPE_TEXTURE_BARRIER_FRAMEBUFFER);
 
    /* The viewport, and now its z as well. Gallium's window depth is
@@ -7786,6 +7925,34 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          pipe->clear(pipe, mask, UINT32_MAX, 0xff, NULL, &clear,
                      draw->clear_depth ? (double)*draw->clear_depth : 0.0,
                      draw->clear_stencil ? *draw->clear_stencil & 0xff : 0);
+   }
+
+   if (render->finfo.fbfetch_targets && !device->screen->caps.fbfetch) {
+      /* After clear and every preceding draw: use the same a5xx sysmem feedback
+       * barrier as sweetca. Keep the binding cache in sync with these reserved slots. */
+      for (unsigned i = 0; i < 4; i++) {
+         if (!(render->finfo.fbfetch_targets & (1u << i))) continue;
+         struct rwa_texture *t = i < draw->color_count ? draw->color[i] : NULL;
+         if (!t || t->res->target != PIPE_TEXTURE_2D) {
+            say(why, why_size, "attachment feedback needs a 2D target at color %u", i);
+            goto unbind;
+         }
+         if (!t->view) {
+            struct pipe_sampler_view tmpl;
+            u_sampler_view_default_template(&tmpl, t->res, t->res->format);
+            t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
+         }
+         void *sampler = default_sampler(device);
+         if (!t->view || !sampler) { say(why, why_size, "attachment feedback view failed"); goto unbind; }
+         unsigned unit = 12 + i;
+         pipe->set_sampler_views(pipe, MESA_SHADER_FRAGMENT, unit, 1, 0, &t->view);
+         pipe->bind_sampler_states(pipe, MESA_SHADER_FRAGMENT, unit, 1, &sampler);
+         device->bound_views[MESA_SHADER_FRAGMENT][unit] = t->view;
+         device->bound_samplers[MESA_SHADER_FRAGMENT][unit] = sampler;
+         device->n_bound_views[MESA_SHADER_FRAGMENT] = MAX2(device->n_bound_views[MESA_SHADER_FRAGMENT], unit + 1);
+         device->n_bound_samplers[MESA_SHADER_FRAGMENT] = MAX2(device->n_bound_samplers[MESA_SHADER_FRAGMENT], unit + 1);
+      }
+      pipe->texture_barrier(pipe, PIPE_TEXTURE_BARRIER_FRAMEBUFFER);
    }
 
    {

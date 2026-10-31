@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
 // BGMTLDevice: the Bergamota Metal device, spike 2 (test processes only).
+// jasmine: SweetGPU and queried a512 limits (2026-10-31).
 //
 // Design after hackios's `_MTLDevice` subclass (hackios-xnu-userland userland/src/hkmetal.m, MIT; read and re-written
 // here, nothing copied wholesale): a subclass of Metal's private `_MTLDevice`, `MTLDeviceSPI` added to it with
@@ -473,15 +474,18 @@ ensure_protocol(Class cls, const char *proto)
 - (uint64_t)maxBufferLength { return 256ULL << 20; }
 - (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count <= 1; }
 
-- (NSString *)name { return _rwa ? [NSString stringWithFormat:@"%s (Bergamota)", rwa_device_name(_rwa)] : @"Adreno (Bergamota, no GPU)"; }
+- (NSString *)name { return _rwa ? [NSString stringWithFormat:@"%s (Chlorophyll)", rwa_device_name(_rwa)] : @"Adreno (Bergamota, no GPU)"; }
 - (BOOL)hasUnifiedMemory { return YES; }
 - (BOOL)isLowPower { return NO; }
 - (BOOL)isHeadless { return NO; }
 - (BOOL)isRemovable { return NO; }
 - (uint64_t)recommendedMaxWorkingSetSize { return 512ULL << 20; }
 - (uint64_t)currentAllocatedSize { return 0; }
-- (MTLSize)maxThreadsPerThreadgroup { return MTLSizeMake(1024, 1024, 64); }
-- (NSUInteger)maxThreadgroupMemoryLength { return 16384; }
+- (MTLSize)maxThreadsPerThreadgroup {
+   struct rwa_device_limits lim; rwa_device_get_limits(_rwa, &lim);
+   return MTLSizeMake(lim.max_threads[0], lim.max_threads[1], lim.max_threads[2]);
+}
+- (NSUInteger)maxThreadgroupMemoryLength { struct rwa_device_limits lim; rwa_device_get_limits(_rwa, &lim); return lim.max_shared_bytes; }
 
 // The device is a stand-in for a Metal device in a process that has none, so a client may ask it something nobody has implemented yet.
 // Metal's stock behaviour for an unknown selector is to abort the process; for a selector that IS in the MTLDevice / MTLDeviceSPI
@@ -506,14 +510,18 @@ ensure_protocol(Class cls, const char *proto)
    _nulls[key] = t;
    return t;
 }
-- (uint64_t)registryID { return 0x10000b630ULL; }
-- (BOOL)supportsSampleCount:(NSUInteger)count { return count == 1 || count == 4; }
+- (uint64_t)registryID {
+   struct rwa_device_limits lim; rwa_device_get_limits(_rwa, &lim);
+   unsigned n = lim.gpu_id;
+   return 0x10000b000ULL | ((n / 100) << 8) | (((n / 10) % 10) << 4) | (n % 10);
+}
+- (BOOL)supportsSampleCount:(NSUInteger)count { return rwa_device_supports_samples(_rwa, (unsigned)count); }
 - (BOOL)isDepth24Stencil8PixelFormatSupported { return NO; }
-- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format { (void)format; return 64; }
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format { return rwa_device_texture_alignment(_rwa, (unsigned)format, 0); }
 // Linear textures (and the buffers clients size for them, CoreGraphics' CGImageTextureData among them) have rows
-// aligned to 64 bytes here (freedreno a6xx pitch alignment). The fallback answered 0 and SpringBoard's image upload
+// aligned from screen/format limits here (jasmine: a5xx linear rows are 64 pixels). The fallback answered 0 and SpringBoard's image upload
 // wrote past an ImageIO buffer into its guard page (KERN_PROTECTION_FAILURE in CGImageTextureDataGetOffsetWithBlock).
-- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(NSUInteger)format { (void)format; return 64; }
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(NSUInteger)format { return rwa_device_texture_alignment(_rwa, (unsigned)format, 1); }
 // Heap sizing queries: page-aligned, and for textures an upper bound (16 bytes a texel, every mip level), never zero.
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
@@ -1006,7 +1014,12 @@ bg_air_slice(NSData *d)
 // first failed one (one "fence timeout" and the compositor restarted, while the kernel counted every submission completed
 // and no hang), so the wait is repeated twice, each failure logged with what the kernel answered (sweet_drm's WAIT_FENCE
 // record: a fence it refuses as never submitted, a GPU not ready, or a real timeout), before the command buffer fails.
+#ifdef RWA_SWEETGPU
+// jasmine: fence errors are reported by the SweetGPU backend itself.
+static void sweet_drm_take_wait_error(char *buf, size_t size) { if (size) buf[0] = 0; }
+#else
 extern void sweet_drm_take_wait_error(char *buf, size_t size) __attribute__((weak_import));
+#endif
 static int
 bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_size)
 {
@@ -1169,8 +1182,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          /* A draw the runtime refuses is skipped and logged, and the rest of the command buffer still runs. Failing the
           * whole command buffer left the frame's later passes undrawn (the wallpaper area black or grey, stale wedges in
           * the poster editor) and counted towards the watchdog that switches Metal off. */
-         if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
+         if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0) {
+#ifdef RWA_SWEETGPU
+            // jasmine: a refused draw must be visible to the standalone Metal client.
+            [self bgFailWith:[NSString stringWithUTF8String:why] code:2];
+            break;
+#else
             BG_LOG("draw skipped: %s\n", why);
+#endif
+         }
          // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
          // later draw of the pass touches it
          if (bg_trace() && w->color_count && w->color[0] && access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0 &&
@@ -1999,11 +2019,18 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 // ---- GPU state, as the kernel reports it (SWEET_GPU_SEL_INFO). ABI minor 1 and 2 are both served: only flags & 3 is read (bit0 ready,
 // bit1 lost); abi_minor is informational and every field beyond the first 40 bytes is ignored. -1: no answer, 0: not ready, 1: ready, 2: LOST.
 struct bg_gpu_info { uint32_t abi_version, flags, gpu_id, chip_id; uint64_t va_start, va_size; uint32_t last_fence, abi_minor; };
+#ifndef RWA_SWEETGPU
 extern int sweet_drm_info(int fd, struct bg_gpu_info *out);
+#endif
 
 int
 bgmtl_gpu_state(unsigned *abi_minor)
 {
+#ifdef RWA_SWEETGPU
+   // jasmine: device creation below is the authoritative SweetGPU availability check.
+   if (abi_minor) *abi_minor = 0;
+   return -1;
+#else
    struct bg_gpu_info in;
    memset(&in, 0, sizeof(in));
    if (sweet_drm_info(-1, &in) != 0)
@@ -2011,6 +2038,7 @@ bgmtl_gpu_state(unsigned *abi_minor)
    if (abi_minor) *abi_minor = in.abi_minor;
    uint32_t f = in.flags & 3;
    return (f & 2) ? 2 : (f & 1) ? 1 : 0;
+#endif
 }
 
 // ---- entry point for test processes ----------------------------------------------------------------------------------

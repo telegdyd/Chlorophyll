@@ -45,3 +45,10 @@ fragment float4 bg_fs_tex3(V in [[stage_in]], texture2d<float> t [[texture(3)]],
 // a fragment stage with the varyings of CoreAnimation's std_vert0_*: color (float4) and texcoord0_0 (float2)
 struct CAV { float4 pos [[position]]; float4 color; float2 texcoord0_0; };
 fragment float4 bg_fs_ca_color(CAV in [[stage_in]]) { return in.color; }
+
+// jasmine: two-attachment feedback, exact float arithmetic over successive draws.
+struct Feedback { float4 a [[color(0)]]; float4 b [[color(1)]]; };
+fragment Feedback bg_fs_feedback(V in [[stage_in]], float4 a [[color(0)]], float4 b [[color(1)]])
+{
+   Feedback f; f.a = a + float4(1, 2, 3, 0); f.b = b + float4(3, 2, 1, 0); return f;
+}

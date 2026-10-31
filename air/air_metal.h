@@ -65,6 +65,14 @@ void rwa_device_close(struct rwa_device *device);
 /* What the driver should call the GPU, as Mesa knows it ("Adreno 7c+ Gen 3"). Never NULL. */
 const char *rwa_device_name(struct rwa_device *device);
 
+/* jasmine: screen capabilities used by the Metal device, without Mesa headers. */
+struct rwa_device_limits {
+   unsigned gpu_id, max_threads[3], max_shared_bytes;
+};
+void rwa_device_get_limits(struct rwa_device *device, struct rwa_device_limits *out);
+unsigned rwa_device_texture_alignment(struct rwa_device *device, unsigned format, int linear);
+int rwa_device_supports_samples(struct rwa_device *device, unsigned samples);
+
 /* Memory a shader can read and write, and the processor can too. The mapping is write
  * combined, as the kernel makes it, so a driver has nothing to flush.
  *

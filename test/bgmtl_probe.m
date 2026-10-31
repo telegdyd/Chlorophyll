@@ -129,6 +129,13 @@ main(int argc, char **argv)
              class_getName([g_dev class]), class_getName(class_getSuperclass([g_dev class])),
              (int)[g_dev conformsToProtocol:objc_getProtocol("MTLDevice")], (int)[g_dev conformsToProtocol:objc_getProtocol("MTLDeviceSPI")]);
 
+      MTLSize limits = [g_dev maxThreadsPerThreadgroup];
+      printf("limits: registry=0x%llx threads=%lux%lux%lu shared=%lu linear-BGRA=%lu linear-RGBA32=%lu samples=1:%d 2:%d 4:%d 8:%d\n",
+         (unsigned long long)[g_dev registryID], (unsigned long)limits.width, (unsigned long)limits.height, (unsigned long)limits.depth,
+         (unsigned long)[g_dev maxThreadgroupMemoryLength],
+         (unsigned long)[g_dev minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm],
+         (unsigned long)[g_dev minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatRGBA32Float],
+         [g_dev supportsSampleCount:1], [g_dev supportsSampleCount:2], [g_dev supportsSampleCount:4], [g_dev supportsSampleCount:8]);
       g_queue = [g_dev newCommandQueue];
       printf("queue: %s\n", g_queue ? class_getName([g_queue class]) : "(nil)");
       if (!g_queue) return 4;
@@ -257,6 +264,8 @@ main(int argc, char **argv)
                [enc dispatchThreadgroups:MTLSizeMake(n / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                [enc endEncoding];
                [cb commit];
+               // jasmine: commit is asynchronous; verify only after completion.
+               [cb waitUntilCompleted];
                if ([cb status] != 4) { printf("  round %u: status %ld\n", r, (long)[cb status]); break; }
                done++;
                for (unsigned i = 0; i < n; i++) if (fo[i] != fa[i] + 2.0f * fb[i]) total_bad++;
