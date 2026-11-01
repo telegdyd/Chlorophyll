@@ -145,6 +145,8 @@ static uint64_t bg_refresh_epoch, bg_refresh_epochs;
 static void bg_lock(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, bg_ctx_init); pthread_mutex_lock(&bg_ctx_mutex); }
 static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 
+#include "bg_upload_profile.h"
+
 #define BG_MAX_BINDINGS 16
 
 // provided by the injection dylib (gpu/metal/inject), absent in the test tools
@@ -387,10 +389,12 @@ bg_install_fallback(Class c)
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
+   uint64_t _uploadID, _uploadWrites; // diagnostic identity, lifetime successful uploads
    uint64_t _refreshEpoch;  // bg_refresh_epoch at the last refresh of _linSrc/_ncBytes
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
+- (void)bgUploadNote:(unsigned)kind bytes:(const void *)bytes length:(size_t)length status:(int)status;
 - (struct rwa_texture *)rwaTexture;
 - (void)bgShadowLocked;   // jasmine: compositor render targets over an IOSurface draw in a shared shadow
 - (struct rwa_texture *)rwaSurfaceTexture;   // jasmine: the imported IOSurface itself (under a shadow too), or NULL
@@ -778,6 +782,7 @@ bg_air_slice(NSData *d)
    char why[256] = { 0 };
    bg_lock();
    int rc = rwa_texture_write_packed_2d([t rwaTexture], p, length, why, sizeof(why));
+   [t bgUploadNote:1 bytes:p length:length status:rc];
    bg_unlock();
    if (rc != 0) {
       BG_LOG("no-copy texture refused: %s\n", why);
@@ -1340,6 +1345,7 @@ bg_sync_commit(void)
    char why[512] = { 0 };
    bg_lock();
    bg_refresh_epoch = ++bg_refresh_epochs;
+   bg_upload_begin();
    // jasmine: surfaces this command buffer renders or blits into draw in their shared shadow (bgShadowLocked)
    for (BGWork *w in _work) {
       if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
@@ -1505,6 +1511,7 @@ bg_sync_commit(void)
    // completed handlers), in submission order. BGMTL_TRACE keeps it synchronous: the trace reads attachments back through the
    // drawing context, which belongs to the encoding thread.
    bg_refresh_epoch = 0;
+   bg_upload_end();
    // In the compositor "scheduled" is reported only when the GPU has FINISHED: the render server hands a framebuffer to the
    // display from the scheduled notification / waitUntilScheduled, and this display path has no GPU write fence on the surface,
    // so an earlier notice let the panel scan a half-drawn buffer (its previous frame showed: motion stepping back and forth).
@@ -2042,8 +2049,9 @@ bg_shadow_release(struct rwa_texture *sh)
    const unsigned o[3] = { 0, 0, 0 };
    const unsigned sz[3] = { _shape.width, _shape.height, 1 };
    char why[256] = { 0 };
-   if (rwa_texture_write(_tex, 0, 0, o, sz, IOSurfaceGetBaseAddress(s), IOSurfaceGetBytesPerRow(s), why, sizeof(why)) != 0)
-      BG_LOG("surface copy of IOSurface %u: %s\n", IOSurfaceGetID(s), why);
+   int rc = rwa_texture_write(_tex, 0, 0, o, sz, IOSurfaceGetBaseAddress(s), IOSurfaceGetBytesPerRow(s), why, sizeof(why));
+   [self bgUploadNote:2 bytes:IOSurfaceGetBaseAddress(s) length:IOSurfaceGetAllocSize(s) status:rc];
+   if (rc != 0) BG_LOG("surface copy of IOSurface %u: %s\n", IOSurfaceGetID(s), why);
    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
    _copySeed = seed;
    _copied = YES;
@@ -2084,29 +2092,40 @@ bg_shadow_release(struct rwa_texture *sh)
    return [self rwaTexture];
 }
 
+- (void)bgUploadNote:(unsigned)kind bytes:(const void *)bytes length:(size_t)length status:(int)status
+{
+   if (!status) _uploadWrites++;
+   const void *source = kind == 0 ? (const void *)_linSrc : kind == 1 ? bytes : (const void *)_copySurface;
+   size_t pitch = kind == 0 ? _linBpr : kind == 2 ? IOSurfaceGetBytesPerRow((IOSurfaceRef)_copySurface) : 0;
+   bg_upload_note(&_uploadID, _uploadWrites, kind, _tex, &_shape, source, bytes, length, _linOff, pitch, status);
+}
 - (struct rwa_texture *)rwaTexture
 {
    if ((_ncBytes || _linSrc) && _tex) {
       bg_lock();
       BOOL fresh = bg_refresh_epoch && _refreshEpoch == bg_refresh_epoch;
       _refreshEpoch = bg_refresh_epoch;
+      if (fresh) [self bgUploadNote:_ncBytes ? 1 : 0 bytes:NULL length:0 status:1];
       bg_unlock();
       if (fresh) return _tex;
    }
    if (_ncBytes && _tex) {
       bg_lock();
       char why[256] = { 0 };
-      if (rwa_texture_write_packed_2d(_tex, _ncBytes, _ncLength, why, sizeof(why)) != 0)
-         BG_LOG("no-copy texture refresh: %s\n", why);
+      int rc = rwa_texture_write_packed_2d(_tex, _ncBytes, _ncLength, why, sizeof(why));
+      [self bgUploadNote:1 bytes:_ncBytes length:_ncLength status:rc];
+      if (rc != 0) BG_LOG("no-copy texture refresh: %s\n", why);
       bg_unlock();
    }
    if (_linSrc && _tex) {
       bg_lock();
       char why[256] = { 0 };
       const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
-      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff, (unsigned)_linBpr,
-                            why, sizeof(why)) != 0)
-         BG_LOG("linear texture refresh: %s\n", why);
+      const void *bytes = (const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff;
+      int rc = rwa_texture_write(_tex, 0, 0, o, sz, bytes, (unsigned)_linBpr, why, sizeof(why));
+      size_t length = [(BGMTLBuffer *)_linSrc length];
+      [self bgUploadNote:0 bytes:bytes length:_linOff < length ? length - _linOff : 0 status:rc];
+      if (rc != 0) BG_LOG("linear texture refresh: %s\n", why);
       bg_unlock();
    }
    return _tex;

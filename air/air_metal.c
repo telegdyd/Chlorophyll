@@ -2278,6 +2278,16 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
 }
 
 int
+rwa_texture_upload_layout(struct rwa_texture *texture, unsigned level,
+                          size_t *row_bytes, unsigned *rows)
+{
+   if (!texture || level > texture->res->last_level) return -1;
+   *row_bytes = util_format_get_stride(texture->res->format, u_minify(texture->res->width0, level));
+   *rows = util_format_get_nblocksy(texture->res->format, u_minify(texture->res->height0, level));
+   return 0;
+}
+
+int
 rwa_texture_write_packed_2d(struct rwa_texture *texture, const void *bytes,
                             size_t length, char *why, size_t why_size)
 {

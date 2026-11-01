@@ -205,6 +205,11 @@ int rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer
 int rwa_texture_write_packed_2d(struct rwa_texture *texture, const void *bytes,
                               size_t length, char *why, size_t why_size);
 
+/* Diagnostic layout only: tight bytes per block row and block rows of a mip.
+ * No mapping, copying or synchronization; returns -1 for an invalid level. */
+int rwa_texture_upload_layout(struct rwa_texture *texture, unsigned level,
+                              size_t *row_bytes, unsigned *rows);
+
 /*
  * What a depth/stencil texture holds, by aspect, which is the reading rwa_texture_read
  * cannot give.
