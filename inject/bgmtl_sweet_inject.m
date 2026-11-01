@@ -18,9 +18,11 @@ extern id bgmtl_create_device(void);
 static BOOL
 wallpaper_process(const char *name)
 {
+   // PridePosterExtension stays out too: its MPS work hung the GPU on pool1 (2026-11-01 03:25), the kernel
+   // group still names it, so it gets the environment but no device until that hang is understood.
    static const char *const names[] = {
       "AegirPoster", "CollectionsPoster", "GradientPosterExtension",
-      "PridePosterExtension", "LegacyPoster", "PhotosPosterProvider",
+      "LegacyPoster", "PhotosPosterProvider",
       "UnityPosterExtension", "EmojiPosterExtension", "ExtragalacticPoster"
    };
    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++)
