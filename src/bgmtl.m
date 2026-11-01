@@ -1243,12 +1243,15 @@ bg_tm(int ev, uint64_t a, uint64_t b, uint64_t c)
 // thread, as Metal's commit is asynchronous and GL's glthread does for the same driver: CoreAnimation's render thread
 // did its own frame and then all of the driver's work for it (step 7: on GL its driver work runs on gdrv0, and the
 // render thread is 61 % QuartzCore; on Metal ours was 1.3-1.5x QuartzCore's time on that thread). In the compositor
-// only (BGMTL_BB); BGMTL_ASYNC=0 replays inline, as tracing and BGMTL_SYNC do.
+// only (BGMTL_BB), and OPT-IN (BGMTL_ASYNC=1): a render ticket then stays open until the worker submits, and when the
+// display epoch moved in that window at boot the kernel refused the swap (stale ticket, fallback reason 16) and ran the
+// display without tickets for the rest of the boot -- the black band again (first installed Metal boot, 2026-11-01).
+// Tracing and BGMTL_SYNC replay inline either way.
 static int
 bg_async_replay(void)
 {
    static int on = -1;
-   if (on < 0) on = getenv("BGMTL_BB") && !(getenv("BGMTL_ASYNC") && getenv("BGMTL_ASYNC")[0] == '0');
+   if (on < 0) on = getenv("BGMTL_BB") && getenv("BGMTL_ASYNC") && getenv("BGMTL_ASYNC")[0] == '1';
    return on;
 }
 static int
