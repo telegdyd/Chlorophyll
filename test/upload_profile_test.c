@@ -38,6 +38,8 @@ int main(void)
    bg_upload_note(&id,3,0,&t,&shape,bytes,NULL,0,0,8,1);
    bg_upload_note(&id,3,0,&t,&shape,bytes,NULL,0,0,8,-1);
    assert(bg_upload.frame[0].skipped==1 && bg_upload.frame[0].failed==1);
+   bg_upload_note(&id,3,0,&t,&shape,bytes,bytes,sizeof(bytes),0,8,2);
+   assert(bg_upload.frame[0].content_reuses==1 && bg_upload.frame[0].reused_bytes==8);
    assert(bg_upload.record[0].writes==3 && bg_upload.record[0].commits==1);
    bg_upload_end();
    shape.mip_levels=2;

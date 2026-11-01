@@ -1952,6 +1952,9 @@ rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, cons
    struct pipe_box box;
    u_box_3d((int)so[0], (int)so[1], (int)(so[2] + sslice), (int)size[0], (int)size[1], (int)(size[2] ? size[2] : 1), &box);
    struct pipe_context *pipe = src->device->pipe;
+   /* Copies can bind u_blitter graphics state, as resolves and mip generation do.
+    * The next Metal draw must rebind even when its application state is equal. */
+   gs_invalidate(src->device);
    /* jasmine: on the a512 the a5xx 2D blitter's copies come out empty: into an imported IOSurface and into a private
     * texture alike (render probe P13, plain and --bb: every texel still zero), while drawing into either works (P11).
     * A 2D copy the 3D engine can draw goes there instead: fd5_blitter declines a scissored blit, and fd_blit then draws

@@ -8,9 +8,9 @@ static struct {
    int enabled, active, finished;
    unsigned frames, count;
    uint64_t next_id, overflow, hash_bytes, deadline;
-   struct { uint64_t bytes, writes, skipped, failed; } frame[BG_UPLOAD_FRAMES];
+   struct { uint64_t bytes, writes, skipped, failed, content_reuses, reused_bytes; } frame[BG_UPLOAD_FRAMES];
    struct {
-      uint64_t id, bytes, writes, first, changed, same_hash, unknown, skipped, failed;
+      uint64_t id, bytes, writes, first, changed, same_hash, unknown, skipped, failed, content_reuses, reused_bytes;
       uint64_t hash, last_commit;
       uintptr_t source, resource;
       size_t offset, pitch, length;
@@ -47,27 +47,29 @@ static void bg_upload_end(void)
    if (!f) { BG_LOG("upload inventory: cannot write %s\n", path); return; }
    fprintf(f, "# command_buffers=%u,overflow_observations=%llu,hashed_bytes=%llu,hash_budget=268435456\n",
            bg_upload.frames, (unsigned long long)bg_upload.overflow, (unsigned long long)bg_upload.hash_bytes);
-   fprintf(f, "commit,bytes,writes,epoch_skips,failures\n");
+   fprintf(f, "commit,bytes,writes,epoch_skips,failures,content_reuses,reused_bytes\n");
    for (unsigned i = 0; i < bg_upload.frames; i++)
-      fprintf(f, "%u,%llu,%llu,%llu,%llu\n", i + 1,
+      fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%llu\n", i + 1,
               (unsigned long long)bg_upload.frame[i].bytes, (unsigned long long)bg_upload.frame[i].writes,
-              (unsigned long long)bg_upload.frame[i].skipped, (unsigned long long)bg_upload.frame[i].failed);
-   fprintf(f, "id,kind,source,resource,offset,pitch,length,width,height,format,mips,bytes,writes,first_upload,changed,same_hash,unknown,epoch_skips,failures,commits\n");
+              (unsigned long long)bg_upload.frame[i].skipped, (unsigned long long)bg_upload.frame[i].failed,
+              (unsigned long long)bg_upload.frame[i].content_reuses, (unsigned long long)bg_upload.frame[i].reused_bytes);
+   fprintf(f, "id,kind,source,resource,offset,pitch,length,width,height,format,mips,bytes,writes,first_upload,changed,same_hash,unknown,epoch_skips,failures,commits,content_reuses,reused_bytes\n");
    for (unsigned i = 0; i < bg_upload.count; i++) {
       const typeof(bg_upload.record[0]) *r = &bg_upload.record[i];
-      fprintf(f, "%llu,%s,%p,%p,%zu,%zu,%zu,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u\n",
+      fprintf(f, "%llu,%s,%p,%p,%zu,%zu,%zu,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu\n",
               (unsigned long long)r->id, r->kind == 0 ? "linear-buffer" : r->kind == 1 ? "no-copy-packed" : "copied-surface",
               (void *)r->source, (void *)r->resource, r->offset, r->pitch, r->length, r->width, r->height, r->format, r->mips,
               (unsigned long long)r->bytes, (unsigned long long)r->writes, (unsigned long long)r->first,
               (unsigned long long)r->changed, (unsigned long long)r->same_hash, (unsigned long long)r->unknown,
-              (unsigned long long)r->skipped, (unsigned long long)r->failed, r->commits);
+              (unsigned long long)r->skipped, (unsigned long long)r->failed, r->commits,
+              (unsigned long long)r->content_reuses, (unsigned long long)r->reused_bytes);
    }
    fclose(f);
    BG_LOG("upload inventory: %u command buffers, %u resources -> %s (diagnostic hash overhead; not a timing run)\n",
           bg_upload.frames, bg_upload.count, path);
 }
 
-// status: 0 uploaded, 1 epoch reuse, -1 failed. Hash equality is evidence only,
+// status: 0 uploaded, 1 epoch reuse, 2 exact content reuse, -1 failed. Hash equality is evidence only,
 // never a reason to skip an upload. Padding is excluded; compressed block rows
 // and packed mip offsets come from the same format helpers as the write path.
 static void bg_upload_note(uint64_t *identity, uint64_t lifetime_writes, unsigned kind,
@@ -80,7 +82,7 @@ static void bg_upload_note(uint64_t *identity, uint64_t lifetime_writes, unsigne
    unsigned i;
    for (i = 0; i < bg_upload.count; i++) if (bg_upload.record[i].id == *identity) break;
    typeof(bg_upload.frame[0]) *frame = &bg_upload.frame[bg_upload.frames];
-   if (status > 0) frame->skipped++;
+   if (status == 1) frame->skipped++;
    else if (status < 0) frame->failed++;
    uint64_t total = 0;
    unsigned levels = kind == 1 ? shape->mip_levels : 1;
@@ -89,6 +91,7 @@ static void bg_upload_note(uint64_t *identity, uint64_t lifetime_writes, unsigne
       if (rwa_texture_upload_layout(tex, l, &row, &rows)) return;
       total += (uint64_t)row * rows;
    }
+   if (status == 2) { frame->content_reuses++; frame->reused_bytes += total; }
    if (!status) { frame->bytes += total; frame->writes++; }
    if (i == BG_UPLOAD_RECORDS) { bg_upload.overflow++; return; }
    typeof(bg_upload.record[0]) *r = &bg_upload.record[i];
@@ -99,7 +102,8 @@ static void bg_upload_note(uint64_t *identity, uint64_t lifetime_writes, unsigne
       r->width = shape->width; r->height = shape->height; r->format = shape->pixel_format; r->mips = shape->mip_levels;
    }
    if (r->last_commit != bg_upload.frames + 1) { r->last_commit = bg_upload.frames + 1; r->commits++; }
-   if (status > 0) { r->skipped++; return; }
+   if (status == 2) { r->content_reuses++; r->reused_bytes += total; return; }
+   if (status == 1) { r->skipped++; return; }
    if (status < 0) { r->failed++; return; }
    r->bytes += total; r->writes++;
    uint64_t hash = 14695981039346656037ull;

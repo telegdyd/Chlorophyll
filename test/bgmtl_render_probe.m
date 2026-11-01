@@ -75,6 +75,7 @@ run(id cb, const char *what)
 int
 main(int argc, char **argv)
 {
+   setvbuf(stdout, NULL, _IONBF, 0);
    @autoreleasepool {
 #ifdef BGMTL_REGISTERED_PROBE
       if (argc == 2 && (!strcmp(argv[1], "--expect-stock") || !strcmp(argv[1], "--expect-inert"))) {
@@ -772,6 +773,76 @@ main(int argc, char **argv)
          CHECK(!bad && edge > 100, "derivative coverage: %u wrong, %u edge pixels", bad, edge);
          printf("  derivative coverage: %u wrong, %u edge pixels\n", bad, edge);
          [pso release]; [vb release]; [rt release]; [pd release];
+      }
+      // P16: no-copy exact comparison must retain mutable-memory semantics.
+      // Exercise render reuse (two draws), mutations, and both CPU/GPU blits.
+      printf("== P16 mutable no-copy refresh and write invalidation\n");
+      {
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_tex"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         id pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:NULL];
+         const float quad[] = {-1,-1,0,1,1,1,1,1, 1,-1,0,1,1,1,1,1, -1,1,0,1,1,1,1,1,
+                                1,-1,0,1,1,1,1,1, 1,1,0,1,1,1,1,1, -1,1,0,1,1,1,1,1};
+         id vb = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+         MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+         id smp = [g_dev newSamplerStateWithDescriptor:sd];
+         unsigned bad = 0, checked = 0;
+         for (unsigned compressed=0; compressed<2; compressed++) {
+            NSUInteger fmt = compressed ? MTLPixelFormatASTC_4x4_LDR : MTLPixelFormatRGBA8Unorm;
+            size_t used = compressed ? 16 : 64, row = 16;
+            uint8_t mem[4096], red[64]; memset(mem,0xa5,sizeof(mem));
+            for(unsigned i=0;i<16;i++) { red[i*4]=255; red[i*4+1]=red[i*4+2]=0; red[i*4+3]=255; }
+            uint16_t block[8]={0xfdfc,0xffff,0xffff,0xffff,0xffff,0,0,0xffff};
+            if(compressed) memcpy(red,block,16);
+            memcpy(mem,red,used);
+            MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:4 height:4 mipmapped:NO];
+            td.usage=MTLTextureUsageShaderRead; td.storageMode=MTLStorageModeShared;
+            id t=[g_dev newTextureWithBytesNoCopy:mem length:sizeof(mem) descriptor:td deallocator:nil];
+            id src=[g_dev newTextureWithDescriptor:td];
+            [src replaceRegion:MTLRegionMake2D(0,0,4,4) mipmapLevel:0 withBytes:red bytesPerRow:row];
+            id buf=[g_dev newBufferWithBytes:red length:used options:0];
+            id target=tex2d(MTLPixelFormatBGRA8Unorm,8,8,MTLTextureUsageRenderTarget);
+            if(!t || !src || !buf || !target || !pso || !vb || !smp) { bad++; continue; }
+            for(unsigned round=0;round<8;round++) { @autoreleasepool {
+               printf("  no-copy format %lu round %u\n", (unsigned long)fmt, round);
+               // Mutate after creation, then between commits. Padding is irrelevant.
+               if(round==0 || round==2) {
+                  if(compressed) {
+                     block[4]=0;block[5]=round==2?0xffff:0;block[6]=round==0?0xffff:0;
+                     memcpy(mem,block,16);
+                  } else for(unsigned i=0;i<16;i++) { mem[i*4]=0;mem[i*4+1]=round==2?255:0;mem[i*4+2]=round==0?255:0;mem[i*4+3]=255; }
+               }
+               mem[used]++; // page padding must not affect content comparison
+               if(round==7) [t replaceRegion:MTLRegionMake2D(0,0,4,4) mipmapLevel:0 withBytes:red bytesPerRow:row];
+               id cb=[g_queue commandBuffer];
+               if(round==3 || round==5) {
+                  id blit=[cb blitCommandEncoder];
+                  if(round==3) [blit copyFromBuffer:buf sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:used sourceSize:MTLSizeMake(4,4,1)
+                                          toTexture:t destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                  else [blit copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(4,4,1)
+                                   toTexture:t destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                  [blit endEncoding];
+               }
+               MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor renderPassDescriptor];
+               rp.colorAttachments[0].texture=target;rp.colorAttachments[0].loadAction=MTLLoadActionClear;rp.colorAttachments[0].storeAction=MTLStoreActionStore;
+               id e=[cb renderCommandEncoderWithDescriptor:rp];
+               [e setRenderPipelineState:pso];[e setVertexBuffer:vb offset:0 atIndex:0];[e setFragmentTexture:t atIndex:0];[e setFragmentSamplerState:smp atIndex:0];
+               for(unsigned draw=0;draw<2;draw++) [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+               [e endEncoding]; if(!run(cb,"no-copy lifecycle"))bad++;
+               uint8_t px[8*8*4];[target getBytes:px bytesPerRow:32 fromRegion:MTLRegionMake2D(0,0,8,8) mipmapLevel:0];
+               // CPU blits invalidate the epoch, so raw caller memory wins on the
+               // following draw. GPU copies keep the epoch and remain visible there.
+               unsigned want = round==5 ? 2 : round<2 ? 0 : 1;
+               for(unsigned i=0;i<64;i++) for(unsigned c=0;c<4;c++) { if(px[i*4+c] != ((c==want || c==3)?255:0))bad++;checked++; }
+            }} // release each completed command buffer: Metal queues bound outstanding objects
+            [t release];[src release];[buf release];[target release];
+         }
+         CHECK(!bad,"no-copy lifecycle: %u wrong / %u values",bad,checked);
+         printf("  no-copy lifecycle: %u wrong / %u values\n",bad,checked);
+         [smp release];[sd release];[vb release];[pso release];[pd release];
       }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;

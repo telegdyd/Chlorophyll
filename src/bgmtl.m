@@ -146,6 +146,7 @@ static void bg_lock(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthr
 static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 
 #include "bg_upload_profile.h"
+#include "bg_nocopy_cache.h"
 
 #define BG_MAX_BINDINGS 16
 
@@ -389,12 +390,15 @@ bg_install_fallback(Class c)
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
+   struct bg_nc_cache _ncCache;
    uint64_t _uploadID, _uploadWrites; // diagnostic identity, lifetime successful uploads
    uint64_t _refreshEpoch;  // bg_refresh_epoch at the last refresh of _linSrc/_ncBytes
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
 - (void)bgUploadNote:(unsigned)kind bytes:(const void *)bytes length:(size_t)length status:(int)status;
+- (void)bgCacheNoCopyLocked:(const void *)bytes length:(size_t)length;
+- (void)bgInvalidateUploadCache;
 - (struct rwa_texture *)rwaTexture;
 - (void)bgShadowLocked;   // jasmine: compositor render targets over an IOSurface draw in a shared shadow
 - (struct rwa_texture *)rwaSurfaceTexture;   // jasmine: the imported IOSurface itself (under a shadow too), or NULL
@@ -783,6 +787,7 @@ bg_air_slice(NSData *d)
    bg_lock();
    int rc = rwa_texture_write_packed_2d([t rwaTexture], p, length, why, sizeof(why));
    [t bgUploadNote:1 bytes:p length:length status:rc];
+   if (!rc) [t bgCacheNoCopyLocked:p length:length];
    bg_unlock();
    if (rc != 0) {
       BG_LOG("no-copy texture refused: %s\n", why);
@@ -1357,6 +1362,17 @@ bg_sync_commit(void)
    int async = bg_async_replay();
    for (BGWork *w in _work) {
       if (async) { bg_unlock(); bg_lock(); }   // let the encoding thread in (bg_ctx_init: fair hand-off)
+      // Keep the original upload/synchronization path for compute, attachments
+      // and explicit blits. The exact-compare fast path is for render sampling.
+      if ([w->src isKindOfClass:[BGMTLTexture class]]) [(BGMTLTexture *)w->src bgInvalidateUploadCache];
+      if ([w->dst isKindOfClass:[BGMTLTexture class]]) [(BGMTLTexture *)w->dst bgInvalidateUploadCache];
+      if (w->kind == BG_WORK_DISPATCH) {
+         for (unsigned i = 0; i < w->texture_count; i++) [(BGMTLTexture *)w->textures[i] bgInvalidateUploadCache];
+      }
+      if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
+         for (unsigned i = 0; i < w->color_count; i++) [(BGMTLTexture *)w->color[i] bgInvalidateUploadCache];
+         [(BGMTLTexture *)w->depth bgInvalidateUploadCache];
+      }
       if (w->kind == BG_WORK_DISPATCH) {
          struct rwa_buffer *bufs[BG_MAX_BINDINGS] = { NULL };
          struct rwa_buffer_bind table[BG_MAX_BINDINGS] = { { NULL, 0 } };
@@ -1483,6 +1499,15 @@ bg_sync_commit(void)
             memset((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, w->fill, w->size);
          bg_refresh_epoch = ++bg_refresh_epochs;   // CPU memory may have changed under a texture
       }
+      // Any operation that can write a texture invalidates its CPU comparison snapshot.
+      // Compute is deliberately conservative: read-only bindings are invalidated too.
+      if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
+         for (unsigned i = 0; i < w->color_count; i++) [(BGMTLTexture *)w->color[i] bgInvalidateUploadCache];
+         [(BGMTLTexture *)w->depth bgInvalidateUploadCache];
+      } else if (w->kind == BG_WORK_DISPATCH) {
+         for (unsigned i = 0; i < w->texture_count; i++) [(BGMTLTexture *)w->textures[i] bgInvalidateUploadCache];
+      }
+      if ([w->dst isKindOfClass:[BGMTLTexture class]]) [(BGMTLTexture *)w->dst bgInvalidateUploadCache];
    }
    // jasmine: drawables written through their shadow (texture init) get the frame in one GPU blit, in order after the draws.
    if (_status != 5) {
@@ -2010,6 +2035,7 @@ bg_shadow_release(struct rwa_texture *sh)
 - (void)dealloc
 {
    bg_lock();
+   bg_nc_cache_destroy(&_ncCache);
    if (_surfTex) { bg_shadow_release(_tex); rwa_texture_destroy(_surfTex); }
    else if (_tex) rwa_texture_destroy(_tex);
    bg_unlock();
@@ -2092,9 +2118,22 @@ bg_shadow_release(struct rwa_texture *sh)
    return [self rwaTexture];
 }
 
+- (void)bgCacheNoCopyLocked:(const void *)bytes length:(size_t)length
+{
+   if (!bg_nc_cache_on()) return;
+   size_t total = 0;
+   for (unsigned l = 0; l < _shape.mip_levels; l++) {
+      size_t row; unsigned rows;
+      if (rwa_texture_upload_layout(_tex, l, &row, &rows) || total > length || !row || rows > (length - total) / row) return;
+      total += row * rows;
+   }
+   bg_nc_cache_store(&_ncCache, bytes, total);
+}
+- (void)bgInvalidateUploadCache { _ncCache.valid = 0; }
 - (void)bgUploadNote:(unsigned)kind bytes:(const void *)bytes length:(size_t)length status:(int)status
 {
    if (!status) _uploadWrites++;
+   if (!bg_upload_enabled()) return;
    const void *source = kind == 0 ? (const void *)_linSrc : kind == 1 ? bytes : (const void *)_copySurface;
    size_t pitch = kind == 0 ? _linBpr : kind == 2 ? IOSurfaceGetBytesPerRow((IOSurfaceRef)_copySurface) : 0;
    bg_upload_note(&_uploadID, _uploadWrites, kind, _tex, &_shape, source, bytes, length, _linOff, pitch, status);
@@ -2111,9 +2150,16 @@ bg_shadow_release(struct rwa_texture *sh)
    }
    if (_ncBytes && _tex) {
       bg_lock();
+      if (bg_nc_cache_match(&_ncCache, _ncBytes)) {
+         [self bgUploadNote:1 bytes:_ncBytes length:_ncLength status:2];
+         bg_unlock();
+         return _tex;
+      }
+      _ncCache.valid = 0;
       char why[256] = { 0 };
       int rc = rwa_texture_write_packed_2d(_tex, _ncBytes, _ncLength, why, sizeof(why));
       [self bgUploadNote:1 bytes:_ncBytes length:_ncLength status:rc];
+      if (!rc) [self bgCacheNoCopyLocked:_ncBytes length:_ncLength];
       if (rc != 0) BG_LOG("no-copy texture refresh: %s\n", why);
       bg_unlock();
    }
@@ -2168,6 +2214,7 @@ bg_shadow_release(struct rwa_texture *sh)
    unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
    char why[256] = { 0 };
    bg_lock();
+   [self bgInvalidateUploadCache];
    if (rwa_texture_write(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("replaceRegion: %s\n", why);
    bg_unlock();
 }
