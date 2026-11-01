@@ -56,3 +56,13 @@ kernel void bg_tex_write(texture2d<float, access::write> t [[texture(0)]], uint2
    if (gid.x < t.get_width() && gid.y < t.get_height())
       t.write(float4(float(gid.x) / 16.0, float(gid.y) / 16.0, 0.5, 1.0), gid);
 }
+
+// Explicit mip sampling for the compressed CPU no-copy image regression probe.
+kernel void bg_tex_sample_lod(texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],
+                             device float4 *out [[buffer(0)]], constant uint &lod [[buffer(1)]],
+                             uint2 gid [[thread_position_in_grid]])
+{
+   uint2 size(t.get_width(lod), t.get_height(lod));
+   float2 uv = (float2(gid) + 0.5f) / float2(size);
+   out[gid.y * size.x + gid.x] = t.sample(s, uv, level(lod));
+}

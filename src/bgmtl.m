@@ -742,12 +742,21 @@ bg_air_slice(NSData *d)
    return [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d];
 }
 
-// A texture over the caller's memory (QuartzCore's CPU-drawn images): a texture of our own, refreshed from those bytes at each use
-// (rows of length / height bytes), and the deallocator called when it is freed.
+// A texture over the caller's packed mip chain. CA rounds length up to a page;
+// it describes the allocation's bound, not the image's row pitch.
 - (id)newTextureWithBytesNoCopy:(void *)p length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *, NSUInteger))dealloc
 {
    BGMTLTexture *t = [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d];
    if (!t) return nil;
+   char why[256] = { 0 };
+   bg_lock();
+   int rc = rwa_texture_write_packed_2d([t rwaTexture], p, length, why, sizeof(why));
+   bg_unlock();
+   if (rc != 0) {
+      BG_LOG("no-copy texture refused: %s\n", why);
+      [t release];
+      return nil;
+   }
    t->_ncBytes = p;
    t->_ncLength = length;
    t->_ncDealloc = dealloc ? Block_copy(dealloc) : NULL;
@@ -2042,9 +2051,7 @@ bg_shadow_release(struct rwa_texture *sh)
    if (_ncBytes && _tex) {
       bg_lock();
       char why[256] = { 0 };
-      const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
-      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes, (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
-                            why, sizeof(why)) != 0)
+      if (rwa_texture_write_packed_2d(_tex, _ncBytes, _ncLength, why, sizeof(why)) != 0)
          BG_LOG("no-copy texture refresh: %s\n", why);
       bg_unlock();
    }

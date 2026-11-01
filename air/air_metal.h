@@ -199,6 +199,12 @@ int rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer
 		     const unsigned origin[3], const unsigned size[3], void *bytes,
 		     size_t stride, char *why, size_t why_size);
 
+/* CPU no-copy images: tightly packed 2D mip levels, with optional allocation padding
+ * after the last level. Validate the entire chain before reading any caller bytes.
+ * Allocation length is a bound, never a row stride (CA rounds it up to a page). */
+int rwa_texture_write_packed_2d(struct rwa_texture *texture, const void *bytes,
+                              size_t length, char *why, size_t why_size);
+
 /*
  * What a depth/stencil texture holds, by aspect, which is the reading rwa_texture_read
  * cannot give.

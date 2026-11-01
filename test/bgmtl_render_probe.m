@@ -26,6 +26,12 @@ static int g_pass, g_fail;
 
 static id g_dev, g_queue;
 
+@interface NSObject (BGNoCopyProbe)
+- (id)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length
+                   descriptor:(MTLTextureDescriptor *)descriptor
+                  deallocator:(void (^)(void *, NSUInteger))deallocator;
+@end
+
 static id
 load_lib(const char *path)
 {
@@ -648,6 +654,74 @@ main(int argc, char **argv)
             CHECK([cb status]==MTLCommandBufferStatusError && [cb error]!=nil,"oversized VS buffer must fail");
             printf("  oversized vertex buffer: status=%ld error=%s\n",(long)[cb status],[[[cb error] localizedDescription] UTF8String]);
          } else { CHECK(NO,"oversized VS refusal setup"); }
+      }
+      // P14: ASTC blocks, page-rounded allocation, partial blocks, all mip levels,
+      // and caller mutations between commits. The old length/height pitch fails.
+      printf("== P14 packed ASTC no-copy images\n");
+      {
+         id pso = compute_pso(klib, "bg_tex_sample_lod");
+         MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+         sd.mipFilter = MTLSamplerMipFilterNearest;
+         id sampler = [g_dev newSamplerStateWithDescriptor:sd];
+         const unsigned dims[][3] = { {144,144,1}, {224,487,1}, {828,9,1}, {13,9,4} };
+         unsigned bad = 0, values = 0;
+         for (unsigned test = 0; test < sizeof(dims)/sizeof(dims[0]); test++) {
+            unsigned W=dims[test][0], H=dims[test][1], levels=dims[test][2];
+            size_t used=0;
+            for (unsigned l=0;l<levels;l++) {
+               unsigned w=MAX(1,W>>l),h=MAX(1,H>>l);
+               used += ((w+3)/4)*((h+3)/4)*16;
+            }
+            size_t length=(used+16383)&~(size_t)16383;
+            uint8_t *mem=malloc(length);
+            memset(mem,0xa5,length);
+            MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR width:W height:H mipmapped:NO];
+            td.mipmapLevelCount=levels; td.usage=MTLTextureUsageShaderRead; td.storageMode=MTLStorageModeShared;
+            id t=nil;
+            for (unsigned round=0;round<2;round++) {
+               size_t offset=0;
+               for (unsigned l=0;l<levels;l++) {
+                  unsigned w=MAX(1,W>>l),h=MAX(1,H>>l);
+                  for(unsigned y=0;y<(h+3)/4;y++) for(unsigned x=0;x<(w+3)/4;x++) {
+                     // ASTC LDR void-extent block: exact constant RGBA per 4x4 block.
+                     uint16_t block[8]={0xfdfc,0xffff,0xffff,0xffff,
+                        ((x+y+round+l)&1)?0xffff:0, (l&1)?0xffff:0, round?0xffff:0, 0xffff};
+                     memcpy(mem+offset,block,16); offset+=16;
+                  }
+               }
+               if (!round) {
+                  t=[g_dev newTextureWithBytesNoCopy:mem length:length descriptor:td deallocator:nil];
+                  if(!t || !pso || !sampler) { bad++; break; }
+                  id shortTex=[g_dev newTextureWithBytesNoCopy:mem length:used-1 descriptor:td deallocator:nil];
+                  if(shortTex) { bad++; [shortTex release]; }
+               }
+               for (unsigned l=0;l<levels;l++) {
+                  unsigned w=MAX(1,W>>l),h=MAX(1,H>>l);
+                  id out=[g_dev newBufferWithLength:(size_t)w*h*16 options:0];
+                  memset([out contents],0xa5,(size_t)w*h*16);
+                  id cb=[g_queue commandBuffer],e=[cb computeCommandEncoder];
+                  [e setComputePipelineState:pso]; [e setTexture:t atIndex:0]; [e setSamplerState:sampler atIndex:0];
+                  [e setBuffer:out offset:0 atIndex:0]; [e setBytes:&l length:sizeof(l) atIndex:1];
+                  [e dispatchThreads:MTLSizeMake(w,h,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+                  [e endEncoding]; if(!run(cb,"ASTC no-copy sample")) bad++;
+                  float *px=[out contents];
+                  for(unsigned y=0;y<h;y++) for(unsigned x=0;x<w;x++) {
+                     float want[4]={((x/4+y/4+round+l)&1)?1:0,(l&1)?1:0,round?1:0,1};
+                     for(unsigned c=0;c<4;c++) {
+                        float got=px[(y*w+x)*4+c];
+                        if(!isfinite(got) || fabsf(got-want[c])>0.00001f) bad++;
+                        values++;
+                     }
+                  }
+                  [out release];
+               }
+            }
+            [t release]; free(mem);
+         }
+         CHECK(!bad,"ASTC no-copy: %u wrong / %u values",bad,values);
+         printf("  ASTC no-copy: %u wrong / %u values (including mip chain and CPU refresh)\n",bad,values);
+         [sampler release]; [sd release];
       }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;

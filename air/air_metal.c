@@ -2246,6 +2246,41 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
 }
 
 int
+rwa_texture_write_packed_2d(struct rwa_texture *texture, const void *bytes,
+                            size_t length, char *why, size_t why_size)
+{
+   const struct pipe_resource *res = texture->res;
+   if (!bytes || res->target != PIPE_TEXTURE_2D || texture->layers != 1 ||
+       res->nr_samples > 1) {
+      say(why, why_size, "no-copy memory needs a single-sample 2D texture and non-null bytes");
+      return -1;
+   }
+   /* Check all levels first, including multiplication/offset overflow. Page-rounded
+    * trailing bytes are allowed but do not change a level's pitch or offset. */
+   size_t offset = 0;
+   for (unsigned level = 0; level <= res->last_level; level++) {
+      size_t row = util_format_get_stride(res->format, u_minify(res->width0, level));
+      unsigned rows = util_format_get_nblocksy(res->format, u_minify(res->height0, level));
+      if (!row || offset > length || rows > (length - offset) / row) {
+         say(why, why_size, "no-copy memory of %zu bytes is too short for %s mip level %u",
+             length, texture->format_name, level);
+         return -1;
+      }
+      offset += row * rows;
+   }
+   offset = 0;
+   for (unsigned level = 0; level <= res->last_level; level++) {
+      unsigned size[3] = { u_minify(res->width0, level), u_minify(res->height0, level), 1 };
+      size_t row = util_format_get_stride(res->format, size[0]);
+      if (rwa_texture_write(texture, level, 0, NULL, size, (const uint8_t *)bytes + offset,
+                            row, why, why_size) != 0)
+         return -1;
+      offset += row * util_format_get_nblocksy(res->format, size[1]);
+   }
+   return 0;
+}
+
+int
 rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                  const unsigned origin[3], const unsigned size[3], void *bytes,
                  size_t stride, char *why, size_t why_size)
