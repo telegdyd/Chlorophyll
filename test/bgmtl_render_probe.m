@@ -91,8 +91,11 @@ main(int argc, char **argv)
       }
 #endif
       // jasmine: --bb as a third argument runs the suite in compositor mode (BGMTL_BB: drawables drawn through a shadow)
-      if (argc > 3 && !strcmp(argv[3], "--bb")) setenv("BGMTL_BB", "1", 1);
-      if (argc < 3) { printf("usage: bgmtl_render_probe kernels.metallib render.metallib [--bb]\n"); return 2; }
+      for (int i=3; i<argc; i++) {
+         if (!strcmp(argv[i], "--bb")) setenv("BGMTL_BB", "1", 1);
+         if (!strcmp(argv[i], "--upload-cache")) setenv("BGMTL_NOCOPY_CACHE", "1", 1);
+      }
+      if (argc < 3) { printf("usage: bgmtl_render_probe kernels.metallib render.metallib [--bb] [--upload-cache]\n"); return 2; }
       printf("== BGMTLDevice textures/render probe (iOS %s)\n", [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String]);
       g_dev = bgmtl_create_device();
 #ifdef BGMTL_REGISTERED_PROBE

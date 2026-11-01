@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Exact comparison cache for packed no-copy textures. Caller holds bg_lock.
 // Caller memory remains mutable: compare every refresh epoch, never by hash.
+// Experimental until a matched CPU gain is established: BGMTL_NOCOPY_CACHE=1.
 // At most 2 MiB per texture / 8 MiB per process; allocation failure uses uploads.
 struct bg_nc_cache { void *bytes; size_t size; int valid; };
 static size_t bg_nc_cache_bytes;
 static int bg_nc_cache_on(void)
 {
    static int on;
-   if (!on) on = getenv("BGMTL_NOCOPY_CACHE") && getenv("BGMTL_NOCOPY_CACHE")[0] == '0' ? -1 : 1;
+   if (!on) on = getenv("BGMTL_NOCOPY_CACHE") && getenv("BGMTL_NOCOPY_CACHE")[0] == '1' ? 1 : -1;
    return on == 1;
 }
 static int bg_nc_cache_match(const struct bg_nc_cache *c, const void *bytes)
