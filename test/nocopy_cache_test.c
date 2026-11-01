@@ -11,7 +11,13 @@ int main(int argc, char **argv)
    unsigned char *source=calloc(1,2*1024*1024+1); assert(source);
    struct bg_nc_cache c[5]={0};
    if(argc>1) {
-      if (!strcmp(argv[1], "default")) unsetenv("BGMTL_NOCOPY_CACHE");
+      if (!strcmp(argv[1], "default")) {
+         unsetenv("BGMTL_NOCOPY_CACHE");
+         bg_nc_cache_store(&c[0],source,16);
+         assert(bg_nc_cache_match(&c[0],source));
+         bg_nc_cache_destroy(&c[0]);assert(!bg_nc_cache_bytes);
+         free(source);puts("no-copy default-on PASS");return 0;
+      }
       else setenv("BGMTL_NOCOPY_CACHE","0",1);
       bg_nc_cache_store(&c[0],source,16);assert(!c[0].bytes);
       free(source);puts("no-copy opt-out PASS");return 0;
