@@ -12,6 +12,21 @@
 
 extern id bgmtl_create_device(void);
 
+// Keep in sync with the kernel's sweetenv=@wallpaper group (j0121). Exact
+// executable names only: neither xpcproxy nor unrelated apps get a device.
+static BOOL
+wallpaper_process(const char *name)
+{
+   static const char *const names[] = {
+      "PosterBoard", "AegirPoster", "CollectionsPoster", "GradientPosterExtension",
+      "PridePosterExtension", "LegacyPoster", "PhotosPosterProvider",
+      "UnityPosterExtension", "EmojiPosterExtension", "ExtragalacticPoster"
+   };
+   for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+      if (!strcmp(name, names[i])) return YES;
+   return NO;
+}
+
 // Astronomy requests an XR10 drawable unconditionally, even when the device
 // correctly reports no XR support. For the scoped SDR experiment, change the
 // layer's actual format before its setter validates it. Pipeline builders then
@@ -47,20 +62,26 @@ poster_enable_sdr(void)
    Method tex_method = class_getInstanceMethod(object_getClass(texture), sel_getUid("setPixelFormat:"));
    Method att_method = class_getInstanceMethod(object_getClass(pipeline.colorAttachments[0]), sel_getUid("setPixelFormat:"));
    [texture release]; [pipeline release];
-   if (!method || !tex_method || !att_method) { NSLog(@"BGMTL Astronomy SDR: format setter missing"); return; }
+   if (!method || !tex_method || !att_method) { NSLog(@"BGMTL wallpaper SDR: format setter missing"); return; }
    poster_set_format = (void (*)(id, SEL, NSUInteger))method_setImplementation(method, (IMP)poster_set_sdr_format);
    // NanoUniverse also hard-codes XR in intermediate textures and PSOs instead of
    // querying the layer. Keep the actual attachment and pipeline formats equal.
    poster_texture_format = (void (*)(id, SEL, NSUInteger))method_setImplementation(tex_method, (IMP)poster_set_sdr_texture);
    poster_attachment_format = (void (*)(id, SEL, NSUInteger))method_setImplementation(att_method, (IMP)poster_set_sdr_attachment);
-   NSLog(@"BGMTL Astronomy SDR: layer, texture and pipeline format fallback enabled");
+   NSLog(@"BGMTL wallpaper SDR: layer, texture and pipeline format fallback enabled");
 }
 
 // Keep unknown selectors and backend failures visible in the probe's capture.
 void bgmtl_note_unimplemented(const char *sel)
-{ fprintf(stderr, "BGMTL UNIMPLEMENTED: %s\n", sel); }
+{
+   fprintf(stderr, "BGMTL UNIMPLEMENTED: %s\n", sel);
+   if (wallpaper_process(getprogname())) NSLog(@"BGMTL UNIMPLEMENTED: %s", sel);
+}
 void bgmtl_note_failure(const char *why)
-{ fprintf(stderr, "BGMTL command buffer failure: %s\n", why ? why : "?"); }
+{
+   fprintf(stderr, "BGMTL command buffer failure: %s\n", why ? why : "?");
+   if (wallpaper_process(getprogname())) NSLog(@"BGMTL command buffer failure: %s", why ? why : "?");
+}
 void bgmtl_note_line(const char *line)
 { fprintf(stderr, "BGMTL: %s\n", line); }
 
@@ -69,15 +90,16 @@ bgmtl_sweet_init(void)
 {
    const char *enable = getenv("BGMTL_ENABLE");
    const char *name = getprogname();
+   BOOL poster = wallpaper_process(name);
    if (!enable || strcmp(enable, "1") ||
        (strcmp(name, "bgmtl_registered_probe") && strcmp(name, "backboardd") &&
-        strcmp(name, "AegirPoster"))) return;
+        !poster)) return;
    fprintf(stderr, "BGMTL registration: enabled in %s\n", name);
    // The compositor's paths in libbgmtl (render tickets, odd-pitch sampled surfaces, BGR5A1): backboardd always wants them.
    if (!strcmp(name, "backboardd")) setenv("BGMTL_BB", "1", 0);
    // A/B switches without a new boot image: KEY=VALUE lines (FD_MESA_DEBUG=inorder, BGMTL_SHADOW=0, ...), set before
    // the device and its Mesa screen exist. The boot command line has no room left for them.
-   const char *env_path = !strcmp(name, "AegirPoster") ?
+   const char *env_path = poster ?
       "/private/var/tmp/bgmtl-poster.env" : "/private/var/tmp/bgmtl-bb.env";
    FILE *ab = fopen(env_path, "r");
    if (ab) {
@@ -110,7 +132,9 @@ bgmtl_sweet_init(void)
       id selected = MTLCreateSystemDefaultDevice();
       fprintf(stderr, "BGMTL registration: selected=%s same=%d\n",
               selected ? object_getClassName(selected) : "nil", selected == dev);
-      if (selected == dev && !strcmp(name, "AegirPoster")) poster_enable_sdr();
+      if (poster) NSLog(@"BGMTL wallpaper registration: %s selected=%s same=%d", name,
+                        selected ? object_getClassName(selected) : "nil", selected == dev);
+      if (selected == dev && poster) poster_enable_sdr();
       [selected release];
       // Keep our original reference for the process lifetime, independently of
       // the private registration entry point's ownership convention.
