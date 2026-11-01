@@ -14,11 +14,12 @@ extern id bgmtl_create_device(void);
 
 // Keep in sync with the kernel's sweetenv=@wallpaper group (j0121). Exact
 // executable names only: neither xpcproxy nor unrelated apps get a device.
+// PosterBoard (the poster host) is not a renderer and stays out (j0122 notes).
 static BOOL
 wallpaper_process(const char *name)
 {
    static const char *const names[] = {
-      "PosterBoard", "AegirPoster", "CollectionsPoster", "GradientPosterExtension",
+      "AegirPoster", "CollectionsPoster", "GradientPosterExtension",
       "PridePosterExtension", "LegacyPoster", "PhotosPosterProvider",
       "UnityPosterExtension", "EmojiPosterExtension", "ExtragalacticPoster"
    };
