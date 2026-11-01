@@ -108,6 +108,25 @@ const_pointer_init(const struct air_value *v)
    return NULL;
 }
 
+/* jasmine: a type that is nothing but one pointer, bare or as the only member
+ * of wrappers (MPS keeps its source texture in a local `struct TextureWriter
+ * { metal::texture2d { ptr addrspace(1) } }`); NULL for anything else. */
+static const struct air_type *
+single_pointer_type(const struct air_type *t)
+{
+   for (unsigned depth = 0; t && depth < 8; depth++) {
+      if (t->kind == AIR_TYPE_POINTER)
+         return t;
+      if (t->kind == AIR_TYPE_STRUCT && t->num_members == 1)
+         t = t->members[0];
+      else if (t->kind == AIR_TYPE_ARRAY && t->count == 1)
+         t = t->elem;
+      else
+         return NULL;
+   }
+   return NULL;
+}
+
 /* jasmine: a getelementptr whose indices are all constant zero, which on a
  * one-pointer slot (or a wrapper of one) names the slot itself. */
 static bool
@@ -1850,7 +1869,11 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       default:
          return air_error(c, "interface: a buffer in address space %u", (unsigned)as);
       }
-      add_resource(c, rk, index, size, read, write, param, node);
+      /* jasmine: a buffer marked air.arg_unused is no resource, for the reason an unused
+       * vertex attribute is no input: the application may legally leave it unbound, and
+       * Pride's ribbonFragment does (`brightness`, buffer 0), which the runtime refused. */
+      if (md_key(node, "air.arg_unused") < 0)
+         add_resource(c, rk, index, size, read, write, param, node);
       c->params[param] = air_val_ptr(c, p);
       return true;
    }
@@ -2943,13 +2966,14 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
          air_set(c, &in->base, tv);
          return true;
       }
-      if (in->aux_type && in->aux_type->kind == AIR_TYPE_POINTER && count == 1) {
+      if (single_pointer_type(in->aux_type) && count == 1) {
          /* jasmine: the slot the comment above describes. QuartzCore's uber
           * fragment shader keeps each sampler argument in such a local and
-          * chooses between it and a constant `unused_sampler`. */
+          * chooses between it and a constant `unused_sampler`; MPS's blurs keep
+          * their source texture in a one-member struct. */
          struct air_val *sv = rzalloc(c->mem_ctx, struct air_val);
          sv->kind = AIR_VAL_SLOT;
-         sv->ptr.pointee = in->aux_type;
+         sv->ptr.pointee = single_pointer_type(in->aux_type);
          sv->elems = rzalloc_array(c->mem_ctx, struct air_val *, 1);
          air_set(c, &in->base, sv);
          return true;
@@ -4738,6 +4762,35 @@ sampler_state_words(const struct air_value *v, uint64_t *word0)
    return true;
 }
 
+static bool init_bytes(struct air_ctx *c, const struct air_value *v, const struct air_type *t,
+                       uint8_t *buf, uint64_t size);
+
+/* jasmine: lay a constant global with a plain initializer out in nir->constant_data,
+ * where ir3 reads it through its constant-data UBO; false leaves it to scratch. */
+static bool
+plan_constant_data(struct air_ctx *c, const struct air_global *g, struct air_global_plan *pl)
+{
+   const struct air_constant *k = air_value_as_constant(g->init);
+   if (!k || k->ckind == AIR_CONST_UNDEF || k->ckind == AIR_CONST_POISON)
+      return false;
+   uint64_t size = air_type_alloc_size(c->m, g->value_type);
+   if (!size || size > 65536)
+      return false;
+   uint8_t *buf = rzalloc_size(c->mem_ctx, size + 8);
+   if (!init_bytes(c, g->init, g->value_type, buf, size))
+      return false;
+   unsigned align = MAX3(g->align, air_type_abi_align(c->m, g->value_type), 16);
+   unsigned off = ALIGN_POT(c->nir->constant_data_size, align);
+   c->nir->constant_data = reralloc_size(c->nir, c->nir->constant_data, off + size);
+   memset((uint8_t *)c->nir->constant_data + c->nir->constant_data_size, 0, off - c->nir->constant_data_size);
+   memcpy((uint8_t *)c->nir->constant_data + off, buf, size);
+   c->nir->constant_data_size = off + size;
+   pl->class = AIR_PTR_CONSTANT_DATA;
+   pl->offset = off;
+   pl->has_offset = true;
+   return true;
+}
+
 static void
 plan_globals(struct air_ctx *c)
 {
@@ -4814,6 +4867,10 @@ plan_globals(struct air_ctx *c)
          /* jasmine: a constant that is one pointer has no bytes for scratch
           * (a pointer here is a resolution), so it is a slot holding it */
          pl->slot = true;
+      } else if (g->is_const && g->init && plan_constant_data(c, g, pl)) {
+         /* jasmine: a constant table (Pride's stripeColors) is the shader's constant
+          * data and not scratch: scratch meant copying it into private memory in every
+          * invocation, and Pride's vertex shaders doing so hung the GPU */
       } else {
          /* a program-scope variable: private to the invocation, written by
           * the static initializers below
@@ -4944,6 +5001,86 @@ init_scratch_globals(struct air_ctx *c)
          o += n;
       }
    }
+}
+
+/* jasmine: scratch that is written and never read. A program-scope variable that
+ * an air.static_init sets from a function constant is folded at every read
+ * (sc_run_static_init), but its initializer's store stays, and that one store is
+ * what gave every MPS blur kernel (kUseSoftwareLinearFilter) private memory: a
+ * path a5xx compute never ran here, and Pride's blurs faulted the SMMU at a low
+ * address and hung the GPU. With no load_scratch left the stores are dead.
+ */
+/* jasmine: a load of scratch at a constant offset that a store in the same block wrote
+ * whole, with no store in between that could overlap it, is the stored value. This is
+ * what an out-parameter leaves (Pride's vertex shaders: `sincos(x, &c)` into a local
+ * float), and with it forwarded drop_write_only_scratch removes the store too. */
+static void
+forward_scratch(nir_function_impl *impl)
+{
+   struct scratch_store { unsigned off, bytes; nir_def *v; } st[16];
+   nir_foreach_block(block, impl) {
+      unsigned n = 0;
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic == nir_intrinsic_store_scratch) {
+            nir_def *v = in->src[0].ssa;
+            bool known = nir_src_is_const(in->src[1]) &&
+                         nir_intrinsic_write_mask(in) == BITFIELD_MASK(v->num_components);
+            unsigned off = known ? nir_src_as_uint(in->src[1]) : 0;
+            unsigned bytes = v->num_components * v->bit_size / 8;
+            if (!known) {
+               n = 0;
+               continue;
+            }
+            unsigned k = 0;
+            for (unsigned i = 0; i < n; i++)
+               if (st[i].off + st[i].bytes <= off || off + bytes <= st[i].off)
+                  st[k++] = st[i];
+            n = k;
+            if (n < ARRAY_SIZE(st))
+               st[n++] = (struct scratch_store) { off, bytes, v };
+         } else if (in->intrinsic == nir_intrinsic_load_scratch && nir_src_is_const(in->src[0])) {
+            unsigned off = nir_src_as_uint(in->src[0]);
+            for (unsigned i = 0; i < n; i++) {
+               if (st[i].off == off && st[i].v->num_components == in->def.num_components &&
+                   st[i].v->bit_size == in->def.bit_size) {
+                  nir_def_replace(&in->def, st[i].v);
+                  break;
+               }
+            }
+         }
+      }
+   }
+}
+
+static void
+drop_write_only_scratch(nir_shader *s)
+{
+   if (!s->scratch_size)
+      return;
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_constant_folding);
+   forward_scratch(impl);
+   nir_progress(true, impl, nir_metadata_control_flow);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_scratch)
+            return;
+      }
+   }
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_store_scratch)
+            nir_instr_remove(instr);
+      }
+   }
+   s->scratch_size = 0;
+   nir_progress(true, impl, nir_metadata_control_flow);
 }
 
 /* The functions of @llvm.global_ctors, inlined at the top of the entry point:
@@ -5228,6 +5365,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       NIR_PASS(_, c.nir, nir_opt_dce);
    }
 
+   drop_write_only_scratch(c.nir);
    nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
 
    if (info) {
