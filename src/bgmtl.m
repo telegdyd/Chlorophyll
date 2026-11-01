@@ -2095,10 +2095,8 @@ bg_shadow_release(struct rwa_texture *sh)
 {
    BG_TRACE("replaceRegion %lu,%lu %lux%lu level %lu bpr %lu\n", (unsigned long)r.origin.x, (unsigned long)r.origin.y,
             (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)level, (unsigned long)bpr);
-   if (bg_trace() && bytes && r.size.height > 1) {
-      const uint8_t *a = (const uint8_t *)bytes, *z = a + bpr * (r.size.height - 1);
-      BG_LOG("  first row px0 %u %u %u %u, last row px0 %u %u %u %u\n", a[0], a[1], a[2], a[3], z[0], z[1], z[2], z[3]);
-   }
+   // Do not peek at height * bytesPerRow here: compressed uploads have block
+   // rows, and even a plain one-channel upload need not contain four bytes.
    (void)bpi;
    unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
    unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
@@ -2199,6 +2197,14 @@ bg_shadow_release(struct rwa_texture *sh)
 @end
 
 @implementation BGMTLRenderEncoder
+static void
+bg_retain_binding(id *slot, id value)
+{
+   if (*slot == value) return;
+   [value retain];
+   [*slot release];
+   *slot = value;
+}
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb descriptor:(MTLRenderPassDescriptor *)d
 {
    self = [super initWithCommandBuffer:cb];
@@ -2251,13 +2257,20 @@ bg_shadow_release(struct rwa_texture *sh)
    }
    return self;
 }
-- (void)dealloc { for (unsigned i = 0; i < 8; i++) [_color[i] release]; [_scratch release]; [_depth release]; [_depth_state release]; [super dealloc]; }
+- (void)dealloc
+{
+   for (unsigned i = 0; i < 8; i++) [_color[i] release];
+   for (unsigned i = 0; i < BG_MAX_BINDINGS; i++) { [_vbuf[i] release]; [_fbuf[i] release]; }
+   for (unsigned i = 0; i < BG_MAX_TEX; i++) { [_tex[i] release]; [_smp[i] release]; }
+   [_pipeline release]; [_scratch release]; [_depth release]; [_depth_state release];
+   [super dealloc];
+}
 - (id)device { return [_cb device]; }
-- (void)setRenderPipelineState:(id)s { _pipeline = s; BG_TRACE("setPipeline %s\n", ((BGMTLRenderPipeline *)s)->_names); }
+- (void)setRenderPipelineState:(id)s { bg_retain_binding((id *)&_pipeline, s); BG_TRACE("setPipeline %s\n", s ? ((BGMTLRenderPipeline *)s)->_names : "nil"); }
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
-{ BG_TRACE("setVertexBuffer %p offset %lu index %lu\n", b, (unsigned long)o, (unsigned long)i); if (i < BG_MAX_BINDINGS) { _vbuf[i] = b; _voff[i] = o; if (i + 1 > _vhigh) _vhigh = (unsigned)i + 1; } }
+{ BG_TRACE("setVertexBuffer %p offset %lu index %lu\n", b, (unsigned long)o, (unsigned long)i); if (i < BG_MAX_BINDINGS) { bg_retain_binding(&_vbuf[i], b); _voff[i] = o; if (i + 1 > _vhigh) _vhigh = (unsigned)i + 1; } }
 - (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
-{ if (i < BG_MAX_BINDINGS) { _fbuf[i] = b; _foff[i] = o; if (i + 1 > _fhigh) _fhigh = (unsigned)i + 1; } }
+{ if (i < BG_MAX_BINDINGS) { bg_retain_binding(&_fbuf[i], b); _foff[i] = o; if (i + 1 > _fhigh) _fhigh = (unsigned)i + 1; } }
 // CoreAnimation binds a buffer once per pass and then only moves the offset between draws
 - (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _voff[i] = o; }
 - (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _foff[i] = o; }
@@ -2276,8 +2289,8 @@ bg_shadow_release(struct rwa_texture *sh)
    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
    if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
 }
-- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; } }
-- (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
+- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { bg_retain_binding(&_tex[i], t); if (i + 1 > _thigh) _thigh = (unsigned)i + 1; } }
+- (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { bg_retain_binding(&_smp[i], s); if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
 - (void)setViewport:(MTLViewport)v
 {
    BG_TRACE("setViewport %g %g %g %g z %g..%g\n", v.originX, v.originY, v.width, v.height, v.znear, v.zfar);
@@ -2300,7 +2313,10 @@ bg_shadow_release(struct rwa_texture *sh)
    if (bg_trace()) {
       BG_LOG("draw: prim %lu start %lu count %lu inst %lu index %s type %lu off %lu\n", (unsigned long)prim, (unsigned long)start,
              (unsigned long)count, (unsigned long)inst, ib ? "yes" : "no", (unsigned long)it, (unsigned long)io);
-      if (ib && count <= 64 && _vbuf[1]) {      // the vertices an indexed draw uses, slot 1 as CoreAnimation lays them out
+      NSUInteger index_length = ib ? [(BGMTLBuffer *)ib length] : 0;
+      NSUInteger vertex_length = _vbuf[1] ? [(BGMTLBuffer *)_vbuf[1] length] : 0;
+      if (ib && it == MTLIndexTypeUInt16 && count <= 64 && io <= index_length && count <= (index_length - io) / 2 &&
+          _vbuf[1] && _voff[1] <= vertex_length) {
          const uint8_t *base = (const uint8_t *)[(BGMTLBuffer *)_vbuf[1] contents] + _voff[1];
          const uint16_t *ix = (const uint16_t *)((const uint8_t *)[(BGMTLBuffer *)ib contents] + io);
          unsigned maxi = 0;
@@ -2308,6 +2324,7 @@ bg_shadow_release(struct rwa_texture *sh)
          for (unsigned k = 0; k < count && n < sizeof(line) - 8; k++) { n += snprintf(line + n, sizeof(line) - n, "%u ", ix[k]); if (ix[k] > maxi) maxi = ix[k]; }
          BG_LOG("  indices: %s\n", line);
          for (unsigned v = 0; v <= maxi && v < 16; v++) {
+            if ((size_t)(v + 1) * 48 > vertex_length - _voff[1]) break;
             const float *f = (const float *)(base + 48 * v);
             const __fp16 *h = (const __fp16 *)(base + 48 * v + 32);
             BG_LOG("  v%u: pos %g %g %g %g  a1 %g %g  a2 %g %g  col %g %g %g %g\n", v, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
@@ -2316,6 +2333,11 @@ bg_shadow_release(struct rwa_texture *sh)
       }
       for (unsigned i = 0; i < _vhigh; i++) {
          if (!_vbuf[i]) continue;
+         NSUInteger length = [(BGMTLBuffer *)_vbuf[i] length];
+         if (_voff[i] > length || length - _voff[i] < 16 * sizeof(float)) {
+            BG_LOG("  vbuf[%u] len %lu off %lu (no 64-byte trace preview)\n", i, (unsigned long)length, (unsigned long)_voff[i]);
+            continue;
+         }
          const float *f = (const float *)((const uint8_t *)[(BGMTLBuffer *)_vbuf[i] contents] + _voff[i]);
          BG_LOG("  vbuf[%u] len %lu off %lu: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n", i,
                 (unsigned long)[(BGMTLBuffer *)_vbuf[i] length], (unsigned long)_voff[i], f[0], f[1], f[2], f[3], f[4], f[5],

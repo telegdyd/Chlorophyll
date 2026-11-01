@@ -277,6 +277,10 @@ main(int argc, char **argv)
             [e setVertexBuffer:vb offset:0 atIndex:0];
             [e setFragmentTexture:t atIndex:0];
             [e setFragmentSamplerState:smp atIndex:0];
+            // A retained-reference encoder owns its bound resources before the
+            // draw too. Astronomy releases newly loaded textures after binding.
+            [pso release]; [vb release]; [t release]; [smp release];
+            pso = vb = t = smp = nil;
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
             [e endEncoding];
             CHECK(run(cb, "textured quad"), "render pass did not complete");
