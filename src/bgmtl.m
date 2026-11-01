@@ -828,11 +828,18 @@ bg_air_slice(NSData *d)
    NSData *vair = vertex ? ((NSData * (*)(id, SEL))objc_msgSend)(vertex, bitcode) : nil;
    NSData *fair = ((NSData * (*)(id, SEL))objc_msgSend)(fragment, bitcode);
    if (!fair.length || (vertex && !vair.length)) return [self bgFail:error with:@"a function has no bitcode"];
-   if (bg_trace() && getenv("BGMTL_DUMP")) {   // the exact modules this pipeline is built from, for air2nir on the Mac
+   NSString *dumpID = nil;
+   if (bg_trace() && getenv("BGMTL_DUMP")) {   // retain BOTH specializations from each pipeline creation
       mkdir(getenv("BGMTL_DUMP"), 0755);
       NSString *d = [NSString stringWithUTF8String:getenv("BGMTL_DUMP")];
-      if (vair) [vair writeToFile:[d stringByAppendingFormat:@"/%@.v.bc", [vertex name]] atomically:NO];
-      [fair writeToFile:[d stringByAppendingFormat:@"/%@.f.bc", [fragment name]] atomically:NO];
+      // Function names are shared by many specializations. Naming files by function
+      // overwrote each stage independently, fabricating pairs that never linked.
+      dumpID = [[NSUUID UUID] UUIDString];
+      NSString *base = [d stringByAppendingPathComponent:dumpID];
+      BOOL vok = !vair || [vair writeToFile:[base stringByAppendingString:@".v.bc"] atomically:NO];
+      BOOL fok = [fair writeToFile:[base stringByAppendingString:@".f.bc"] atomically:NO];
+      BG_LOG("AIR pair %s: vertex %s fragment %s saved=%d/%d\n", [dumpID UTF8String],
+             vertex ? [[vertex name] UTF8String] : "(generated)", [[fragment name] UTF8String], vok, fok);
    }
    struct rwa_render_shape shape;
    memset(&shape, 0, sizeof(shape));
@@ -885,6 +892,7 @@ bg_air_slice(NSData *d)
    BGMTLRenderPipeline *p = [[BGMTLRenderPipeline alloc] initWithDevice:self pipelineStateDescriptor:descriptor];
    if (!p) { bg_lock(); rwa_render_destroy(r); bg_unlock(); return [self bgFail:error with:@"_MTLRenderPipelineState refused to initialise"]; }
    p->_owner = self; p->_render = r; p->_info = info;
+   if (dumpID) BG_LOG("AIR pair %s: linked pipeline %p\n", [dumpID UTF8String], p);
    {
       char dwhy[128] = { 0 };
       unsigned nd = 0;
