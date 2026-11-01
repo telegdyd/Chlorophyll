@@ -18,11 +18,9 @@ extern id bgmtl_create_device(void);
 static BOOL
 wallpaper_process(const char *name)
 {
-   // PridePosterExtension stays out too: its MPS work hung the GPU on pool1 (2026-11-01 03:25), the kernel
-   // group still names it, so it gets the environment but no device until that hang is understood.
    static const char *const names[] = {
       "AegirPoster", "CollectionsPoster", "GradientPosterExtension",
-      "LegacyPoster", "PhotosPosterProvider",
+      "LegacyPoster", "PhotosPosterProvider", "PridePosterExtension",
       "UnityPosterExtension", "EmojiPosterExtension", "ExtragalacticPoster"
    };
    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++)
@@ -122,13 +120,28 @@ bgmtl_sweet_init(void)
       char line[256];
       while (fgets(line, sizeof(line), ab)) {
          line[strcspn(line, "\r\n")] = 0;
-         char *eq = strchr(line, '=');
+         char *key = line, *eq = strchr(line, '=');
          if (!eq || eq == line) continue;
          *eq = 0;
-         setenv(line, eq + 1, 1);
-         fprintf(stderr, "BGMTL registration: %s=%s (%s)\n", line, eq + 1, env_path);
+         // Name:KEY=VALUE applies to that one process only.
+         char *colon = strchr(line, ':');
+         if (colon) {
+            *colon = 0;
+            if (strcmp(line, name)) continue;
+            key = colon + 1;
+         }
+         setenv(key, eq + 1, 1);
+         fprintf(stderr, "BGMTL registration: %s=%s (%s)\n", key, eq + 1, env_path);
       }
       fclose(ab);
+   }
+   // A poster's stderr goes nowhere: BGMTL_LOG_DIR=<dir> sends it, unbuffered, to <dir>/<name>-<pid>.log so a trace
+   // (BGMTL_TRACE=1) survives a GPU hang and can be read back afterwards.
+   const char *log_dir = poster ? getenv("BGMTL_LOG_DIR") : NULL;
+   if (log_dir && *log_dir) {
+      char path[256];
+      snprintf(path, sizeof(path), "%s/%s-%d.log", log_dir, name, getpid());
+      if (freopen(path, "a", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
    }
    @autoreleasepool {
       void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");

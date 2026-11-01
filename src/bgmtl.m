@@ -159,7 +159,7 @@ __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; } 
 @class BGMTLComputePipeline;
 
 // ---- recorded work ---------------------------------------------------------------------------------------------------
-enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF, BG_WORK_CLEAR, BG_WORK_MIPMAPS };
+enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF, BG_WORK_CLEAR, BG_WORK_MIPMAPS, BG_WORK_RESOLVE };
 #define BG_MAX_TEX 16
 @interface BGWork : NSObject {
  @public
@@ -434,6 +434,7 @@ bg_install_fallback(Class c)
    id _tex[BG_MAX_TEX], _smp[BG_MAX_TEX];
    unsigned _thigh, _shigh;
    id _color[8];
+   id _resolve[8];                 // MTLStoreActionMultisampleResolve targets, resolved at endEncoding
    unsigned _ncolor;
    unsigned _clear_mask;           // colour attachments cleared at the start of the pass
    float _clear_vals[8][4];
@@ -1447,6 +1448,9 @@ bg_sync_commit(void)
       } else if (w->kind == BG_WORK_MIPMAPS) {
          if (rwa_texture_generate_mipmaps([(BGMTLTexture *)w->dst rwaTexture]) != 0)
             BG_LOG("blit: generateMipmapsForTexture: no mip chain made\n");
+      } else if (w->kind == BG_WORK_RESOLVE) {
+         if (rwa_texture_resolve([(BGMTLTexture *)w->src rwaTexture], [(BGMTLTexture *)w->dst rwaTexture]) != 0)
+            BG_LOG("render pass: multisample resolve refused\n");
       } else if (w->kind == BG_WORK_TEXCOPY &&
                  rwa_texture_copy([(BGMTLTexture *)w->src rwaTexture], (unsigned)w->t_slevel, (unsigned)w->t_sslice,
                                   (const unsigned[3]){ (unsigned)w->t_sorg[0], (unsigned)w->t_sorg[1], (unsigned)w->t_sorg[2] },
@@ -1731,8 +1735,10 @@ bg_sync_commit(void)
       if (d.stencilAttachment.texture) BG_LOG("  stencil fmt %lu load %lu clear %u\n", (unsigned long)d.stencilAttachment.texture.pixelFormat,
                                              (unsigned long)d.stencilAttachment.loadAction, d.stencilAttachment.clearStencil);
    }
-   for (unsigned i = 0; i < 8; i++)
+   for (unsigned i = 0; i < 8; i++) {
       if (d.colorAttachments[i].texture) [self bgTicketFor:d.colorAttachments[i].texture];
+      if (d.colorAttachments[i].resolveTexture) [self bgTicketFor:d.colorAttachments[i].resolveTexture];
+   }
    return [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease];
 }
 - (id)blitCommandEncoder { return [[[BGMTLBlitEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
@@ -2250,6 +2256,11 @@ bg_retain_binding(id *slot, id value)
       if (!a || ![a texture]) continue;
       _color[i] = [[a texture] retain];
       _ncolor = i + 1;
+      // jasmine: a multisample attachment resolved at the end of the pass (Pride's 4x MSAA ribbons into the drawable); the store
+      // action used to be ignored, and the drawable stayed as it was: black.
+      if (([a storeAction] == MTLStoreActionMultisampleResolve || [a storeAction] == MTLStoreActionStoreAndMultisampleResolve) &&
+          [a resolveTexture])
+         _resolve[i] = [[a resolveTexture] retain];
       if ([a loadAction] == MTLLoadActionClear) {
          MTLClearColor c = [a clearColor];
          _clear_mask |= 1u << i;
@@ -2293,7 +2304,7 @@ bg_retain_binding(id *slot, id value)
 }
 - (void)dealloc
 {
-   for (unsigned i = 0; i < 8; i++) [_color[i] release];
+   for (unsigned i = 0; i < 8; i++) { [_color[i] release]; [_resolve[i] release]; }
    for (unsigned i = 0; i < BG_MAX_BINDINGS; i++) { [_vbuf[i] release]; [_fbuf[i] release]; }
    for (unsigned i = 0; i < BG_MAX_TEX; i++) { [_tex[i] release]; [_smp[i] release]; }
    [_pipeline release]; [_scratch release]; [_depth release]; [_depth_state release];
@@ -2420,7 +2431,16 @@ bg_retain_binding(id *slot, id value)
 - (void)drawIndexedPrimitives:(NSUInteger)p indexCount:(NSUInteger)c indexType:(NSUInteger)t indexBuffer:(id)b indexBufferOffset:(NSUInteger)o
                 instanceCount:(NSUInteger)n
 { [self bgRecordDraw:p start:0 count:c instances:n indexBuffer:b indexType:t indexOffset:o baseVertex:0 baseInstance:0]; }
-- (void)endEncoding { [super endEncoding]; }
+- (void)endEncoding
+{
+   for (unsigned i = 0; i < _ncolor; i++) {
+      if (!_resolve[i]) continue;
+      BGWork *w = [[[BGWork alloc] init] autorelease];
+      w->kind = BG_WORK_RESOLVE; w->src = [_color[i] retain]; w->dst = [_resolve[i] retain];
+      [_cb bgRecord:w];
+   }
+   [super endEncoding];
+}
 @end
 
 // ---- GPU state, as the kernel reports it (SWEET_GPU_SEL_INFO). ABI minor 1 and 2 are both served: only flags & 3 is read (bit0 ready,

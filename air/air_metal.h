@@ -604,6 +604,8 @@ int rwa_texture_ticket_begin(struct rwa_texture *texture, uint64_t *generation, 
 int rwa_ticket_end(struct rwa_device *device, uint64_t generation, uint64_t epoch, int abort, uint32_t seqno);
 /* The kernel sequence number of a flushed fence's submit, after draining the submit queue; 0 if none. */
 uint32_t rwa_fence_seqno(struct rwa_device *device, struct rwa_fence *fence);
+/* jasmine: a multisample texture resolved into a one-sample one of the same size, on the GPU. */
+int rwa_texture_resolve(struct rwa_texture *src, struct rwa_texture *dst);
 int rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, const unsigned so[3],
                      struct rwa_texture *dst, unsigned dlevel, unsigned dslice, const unsigned dorg[3], const unsigned size[3]);
 /* Chlorophyll: generateMipmapsForTexture on the GPU, levels 1..last from level 0 (0 or -1). */

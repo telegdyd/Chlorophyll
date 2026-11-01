@@ -66,3 +66,12 @@ kernel void bg_tex_sample_lod(texture2d<float> t [[texture(0)]], sampler s [[sam
    float2 uv = (float2(gid) + 0.5f) / float2(size);
    out[gid.y * size.x + gid.x] = t.sample(s, uv, level(lod));
 }
+
+// jasmine: every sample of one texel of a multisample texture (bgmtl_mps_probe msaa ... msread): separates a pass that
+// renders into a multisample attachment from the resolve that reads it.
+kernel void bg_ms_read(texture2d_ms<float, access::read> t [[texture(0)]], device float4 *out [[buffer(0)]],
+                       constant uint2 &at [[buffer(1)]], uint gid [[thread_position_in_grid]])
+{
+   if (gid < 4)
+      out[gid] = t.read(at, gid);
+}

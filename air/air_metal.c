@@ -1701,6 +1701,10 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       .target = target, .format = fmt->pipe,
       .width0 = width, .height0 = height, .depth0 = depth,
       .array_size = array_size, .last_level = mips - 1, .nr_samples = query_samples,
+      /* jasmine: storage samples as the state tracker sets them. Left 0, a multisample texture failed
+       * util_blitter_is_blit_supported (is_format_supported wants the two counts equal), so every
+       * MSAA resolve blit was dropped silently and Pride's drawable stayed black. */
+      .nr_storage_samples = query_samples,
       .bind = bind, .usage = PIPE_USAGE_DEFAULT };
 
    if (import) {
@@ -1978,6 +1982,34 @@ rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, cons
       return 0;
    }
    pipe->resource_copy_region(pipe, dst->res, dlevel, dorg[0], dorg[1], dorg[2] + dslice, src->res, slevel, &box);
+   return 0;
+}
+
+/* jasmine: a render pass's MTLStoreActionMultisampleResolve, on the GPU and in order with the draws: the samples of each
+ * texel averaged into the one-sample resolve texture. Through u_blitter (scissored, as rwa_texture_copy: the a512's 2D
+ * blitter leaves its destination empty), which resolves by drawing with the multisample texture as its source. -1: the
+ * shapes do not match a resolve. */
+int
+rwa_texture_resolve(struct rwa_texture *src, struct rwa_texture *dst)
+{
+   if (!src || !dst || !src->res || !dst->res || src->device != dst->device || src->res->nr_samples <= 1 ||
+       dst->res->nr_samples > 1 || src->res->width0 != dst->res->width0 || src->res->height0 != dst->res->height0)
+      return -1;
+   struct pipe_blit_info info;
+   memset(&info, 0, sizeof(info));
+   info.src.resource = src->res;
+   info.src.format = src->res->format;
+   u_box_2d(0, 0, (int)src->res->width0, (int)src->res->height0, &info.src.box);
+   info.dst.resource = dst->res;
+   info.dst.format = dst->res->format;
+   info.dst.box = info.src.box;
+   info.mask = util_format_get_mask(dst->res->format);
+   info.filter = PIPE_TEX_FILTER_NEAREST;
+   info.scissor_enable = true;
+   info.scissor.maxx = dst->res->width0;
+   info.scissor.maxy = dst->res->height0;
+   gs_invalidate(src->device);
+   src->device->pipe->blit(src->device->pipe, &info);
    return 0;
 }
 
@@ -4621,6 +4653,29 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
       .block = { group_size[0], group_size[1], group_size[2] },
       .grid = { groups[0], groups[1], groups[2] },
    };
+   /* jasmine: BGMTL_TRACE names every dispatch and the GPU addresses it binds, before it is
+    * launched, so the last line before a hang is the dispatch that hung (Pride's MPS blurs
+    * faulted the SMMU at an address outside the GPU's VA range). */
+   if (getenv("BGMTL_TRACE") && !device->software) {
+      fprintf(stderr, "rwa: dispatch %s grid %ux%ux%u of %ux%ux%u\n", name, groups[0], groups[1], groups[2],
+              group_size[0], group_size[1], group_size[2]);
+      for (unsigned i = 0; i < bindings->texture_count; i++) {
+         struct rwa_texture *t = bindings->textures[i];
+         if (t && t->res)
+            fprintf(stderr, "rwa:   texture %u %ux%u %s at %llx size %zu\n", i, t->res->width0, t->res->height0,
+                    t->format_name ? t->format_name : "?", (unsigned long long)fd_bo_get_iova(fd_resource(t->res)->bo),
+                    (size_t)fd_bo_size(fd_resource(t->res)->bo));
+      }
+      for (unsigned i = 0; i < bindings->buffer_count; i++) {
+         struct rwa_buffer *b = bindings->buffers[i];
+         if (b && b->res)
+            fprintf(stderr, "rwa:   buffer %u at %llx size %zu\n", i,
+                    (unsigned long long)fd_bo_get_iova(fd_resource(b->res)->bo), b->size);
+      }
+      for (unsigned i = 0; i < bindings->sampler_count; i++)
+         if (bindings->samplers[i])
+            fprintf(stderr, "rwa:   sampler %u\n", i);
+   }
    pipe->launch_grid(pipe, &grid);
 
    /* Waited for here, and not left to rwa_finish, because this is the call that can
