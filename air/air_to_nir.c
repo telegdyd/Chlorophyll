@@ -2007,7 +2007,7 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          c->params[param] = air_val_ssa(c, fit(c, pos, t));
          c->nir->info.fs.origin_upper_left = true;
          c->nir->info.fs.pixel_center_integer = false;
-         /* nothing in this path calls nir_shader_gather_info, and nir_to_tgsi emits the
+         /* nir_to_tgsi emits the
           * FS_COORD_ORIGIN property only for a shader whose info says it reads the
           * position -- without this the property is absent and softpipe falls back on
           * TGSI_FS_COORD_ORIGIN_UPPER_LEFT (0), which is the right answer by accident.
@@ -2108,9 +2108,8 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       if (bits == 16)
          fetched = nir_f2f16(&c->b, fetched);
 
-      /* nir_shader_gather_info does not run on this path -- ir3 calls it only for a
-       * binning variant -- so what it would have set from the intrinsic
-       * (nir_gather_info.c) is set here. Without uses_fbfetch_output the draw gets no
+      /* Record the fetch immediately; the final fragment info gather refreshes it
+       * from the intrinsic as well. Without uses_fbfetch_output the draw gets no
        * flush at all and the read returns whatever the tile buffer happened to hold.
        */
       c->nir->info.outputs_read |= BITFIELD64_BIT(sem.location);
@@ -5367,6 +5366,15 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
 
    drop_write_only_scratch(c.nir);
    nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
+
+   /* Fragment derivatives and implicit-LOD samples require helper invocations
+    * for the whole pixel quad. ir3 consumes these shader-info flags to enable
+    * PIXLODENABLE; it does not gather them for a fragment shader itself. Without
+    * them, fwidth reads inactive lanes at primitive edges (CA's rounded layers
+    * acquire dashed borders even though their interpolated distance is correct).
+    * Gather while the frontend's I/O variables are still present. */
+   if (stage == MESA_SHADER_FRAGMENT)
+      nir_shader_gather_info(c.nir, nir_shader_get_entrypoint(c.nir));
 
    if (info) {
       /* The info's arrays live under mem_ctx, not under the scratch context --

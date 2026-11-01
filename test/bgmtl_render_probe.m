@@ -727,6 +727,52 @@ main(int argc, char **argv)
          printf("  ASTC no-copy: %u wrong / %u values (including mip chain and CPU refresh)\n",bad,values);
          [sampler release]; [sd release];
       }
+      // P15: a derivative-only shader needs helper lanes at the shared edge
+      // of these triangles. Compare the entire circle, including that edge.
+      printf("== P15 derivative coverage across primitive edges\n");
+      {
+         enum { N = 128 };
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_quad_helpers"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         NSError *err = nil;
+         id pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+         const float quad[6 * 8] = {
+            -1,-1,0,1, 1,1,1,1,  1,-1,0,1, 1,1,1,1, -1,1,0,1, 1,1,1,1,
+             1,-1,0,1, 1,1,1,1,  1, 1,0,1, 1,1,1,1, -1,1,0,1, 1,1,1,1 };
+         id vb = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+         id rt = tex2d(MTLPixelFormatBGRA8Unorm, N, N, MTLTextureUsageRenderTarget);
+         unsigned bad = 0, edge = 0;
+         if (pso && vb && rt) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id cb = [g_queue commandBuffer], e = [cb renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:pso]; [e setVertexBuffer:vb offset:0 atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6]; [e endEncoding];
+            if (!run(cb, "derivative circle")) bad++;
+            uint8_t px[N * N * 4];
+            [rt getBytes:px bytesPerRow:N * 4 fromRegion:MTLRegionMake2D(0, 0, N, N) mipmapLevel:0];
+            for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+               float u = (x + 0.5f - N / 2) / (N / 2), v = (y + 0.5f - N / 2) / (N / 2);
+               // Exact coarse differences of u*u + v*v across a 2x2 quad.
+               float dx = 2.0f * ((x & ~1) + 1 - N / 2) / ((N / 2) * (N / 2));
+               float dy = 2.0f * ((y & ~1) + 1 - N / 2) / ((N / 2) * (N / 2));
+               float coverage = (0.5625f - u*u - v*v) / fmaxf(fabsf(dx) + fabsf(dy), 0.0001f) + 0.5f;
+               int want = (int)lrintf(fminf(1, fmaxf(0, coverage)) * 255);
+               if (want > 0 && want < 255) edge++;
+               for (unsigned c = 0; c < 4; c++) if (abs(px[(y*N+x)*4+c] - want) > 3) {
+                  if (bad < 4) printf("  helper (%d,%d) channel %u: %u expected %d\n", x, y, c, px[(y*N+x)*4+c], want);
+                  bad++; break;
+               }
+            }
+         } else { bad++; printf("  derivative setup: %s\n", err ? [[err localizedDescription] UTF8String] : "nil"); }
+         CHECK(!bad && edge > 100, "derivative coverage: %u wrong, %u edge pixels", bad, edge);
+         printf("  derivative coverage: %u wrong, %u edge pixels\n", bad, edge);
+         [pso release]; [vb release]; [rt release]; [pd release];
+      }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;
    }

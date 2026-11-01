@@ -17,6 +17,15 @@ vertex V bg_vs(uint vid [[vertex_id]], device const float4 *data [[buffer(0)]])
 
 fragment float4 bg_fs_color(V in [[stage_in]]) { return in.color; }
 
+// A circle crossing the quad's shared triangle edge. Derivatives there need
+// helper lanes even when no texture instruction requests an implicit LOD.
+fragment half4 bg_fs_quad_helpers(V in [[stage_in]])
+{
+   float2 p = in.uv * 2.0 - 1.0;
+   float d = dot(p, p);
+   return half4(saturate((0.5625 - d) / max(fwidth(d), 0.0001) + 0.5));
+}
+
 fragment float4 bg_fs_tex(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]])
 {
    return t.sample(s, in.uv);

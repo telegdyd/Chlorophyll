@@ -883,9 +883,8 @@ barrier_op(struct air_ctx *c, const struct air_inst *in)
  * lanes of the quad. Under `terminate` those neighbours would read a dead
  * lane.
  *
- * uses_discard is set by hand because nir_shader_gather_info does not run on
- * this path (ir3 calls it only for a binning variant), exactly as the
- * framebuffer-fetch flags are set in air_to_nir.c. It is not bookkeeping: it
+ * uses_discard is recorded here and refreshed by the final fragment info
+ * gather, like the framebuffer-fetch flags in air_to_nir.c. It is not bookkeeping: it
  * is what nir_to_tgsi_info turns into `uses_kill`, which is what a Gallium
  * driver reads before it allows an early depth test, and what freedreno reads
  * before it writes LRZ. A discarding shader whose interface says it discards
