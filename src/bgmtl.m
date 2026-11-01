@@ -1027,6 +1027,7 @@ bg_air_slice(NSData *d)
 
 // ---- command queue / buffer / encoders -------------------------------------------------------------------------------
 @implementation BGMTLCommandQueue
++ (void)load { ensure_protocol(self, "MTLCommandQueue"); }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(id)descriptor
 {
    self = [super initWithDevice:device descriptor:descriptor];
@@ -1043,6 +1044,8 @@ bg_air_slice(NSData *d)
 @end
 
 @implementation BGMTLCommandBuffer
+// MPS (MPSCommandBufferImageCache) refuses a command buffer that does not conform: Pride's poster got nil and crashed
++ (void)load { ensure_protocol(self, "MTLCommandBuffer"); }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue
 {
    self = [super initWithQueue:queue retainedReferences:YES synchronousDebugMode:NO];
@@ -1737,6 +1740,7 @@ bg_sync_commit(void)
 @end
 
 @implementation BGMTLComputeEncoder
++ (void)load { ensure_protocol(self, "MTLComputeCommandEncoder"); }
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb
 {
    self = [super initWithCommandBuffer:cb];
@@ -1788,6 +1792,7 @@ bg_sync_commit(void)
 @end
 
 @implementation BGMTLBlitEncoder
++ (void)load { ensure_protocol(self, "MTLBlitCommandEncoder"); }
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb
 {
    self = [super initWithCommandBuffer:cb];
@@ -2225,6 +2230,7 @@ bg_shadow_release(struct rwa_texture *sh)
 @end
 
 @implementation BGMTLRenderEncoder
++ (void)load { ensure_protocol(self, "MTLRenderCommandEncoder"); }
 static void
 bg_retain_binding(id *slot, id value)
 {
@@ -2473,6 +2479,7 @@ bgmtl_gpu_state(unsigned *abi_minor)
 - (NSUInteger)resourceOptions { return (_storage << MTLResourceStorageModeShift) | (_cache << MTLResourceCPUCacheModeShift) | (_hazard << MTLResourceHazardTrackingModeShift); }
 - (NSInteger)type { return (NSInteger)_type; }
 - (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }   // MTLPurgeableStateNonVolatile
+- (NSUInteger)protectionOptions { return 0; }
 // bytes held by live resources not made aliasable (an aliasable one's space is the heap's again)
 - (NSUInteger)usedSize
 {

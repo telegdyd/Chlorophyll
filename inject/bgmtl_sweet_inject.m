@@ -78,13 +78,26 @@ void bgmtl_note_unimplemented(const char *sel)
    fprintf(stderr, "BGMTL UNIMPLEMENTED: %s\n", sel);
    if (wallpaper_process(getprogname())) NSLog(@"BGMTL UNIMPLEMENTED: %s", sel);
 }
+// The unified log shows the failure text as <private>: wallpaper processes also append it, and
+// the runtime's notes, to a file (the first 64 per process) so the reason can be read back.
+static void
+poster_note_file(const char *kind, const char *text)
+{
+   static int told;
+   if (!wallpaper_process(getprogname()) || told++ >= 64) return;
+   FILE *f = fopen("/private/var/tmp/bgmtl-poster-failures.txt", "a");
+   if (!f) return;
+   fprintf(f, "%s[%d] %s: %s\n", getprogname(), getpid(), kind, text ? text : "?");
+   fclose(f);
+}
 void bgmtl_note_failure(const char *why)
 {
    fprintf(stderr, "BGMTL command buffer failure: %s\n", why ? why : "?");
    if (wallpaper_process(getprogname())) NSLog(@"BGMTL command buffer failure: %s", why ? why : "?");
+   poster_note_file("failure", why);
 }
 void bgmtl_note_line(const char *line)
-{ fprintf(stderr, "BGMTL: %s\n", line); }
+{ fprintf(stderr, "BGMTL: %s\n", line); poster_note_file("note", line); }
 
 __attribute__((constructor)) static void
 bgmtl_sweet_init(void)
