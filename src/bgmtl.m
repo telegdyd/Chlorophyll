@@ -263,6 +263,15 @@ bg_fwd_inv(id self, SEL _cmd, NSInvocation *inv)
    }
 }
 
+// heap membership of a buffer or texture (BGMTLHeap): the heap (retained) and whether it was made aliasable
+static char bg_heap_key, bg_alias_key;
+static id bg_resource_heap(id r) { return objc_getAssociatedObject(r, &bg_heap_key); }
+static BOOL bg_resource_aliasable(id r) { return objc_getAssociatedObject(r, &bg_alias_key) != nil; }
+static void bg_resource_make_aliasable(id r)
+{
+   if (bg_resource_heap(r)) objc_setAssociatedObject(r, &bg_alias_key, (id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN);
+}
+
 static void
 bg_install_fallback(Class c)
 {
@@ -441,6 +450,18 @@ bg_install_fallback(Class c)
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb descriptor:(MTLRenderPassDescriptor *)d;
 @end
 
+// A heap: its resources are ordinary device buffers and textures (no sub-allocation), counted against the heap's size
+// so that callers sizing work by -maxAvailableSizeWithAlignment: (MPS's per-command-buffer cache, Pride's poster)
+// see the space Metal would give them. A resource retains its heap, the heap tracks its resources weakly.
+@interface BGMTLHeap : _MTLObjectWithLabel {
+   BGMTLDevice *_owner;
+   NSUInteger _size, _storage, _cache, _hazard, _type;
+   NSMapTable *_resources;   // resource (weak) -> the heap bytes it takes (its size query; a texture's allocatedSize is 0)
+   os_unfair_lock _lock;
+}
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLHeapDescriptor *)d;
+@end
+
 static void
 ensure_protocol(Class cls, const char *proto)
 {
@@ -465,7 +486,7 @@ ensure_protocol(Class cls, const char *proto)
    // lookup there would patch the inject's copy instead of its own
    Class fb[] = { [BGMTLCommandQueue class], [BGMTLCommandBuffer class], [BGMTLRenderEncoder class], [BGMTLComputeEncoder class],
                   [BGMTLBlitEncoder class], [BGMTLBuffer class], [BGMTLTexture class], [BGMTLRenderPipeline class],
-                  [BGMTLComputePipeline class], [BGMTLSampler class], [BGMTLDepthStencil class] };
+                  [BGMTLComputePipeline class], [BGMTLSampler class], [BGMTLDepthStencil class], [BGMTLHeap class] };
    for (unsigned i = 0; i < sizeof(fb) / sizeof(fb[0]); i++) {
       if (fb[i]) bg_install_fallback(fb[i]);
    }
@@ -724,6 +745,11 @@ bg_air_slice(NSData *d)
    return [[BGMTLBuffer alloc] initWithBGDevice:self length:length];
 }
 
+- (id)newHeapWithDescriptor:(MTLHeapDescriptor *)d
+{
+   return [[BGMTLHeap alloc] initWithBGDevice:self descriptor:d];
+}
+
 - (id)newBufferWithBytesNoCopy:(void *)p length:(NSUInteger)length options:(NSUInteger)options deallocator:(void (^)(void *, NSUInteger))dealloc
 {
    (void)options;
@@ -968,10 +994,10 @@ bg_air_slice(NSData *d)
 - (NSUInteger)resourceOptions { return 0; }
 - (NSUInteger)hazardTrackingMode { return 0; }
 - (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
-- (id)heap { return nil; }
+- (id)heap { return bg_resource_heap(self); }
 - (NSUInteger)heapOffset { return 0; }
-- (BOOL)isAliasable { return NO; }
-- (void)makeAliasable {}
+- (BOOL)isAliasable { return bg_resource_aliasable(self); }
+- (void)makeAliasable { bg_resource_make_aliasable(self); }
 - (BOOL)doesAliasResource:(id)r { (void)r; return NO; }
 - (BOOL)isComplete { return YES; }
 - (void)waitUntilComplete {}
@@ -2085,8 +2111,10 @@ bg_shadow_release(struct rwa_texture *sh)
 - (NSUInteger)hazardTrackingMode { return 0; }
 - (NSUInteger)allocatedSize { return 0; }
 - (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
-- (id)heap { return nil; }
-- (BOOL)isAliasable { return NO; }
+- (id)heap { return bg_resource_heap(self); }
+- (NSUInteger)heapOffset { return 0; }
+- (BOOL)isAliasable { return bg_resource_aliasable(self); }
+- (void)makeAliasable { bg_resource_make_aliasable(self); }
 - (BOOL)isComplete { return YES; }
 - (void)waitUntilComplete {}
 - (NSUInteger)protectionOptions { return 0; }
@@ -2413,6 +2441,92 @@ bgmtl_gpu_state(unsigned *abi_minor)
    return (f & 2) ? 2 : (f & 1) ? 1 : 0;
 #endif
 }
+
+// ---- heap ------------------------------------------------------------------------------------------------------------
+@implementation BGMTLHeap
++ (void)load { ensure_protocol(self, "MTLHeap"); ensure_protocol(self, "MTLHeapSPI"); }
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLHeapDescriptor *)d
+{
+   if (!(self = [super init])) return nil;
+   _owner = [device retain];
+   _size = d.size;
+   _storage = d.storageMode;
+   _cache = d.cpuCacheMode;
+   _hazard = d.hazardTrackingMode;
+   _type = d.type;
+   _resources = [[NSMapTable weakToStrongObjectsMapTable] retain];
+   _lock = OS_UNFAIR_LOCK_INIT;
+   BG_TRACE("heap %lu bytes type %lu storage %lu\n", (unsigned long)_size, (unsigned long)_type, (unsigned long)_storage);
+   return self;
+}
+- (void)dealloc
+{
+   [_resources release];
+   [_owner release];
+   [super dealloc];
+}
+- (id)device { return _owner; }
+- (NSUInteger)size { return _size; }
+- (NSUInteger)storageMode { return _storage; }
+- (NSUInteger)cpuCacheMode { return _cache; }
+- (NSUInteger)hazardTrackingMode { return _hazard; }
+- (NSUInteger)resourceOptions { return (_storage << MTLResourceStorageModeShift) | (_cache << MTLResourceCPUCacheModeShift) | (_hazard << MTLResourceHazardTrackingModeShift); }
+- (NSInteger)type { return (NSInteger)_type; }
+- (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }   // MTLPurgeableStateNonVolatile
+// bytes held by live resources not made aliasable (an aliasable one's space is the heap's again)
+- (NSUInteger)usedSize
+{
+   NSUInteger used = 0;
+   os_unfair_lock_lock(&_lock);
+   for (id r in _resources) {
+      if (!bg_resource_aliasable(r)) used += [[_resources objectForKey:r] unsignedLongValue];
+   }
+   os_unfair_lock_unlock(&_lock);
+   return used;
+}
+- (NSUInteger)currentAllocatedSize { return _size; }
+- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment
+{
+   (void)alignment;
+   NSUInteger used = [self usedSize];
+   return used < _size ? (_size - used) & ~(NSUInteger)0x3fff : 0;
+}
+- (id)bgAdopt:(id)r size:(NSUInteger)need
+{
+   if (!r) return nil;
+   if ([self usedSize] + need > _size) {         // no room: nil, as Metal answers, and the caller makes another heap
+      [r release];
+      return nil;
+   }
+   objc_setAssociatedObject(r, &bg_heap_key, self, OBJC_ASSOCIATION_RETAIN);
+   os_unfair_lock_lock(&_lock);
+   [_resources setObject:@(need) forKey:r];
+   os_unfair_lock_unlock(&_lock);
+   return r;
+}
+- (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options
+{
+   MTLSizeAndAlign sa = [_owner heapBufferSizeAndAlignWithLength:length options:options];
+   if ([self usedSize] + sa.size > _size) return nil;
+   return [self bgAdopt:[_owner newBufferWithLength:length options:options] size:sa.size];
+}
+- (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options offset:(NSUInteger)offset
+{
+   (void)offset;   // placement heaps: the offset is the caller's bookkeeping; memory is the resource's own here
+   return [self newBufferWithLength:length options:options];
+}
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d
+{
+   MTLSizeAndAlign sa = [_owner heapTextureSizeAndAlignWithDescriptor:d];
+   if ([self usedSize] + sa.size > _size) return nil;
+   return [self bgAdopt:[_owner newTextureWithDescriptor:d] size:sa.size];
+}
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset
+{
+   (void)offset;
+   return [self newTextureWithDescriptor:d];
+}
+@end
 
 // ---- entry point for test processes ----------------------------------------------------------------------------------
 id
