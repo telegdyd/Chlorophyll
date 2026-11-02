@@ -32,6 +32,23 @@
 #include <string.h>
 
 #include "air_metal.h"
+#ifdef RWA_SWEETGPU
+#include "util/sweet_state_profile.h"
+#endif
+
+void rwa_state_profile_begin(unsigned render_passes)
+{
+#ifdef RWA_SWEETGPU
+   sweet_m3_begin(render_passes);
+#endif
+}
+
+void rwa_state_profile_end(void)
+{
+#ifdef RWA_SWEETGPU
+   sweet_m3_end();
+#endif
+}
 
 #include "nir.h"
 #include "nir_builder.h"

@@ -1368,6 +1368,10 @@ struct rwa_clear {
 };
 int rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char *why, size_t why_size);
 
+/* Bounded opt-in operation inventory; serialized with device replay. */
+void rwa_state_profile_begin(unsigned render_passes);
+void rwa_state_profile_end(void);
+
 #ifdef __cplusplus
 }
 #endif

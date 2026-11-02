@@ -391,6 +391,7 @@ bg_install_fallback(Class c)
 @interface BGMTLCommandBuffer : _MTLCommandBuffer {
    BGMTLCommandQueue *_queue;
    NSMutableArray *_work;
+   unsigned _renderPasses; // M3 inventory: encoded render passes, including empty passes
    NSError *_error;
    NSInteger _status;
    NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
@@ -1403,6 +1404,7 @@ bg_sync_commit(void)
    bg_lock();
    bg_refresh_epoch = ++bg_refresh_epochs;
    bg_upload_begin();
+   rwa_state_profile_begin(_renderPasses);
    // jasmine: surfaces this command buffer renders or blits into draw in their shared shadow (bgShadowLocked)
    for (BGWork *w in _work) {
       if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
@@ -1599,6 +1601,7 @@ bg_sync_commit(void)
    int defer_scheduled = bg_defer_scheduled();
    @synchronized (self) { if (_status != 5 && !defer_scheduled) _status = 3; }   // Scheduled
    struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
+   rwa_state_profile_end();
    if (_tcount) {   // jasmine: seal this command buffer's render tickets with its submit (bgTicketFor)
       uint32_t seqno = fence ? rwa_fence_seqno([dev rwa], fence) : 0;
       for (unsigned i = 0; i < _tcount; i++)
@@ -1814,6 +1817,7 @@ bg_sync_commit(void)
 
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
 {
+   _renderPasses++;
    id<MTLTexture> t = d.colorAttachments[0].texture;
    BG_TRACE("render pass: color0 %lux%lu fmt %lu load %lu store %lu\n", (unsigned long)t.width, (unsigned long)t.height,
             (unsigned long)t.pixelFormat, (unsigned long)d.colorAttachments[0].loadAction, (unsigned long)d.colorAttachments[0].storeAction);

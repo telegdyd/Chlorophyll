@@ -865,6 +865,64 @@ main(int argc, char **argv)
          CHECK(!accepted && good, "unsupported formats still return nil; supported creation survives: %u accepted", accepted);
          [good release];
       }
+      // P18: independently executable batches must restore all draw state.
+      // Switch targets and pipelines, sample a prior target, retain untouched
+      // pixels, then reuse bindings in a new command buffer. Recreate resources.
+      printf("== P18 batch state across target switches and recreation\n");
+      {
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_color"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         id color = [g_dev newRenderPipelineStateWithDescriptor:pd error:NULL];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_tex_inline"];
+         id sample = [g_dev newRenderPipelineStateWithDescriptor:pd error:NULL];
+         unsigned bad = 0, checked = 0;
+         for (unsigned round = 0; round < 6; round++) { @autoreleasepool {
+            unsigned n = round & 1 ? 12 : 8;
+            float quad[] = {-1,-1,0,1,1,0,0,1, 1,-1,0,1,1,0,0,1, -1,1,0,1,1,0,0,1,
+                             1,-1,0,1,1,0,0,1, 1,1,0,1,1,0,0,1, -1,1,0,1,1,0,0,1};
+            id vb[2];
+            vb[0] = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+            for (unsigned v = 0; v < 6; v++) { quad[v*8+4] = 0; quad[v*8+5] = 1; }
+            vb[1] = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+            id a = tex2d(MTLPixelFormatBGRA8Unorm, n, n, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+            id b = tex2d(MTLPixelFormatBGRA8Unorm, n, n, MTLTextureUsageRenderTarget);
+            if (!color || !sample || !vb[0] || !vb[1] || !a || !b) bad++;
+            else for (unsigned commit = 0; commit < 2; commit++) { @autoreleasepool {
+               id cb = [g_queue commandBuffer];
+               for (unsigned pass = 0; pass < 4; pass++) {
+                  MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                  rp.colorAttachments[0].texture = pass & 1 ? b : a;
+                  rp.colorAttachments[0].loadAction = pass == 2 ? MTLLoadActionLoad : MTLLoadActionClear;
+                  rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                  id e = [cb renderCommandEncoderWithDescriptor:rp];
+                  [e setRenderPipelineState:pass & 1 ? sample : color];
+                  [e setVertexBuffer:vb[pass == 2 ? 1-commit : commit] offset:0 atIndex:0];
+                  if (pass & 1) [e setFragmentTexture:a atIndex:0];
+                  if (pass == 2) [e setScissorRect:(MTLScissorRect){0, 0, n/2, n}];
+                  for (unsigned draw = 0; draw < 2; draw++)
+                     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+                  [e endEncoding];
+               }
+               if (!run(cb, "batch state transitions")) bad++;
+               uint8_t px[12*12*4];
+               [b getBytes:px bytesPerRow:n*4 fromRegion:MTLRegionMake2D(0,0,n,n) mipmapLevel:0];
+               for (unsigned y=0; y<n; y++) for (unsigned x=0; x<n; x++) {
+                  unsigned green = x < n/2 ? 1-commit : commit;
+                  for (unsigned c=0; c<4; c++) {
+                     unsigned want = (c == 3 || c == (green ? 1 : 2)) ? 255 : 0;
+                     if (px[(y*n+x)*4+c] != want) bad++;
+                     checked++;
+                  }
+               }
+            }}
+            [a release]; [b release]; [vb[0] release]; [vb[1] release];
+         }}
+         CHECK(!bad, "batch state transitions: %u wrong / %u values", bad, checked);
+         printf("  batch state transitions: %u wrong / %u values\n", bad, checked);
+         [color release]; [sample release]; [pd release];
+      }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;
    }
