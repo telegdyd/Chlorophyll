@@ -184,7 +184,7 @@ bg_ctx_init(void)
    pthread_mutexattr_t a;
    pthread_mutexattr_init(&a);
    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-   // jasmine: fair hand-off, so CoreAnimation's thread gets the context between the replay worker's work items (commit)
+   // Fair hand-off lets encoding threads acquire the context between command-buffer replays.
    pthread_mutexattr_setpolicy_np(&a, PTHREAD_MUTEX_POLICY_FAIRSHARE_NP);
    pthread_mutex_init(&bg_ctx_mutex, &a);
    pthread_mutexattr_destroy(&a);
@@ -401,6 +401,7 @@ bg_install_fallback(Class c)
    uint64_t _tgen[8], _tepoch[8];                          // jasmine: render tickets opened for this command buffer
    uint32_t _tsurf[8];
    unsigned _tcount;
+   BOOL _ticketDrainFailed; // retain kernel protection if submitted writes could not be drained
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (void)bgTicketFor:(id)texture;
@@ -1136,7 +1137,7 @@ bg_air_slice(NSData *d)
 }
 - (void)dealloc
 {
-   if (_tcount) {   // opened and never committed: give the generations up, or the display waits its 1 s bound for them
+   if (_tcount && !_ticketDrainFailed) {   // opened and never committed: give the generations up, or the display waits its 1 s bound for them
       bg_lock();
       for (unsigned i = 0; i < _tcount; i++)
          rwa_ticket_end([(BGMTLDevice *)[_queue device] rwa], _tgen[i], _tepoch[i], true, 0);
@@ -1228,6 +1229,24 @@ bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_s
       }
    }
    return rc;
+}
+
+#include "bg_ticket_retire.h"
+struct bg_ticket_drain {
+   BGMTLDevice *device;
+   struct rwa_fence *fence;
+   char *why;
+   size_t why_size;
+};
+static int bg_ticket_end(void *context, uint64_t generation, uint64_t epoch, int abort, uint32_t seqno)
+{
+   struct bg_ticket_drain *d = context;
+   return rwa_ticket_end([d->device rwa], generation, epoch, abort, seqno);
+}
+static int bg_ticket_wait(void *context)
+{
+   struct bg_ticket_drain *d = context;
+   return bg_fence_wait(d->device, d->fence, d->why, d->why_size);
 }
 
 - (void)bgFailWith:(NSString *)why code:(NSInteger)code
@@ -1415,9 +1434,10 @@ bg_sync_commit(void)
       } else if ([w->dst isKindOfClass:[BGMTLTexture class]])
          [(BGMTLTexture *)w->dst bgShadowLocked];
    }
-   int async = bg_async_replay();
+   // The shared context, refresh epoch and M3/M4/M5 TLS scopes belong to this
+   // entire replay. Encoding/context calls cannot run between its work items.
+   // The fair mutex hands off at command-buffer boundaries.
    for (BGWork *w in _work) {
-      if (async) { bg_unlock(); bg_lock(); }   // let the encoding thread in (bg_ctx_init: fair hand-off)
       // Keep the original upload/synchronization path for compute, attachments
       // and explicit blits. The exact-compare fast path is for render sampling.
       if ([w->src isKindOfClass:[BGMTLTexture class]]) [(BGMTLTexture *)w->src bgInvalidateUploadCache];
@@ -1624,12 +1644,17 @@ bg_sync_commit(void)
    // every swap, so the next frame's encoding could not overlap the GPU at all.
    int defer_scheduled = bg_defer_scheduled();
    @synchronized (self) { if (_status != 5 && !defer_scheduled) _status = 3; }   // Scheduled
-   struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
+   // Even an error after an earlier draw must drain its recorded GPU work.
+   // Otherwise ABORT would release the ticket while that work remained queued.
+   struct rwa_fence *fence = rwa_flush([dev rwa]);
    if (_tcount) {   // jasmine: seal this command buffer's render tickets with its submit (bgTicketFor)
       uint32_t seqno = fence ? rwa_fence_seqno([dev rwa], fence) : 0;
-      for (unsigned i = 0; i < _tcount; i++)
-         rwa_ticket_end([dev rwa], _tgen[i], _tepoch[i], !seqno, seqno);
-      _tcount = 0;
+      struct bg_ticket_drain drain = { dev, fence, why, sizeof(why) };
+      if (bg_ticket_retire(_tgen, _tepoch, &_tcount, seqno, &drain,
+                           bg_ticket_end, bg_ticket_wait)) {
+         _ticketDrainFailed = _tcount != 0;
+         [self bgFailWith:@"render ticket acknowledgement failed" code:3];
+      }
    }
    rwa_pass_profile_end();
    rwa_state_profile_end(); // Include the ticket's deferred-submit drain in the inventory.
@@ -1638,8 +1663,8 @@ bg_sync_commit(void)
    dispatch_group_leave(_sched);
    if (!defer_scheduled)
       for (void (^h)(id) in [self bgTake:_scheduled]) h(self);
-   if (bg_trace() || bg_sync_commit() || _status == 5) {
-      if (_status != 5 && bg_fence_wait(dev, fence, why, sizeof(why)) != 0)
+   if (bg_trace() || bg_sync_commit()) {
+      if (bg_fence_wait(dev, fence, why, sizeof(why)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5)
          @synchronized (self) { _status = 4; }
@@ -1660,17 +1685,19 @@ bg_sync_commit(void)
    dispatch_once(&once, ^{ completion = dispatch_queue_create("chlorophyll.completion", DISPATCH_QUEUE_SERIAL); });
    [self retain];
    dispatch_async(completion, ^{
-      char w2[512] = { 0 };
-      if (bg_fence_wait(dev, fence, w2, sizeof(w2)) != 0)
-         [self bgFailWith:[NSString stringWithUTF8String:w2] code:3];
-      else
-         @synchronized (self) { _status = 4; }   // Completed: the fence has been paid
-      uint64_t t_fence = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-      rwa_fence_release([dev rwa], fence);
-      [self bgCompleteFrom:t_begin];
-      dispatch_group_leave(_done);
-      if (bg_timing()) bg_tm(BG_TM_DONE, t_flushed, t_fence, clock_gettime_nsec_np(CLOCK_MONOTONIC));
-      [self release];
+      @autoreleasepool {
+         char w2[512] = { 0 };
+         if (bg_fence_wait(dev, fence, w2, sizeof(w2)) != 0)
+            [self bgFailWith:[NSString stringWithUTF8String:w2] code:3];
+         else if (_status != 5)
+            @synchronized (self) { _status = 4; }   // Completed: the fence has been paid
+         uint64_t t_fence = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+         rwa_fence_release([dev rwa], fence);
+         [self bgCompleteFrom:t_begin];
+         dispatch_group_leave(_done);
+         if (bg_timing()) bg_tm(BG_TM_DONE, t_flushed, t_fence, clock_gettime_nsec_np(CLOCK_MONOTONIC));
+         [self release];
+      }
    });
 }
 

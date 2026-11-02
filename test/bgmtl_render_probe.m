@@ -1012,6 +1012,53 @@ main(int argc, char **argv)
          for (unsigned i=0; i<COUNT; i++) [targets[i] release];
          [vb release]; [sample release]; [pd release];
       }
+      // P20: enqueue without draining between CBs; worker/context ownership,
+      // copied handler lifetimes and completion FIFO must survive autorelease.
+      printf("== P20 queued replay and callback order\n");
+      {
+         enum { COUNT=32, N=8 };
+         id target=tex2d(MTLPixelFormatBGRA8Unorm,N,N,MTLTextureUsageRenderTarget);
+         MTLRenderPipelineDescriptor *pd=[[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction=[rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction=[rlib newFunctionWithName:@"bg_fs_color"];
+         pd.colorAttachments[0].pixelFormat=MTLPixelFormatBGRA8Unorm;
+         id pso=[g_dev newRenderPipelineStateWithDescriptor:pd error:NULL];
+         id oversized=[g_dev newBufferWithLength:1<<20 options:0];
+         __block unsigned scheduled=0, completed=0, badScheduled=0, badCompleted=0;
+         id last=nil;
+         for (unsigned i=0;i<COUNT;i++) { @autoreleasepool {
+            MTLRenderPassDescriptor *d=[MTLRenderPassDescriptor renderPassDescriptor];
+            d.colorAttachments[0].texture=target;
+            d.colorAttachments[0].loadAction=MTLLoadActionClear;
+            d.colorAttachments[0].storeAction=MTLStoreActionStore;
+            d.colorAttachments[0].clearColor=MTLClearColorMake(i==COUNT-1 ? 1 : 0,0,1,1);
+            id cb=[g_queue commandBuffer];
+            id encoder=[cb renderCommandEncoderWithDescriptor:d];
+            if (i==COUNT/2) {
+               // An error after the clear must drain that clear and complete
+               // in FIFO order, rather than overtaking earlier queued CBs.
+               [encoder setRenderPipelineState:pso];
+               [encoder setVertexBuffer:oversized offset:0 atIndex:0];
+               [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            }
+            [encoder endEncoding];
+            [cb addScheduledHandler:^(id b) { if (scheduled++ != i || [b status]<3) badScheduled++; }];
+            [cb addCompletedHandler:^(id b) { if (completed++ != i || [b status]!=(i==COUNT/2 ? 5 : 4)) badCompleted++; }];
+            if (i==COUNT-1) last=[cb retain];
+            [cb commit];
+         }}
+         [last waitUntilCompleted];
+         uint8_t px[N*N*4];
+         [target getBytes:px bytesPerRow:N*4 fromRegion:MTLRegionMake2D(0,0,N,N) mipmapLevel:0];
+         unsigned bad=0;
+         for (unsigned j=0;j<sizeof(px);j++) if (px[j] != (j%4==1 ? 0 : 255)) bad++;
+         CHECK(scheduled==COUNT && completed==COUNT && !badScheduled && !badCompleted && !bad,
+               "queued replay: scheduled/completed %u/%u, order/status %u/%u, pixel errors %u",
+               scheduled,completed,badScheduled,badCompleted,bad);
+         printf("  queued replay: %u/%u callbacks, %u/%u order/status errors, %u wrong values\n",
+                scheduled,completed,badScheduled,badCompleted,bad);
+         [last release]; [target release]; [oversized release]; [pso release]; [pd release];
+      }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;
    }
