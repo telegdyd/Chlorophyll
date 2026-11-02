@@ -1379,6 +1379,10 @@ void rwa_pass_profile_work(unsigned kind);
 void rwa_pass_profile_shader(const char *name, const uint64_t *textures);
 void rwa_pass_profile_end(void);
 
+/* M6 diagnostic attachment intent; no rendering operation. */
+int rwa_lifetime_profile_active(void);
+void rwa_lifetime_attachment(struct rwa_texture *texture, unsigned slot, unsigned load, unsigned store);
+
 #ifdef __cplusplus
 }
 #endif

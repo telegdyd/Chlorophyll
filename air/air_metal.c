@@ -360,11 +360,60 @@ struct rwa_texture {
    /* Bergamota: the kernel's BO handle when the memory is an IOSurface (rwa_texture_from_surface), for the clean+invalidate that makes the GPU's
     * pixels visible to whoever composites the surface (rwa_texture_flush_surface) */
    unsigned surface_handle;
+   uint64_t lifetime_id;
+   unsigned lifetime_surface;
 
    /* Chlorophyll: its render surface (level 0, layer 0, its own format: the only one a pass makes), made when it is
     * first an attachment and kept, so consecutive draws into it give the same pointer (see rwa_device.fb_color) */
    struct pipe_surface *surface;
 };
+
+/* M6 records conservative accesses in replay order, not GPU completion order.
+ * No payloads, allocation, clocks or I/O here. Scope ends at each inline replay;
+ * CPU/external accesses outside that scope and driver BO renaming remain UNKNOWN.
+ * Never infer physical alias freedom or dead stores from these logical identities. */
+static uint64_t lifetime_next;
+static bool lifetime_collecting(void)
+{
+#ifdef RWA_SWEETGPU
+   static int enabled;
+   if (!enabled) {
+      const char *v = getenv("BGMTL_LIFETIME_PROFILE");
+      enabled = v && !strcmp(v, "1") ? 1 : -1;
+   }
+   return enabled == 1 && sweet_m5_collecting();
+#else
+   return false;
+#endif
+}
+int rwa_lifetime_profile_active(void) { return lifetime_collecting(); }
+/* kind: attachment=1, clear=2, draw=3, sample=4, image=5, copy-src=6,
+ * copy-dst=7, resolve-src=8, resolve-dst=9, cpu-read=10, cpu-write=11,
+ * external=12, mipmap=13, destroy=14. UINT32_MAX means unknown/range. */
+static void lifetime_access(const struct rwa_texture *t, unsigned kind,
+   unsigned level, unsigned layer, const unsigned *origin, const unsigned *size,
+   uint64_t mask, uint64_t detail)
+{
+#ifdef RWA_SWEETGPU
+   if (!t || !lifetime_collecting()) return;
+   uint64_t v[20] = {kind, t->lifetime_id, (uintptr_t)t->res,
+      t->lifetime_surface, level, layer,
+      origin ? origin[0] : 0, origin ? origin[1] : 0, origin ? origin[2] : 0,
+      size ? size[0] : t->res->width0, size ? size[1] : t->res->height0,
+      size ? size[2] : t->res->depth0, mask, detail,
+      t->res->width0, t->res->height0, t->res->last_level, t->layers,
+      t->res->nr_samples, t->res->format};
+   sweet_m5_access(v);
+#else
+   (void)t; (void)kind; (void)level; (void)layer; (void)origin; (void)size;
+   (void)mask; (void)detail;
+#endif
+}
+void rwa_lifetime_attachment(struct rwa_texture *t, unsigned slot,
+                             unsigned load, unsigned store)
+{
+   lifetime_access(t, 1, 0, 0, NULL, NULL, slot, load | ((uint64_t)store << 32));
+}
 
 /* the libdrm stand-in's IOSurface calls (gpu/freedreno-sweet/sweet_drm.c); struct sweet_gpu_surface_bo, first 48 bytes (ABI minor 0 layout,
  * which every kernel minor accepts: a caller may pass and accept only these) */
@@ -1748,6 +1797,8 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       say(why, why_size, "out of memory making a texture");
       return NULL;
    }
+   texture->lifetime_id = __atomic_add_fetch(&lifetime_next, 1, __ATOMIC_RELAXED);
+   texture->lifetime_surface = import ? import->id : 0;
    texture->device = device;
    texture->shape = *shape;
    texture->format_name = fmt->name;
@@ -1991,6 +2042,7 @@ rwa_texture_flush_surface(struct rwa_texture *texture)
 {
    if (!texture || !texture->surface_handle)
       return 0;
+   lifetime_access(texture, 12, ~0u, ~0u, NULL, NULL, 0, 0);
    return sweet_drm_bo_sync(-1, texture->surface_handle, 0, 0);
 }
 
@@ -2007,6 +2059,8 @@ rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, cons
    if (util_format_get_blocksize(src->res->format) != util_format_get_blocksize(dst->res->format) ||
        util_format_get_blockwidth(src->res->format) != util_format_get_blockwidth(dst->res->format))
       return -1;
+   lifetime_access(src, 6, slevel, sslice, so, size, 15, 0);
+   lifetime_access(dst, 7, dlevel, dslice, dorg, size, 15, 0);
    struct pipe_box box;
    u_box_3d((int)so[0], (int)so[1], (int)(so[2] + sslice), (int)size[0], (int)size[1], (int)(size[2] ? size[2] : 1), &box);
    struct pipe_context *pipe = src->device->pipe;
@@ -2056,6 +2110,8 @@ rwa_texture_resolve(struct rwa_texture *src, struct rwa_texture *dst)
    if (!src || !dst || !src->res || !dst->res || src->device != dst->device || src->res->nr_samples <= 1 ||
        dst->res->nr_samples > 1 || src->res->width0 != dst->res->width0 || src->res->height0 != dst->res->height0)
       return -1;
+   lifetime_access(src, 8, 0, 0, NULL, NULL, 15, 0);
+   lifetime_access(dst, 9, 0, 0, NULL, NULL, 15, 0);
    struct pipe_blit_info info;
    memset(&info, 0, sizeof(info));
    info.src.resource = src->res;
@@ -2083,6 +2139,7 @@ rwa_texture_generate_mipmaps(struct rwa_texture *texture)
 {
    if (!texture || !texture->res || texture->res->last_level == 0)
       return -1;
+   lifetime_access(texture, 13, ~0u, ~0u, NULL, NULL, 15, 0);
    struct pipe_resource *res = texture->res;
    /* The blitter saves and restores what it binds, but nothing here depends on that. */
    gs_invalidate(texture->device);
@@ -2134,6 +2191,7 @@ rwa_texture_destroy(struct rwa_texture *texture)
 {
    if (!texture)
       return;
+   lifetime_access(texture, 14, ~0u, ~0u, NULL, NULL, 0, 0);
    /* The framebuffer may still hold its surface (draws leave it bound): let go of it first. */
    if (texture->surface) {
       fb_release_texture(texture->device, texture);
@@ -2254,6 +2312,7 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                   const unsigned origin[3], const unsigned size[3], const void *bytes,
                   size_t stride, char *why, size_t why_size)
 {
+   lifetime_access(texture, 11, level, layer, origin, size, 15, 0);
    struct pipe_box box;
    size_t row;
 
@@ -2388,6 +2447,7 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                  const unsigned origin[3], const unsigned size[3], void *bytes,
                  size_t stride, char *why, size_t why_size)
 {
+   lifetime_access(texture, 10, level, layer, origin, size, 15, 0);
    struct pipe_context *pipe = texture->device->pipe;
    struct pipe_box box;
    size_t row;
@@ -2475,6 +2535,7 @@ rwa_depth_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                const unsigned origin[3], const unsigned size[3], float *depth,
                uint8_t *stencil, char *why, size_t why_size)
 {
+   lifetime_access(texture, 10, level, layer, origin, size, 15, 0);
    struct pipe_context *pipe = texture->device->pipe;
    enum pipe_format format = texture->res->format;
    struct pipe_box box;
@@ -4346,6 +4407,9 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
          }
       }
 
+      if (t) lifetime_access(t, r->kind == AIR_RESOURCE_IMAGE ? 5 : 4,
+         ~0u, ~0u, NULL, NULL, r->read | ((uint64_t)r->write << 1), stage);
+
       switch (r->kind) {
       case AIR_RESOURCE_DEVICE_BUFFER:
          if (r->index >= ARRAY_SIZE(sb)) {
@@ -5997,6 +6061,8 @@ struct rwa_render {
 
    struct air_shader_info finfo;
    struct air_shader_info vinfo;      /* valid only when a vertex module was supplied */
+   uint32_t lifetime_write_masks;
+   uint64_t lifetime_outputs;
    unsigned fbfetch_unit[4];          /* jasmine: the unit each attachment read samples on a5xx */
    bool generated_vertex;
 
@@ -7322,6 +7388,8 @@ rwa_render_create(struct rwa_device *device,
    if (!blend_state_from_metal(shape, device->screen, &blend, &out.blend_enabled_mask,
                                &out.color_write_masks, why, why_size))
       goto fail;
+   render->lifetime_write_masks = out.color_write_masks;
+   render->lifetime_outputs = fs->info.outputs_written;
    render->blend = device->pipe->create_blend_state(device->pipe, &blend);
    /* The pipeline's own depth/stencil state, and it is the ZEROED one on purpose: it is
     * what a draw gets when the caller passes no rwa_depth_stencil, which is Metal's
@@ -7625,6 +7693,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
       union pipe_color_union cv;
       for (unsigned c = 0; c < 4; c++)
          cv.f[c] = clear->color_value[i][c];
+      lifetime_access(clear->color[i], 2, 0, 0, NULL, NULL, 15, i);
       pipe->clear(pipe, PIPE_CLEAR_COLOR0 << i, UINT32_MAX, 0xff, NULL, &cv, 0.0, 0);
    }
    if (clear->depth) {
@@ -7634,6 +7703,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
       if (clear->clear_stencil && format_has_stencil(clear->depth->res->format))
          mask |= PIPE_CLEAR_STENCIL;
       if (mask) {
+         lifetime_access(clear->depth, 2, 0, 0, NULL, NULL, mask, 8);
          union pipe_color_union none = { 0 };
          pipe->clear(pipe, mask, UINT32_MAX, 0xff, NULL, &none, clear->clear_depth ? (double)*clear->clear_depth : 0.0,
                      clear->clear_stencil ? *clear->clear_stencil & 0xff : 0);
@@ -8364,6 +8434,18 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       if (fdctx->sweet_metal_sysmem_draw)
          fdctx->sysmem_barrier_keeps_clears = true;
 #endif
+      if (lifetime_collecting()) {
+         const struct pipe_scissor_state *r = &device->gs.sc;
+         unsigned origin[3] = {r->minx, r->miny, 0};
+         unsigned size[3] = {r->maxx-r->minx, r->maxy-r->miny, 1};
+         for (unsigned k=0; k<draw->color_count; k++) {
+            uint64_t masks = ((render->lifetime_write_masks >> (k*4)) & 15) |
+               ((uint64_t)((render->finfo.fbfetch_targets >> k) & 1) << 4);
+            lifetime_access(draw->color[k], 3, 0, 0, origin, size, masks,
+                            render->lifetime_outputs);
+         }
+         lifetime_access(draw->depth, 3, 0, 0, origin, size, ~0u, 0);
+      }
       pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
 #ifdef RWA_SWEETGPU
       fdctx->sweet_metal_sysmem_draw = false;

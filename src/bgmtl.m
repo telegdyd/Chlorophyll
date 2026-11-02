@@ -1431,6 +1431,13 @@ bg_sync_commit(void)
       }
       if (w->kind == BG_WORK_PASS) {
          rwa_pass_profile_pass(w->pass_info);
+         if (rwa_lifetime_profile_active()) {
+            for (unsigned i=0;i<8;i++) if (w->color[i])
+               rwa_lifetime_attachment([(BGMTLTexture *)w->color[i] rwaTexture], i,
+                  (w->pass_info[12] >> (i*4)) & 15, (w->pass_info[13] >> (i*4)) & 15);
+            rwa_lifetime_attachment([(BGMTLTexture *)w->depth rwaTexture], 8,
+               w->pass_info[16], w->pass_info[17]);
+         }
          continue;
       }
       if (w->kind != BG_WORK_DRAW && w->kind != BG_WORK_CLEAR) rwa_pass_profile_work(w->kind);
@@ -1846,11 +1853,15 @@ bg_sync_commit(void)
       for (unsigned i=0;i<8;i++) {
          MTLRenderPassColorAttachmentDescriptor *a=d.colorAttachments[i];
          if (!a.texture) continue;
+         if (getenv("BGMTL_LIFETIME_PROFILE") && !strcmp(getenv("BGMTL_LIFETIME_PROFILE"), "1"))
+            w->color[i]=[a.texture retain];
          w->pass_info[3]++; w->pass_info[4+i]=a.texture.pixelFormat;
          w->pass_info[12] |= (uint64_t)a.loadAction << (i*4);
          w->pass_info[13] |= (uint64_t)a.storeAction << (i*4);
          if (a.resolveTexture) w->pass_info[14] |= 1u<<i;
       }
+      if (getenv("BGMTL_LIFETIME_PROFILE") && !strcmp(getenv("BGMTL_LIFETIME_PROFILE"), "1"))
+         w->depth=[(d.depthAttachment.texture ?: d.stencilAttachment.texture) retain];
       w->pass_info[15]=d.depthAttachment.texture.pixelFormat;
       w->pass_info[16]=d.depthAttachment.loadAction; w->pass_info[17]=d.depthAttachment.storeAction;
       w->pass_info[18]=d.stencilAttachment.loadAction | ((uint64_t)d.stencilAttachment.storeAction<<4);
