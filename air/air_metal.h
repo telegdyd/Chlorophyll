@@ -604,7 +604,8 @@ int rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why
 void rwa_fence_release(struct rwa_device *device, struct rwa_fence *fence);
 /* jasmine: the kernel's render tickets (j0110) for an imported IOSurface the GPU is about to draw: the display shows it
  * only once the ticket is sealed and the GPU has passed the sealed submit. begin: 0, -EBUSY (the surface's previous
- * ticket is open or it is on the display), -ENOTSUP (tickets off, or not an import), or another error. */
+ * ticket is open or it is on the display), -EAGAIN (the presenter is temporarily unavailable: the display is asleep,
+ * or the queue fell back/powered off; retry later), -ENOTSUP (tickets off, or not an import), or another error. */
 int rwa_texture_ticket_begin(struct rwa_texture *texture, uint64_t *generation, uint64_t *epoch);
 int rwa_ticket_end(struct rwa_device *device, uint64_t generation, uint64_t epoch, int abort, uint32_t seqno);
 /* The kernel sequence number of a flushed fence's submit, after draining the submit queue; 0 if none. */

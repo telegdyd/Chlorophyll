@@ -17,6 +17,7 @@
 // buffers), buffers, libraries/functions through Metal's own _MTLLibrary, compute pipelines. No textures, render, heaps, events.
 #import <Foundation/Foundation.h>
 #include <libkern/OSByteOrder.h>
+#include <errno.h>
 #include <os/lock.h>
 #include <pthread.h>
 #include <Block.h>
@@ -415,6 +416,8 @@ bg_install_fallback(Class c)
    uint64_t _tgen[32], _tepoch[32];                          // jasmine: render tickets opened for this command buffer
    uint32_t _tsurf[32];
    unsigned _tcount;
+   uint32_t _dsurf[32];                                      // destinations deferred while the presenter was suspended
+   unsigned _dcount;
    BOOL _ticketDrainFailed; // retain kernel protection if submitted writes could not be drained
    BOOL _admissionFailed, _committed;
    BGWriteOwner *_writeOwner;

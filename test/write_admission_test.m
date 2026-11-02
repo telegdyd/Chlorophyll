@@ -1,11 +1,25 @@
 /* SPDX-License-Identifier: MIT */
+/* M7 imported-write admission host test. This is the actual-method test: the
+ * test object below is only the minimum BGMTLCommandBuffer/BGWriteOwner shell
+ * needed by src/bg_write_admission.h, and the ticket BEGIN results are stubbed.
+ *
+ * The deferred cases in the second half require the display-suspended M7
+ * implementation (BEGIN -EAGAIN at encode, one retry at replay, unticketed
+ * admission, normal release). Against the pre-deferred header they fail at the
+ * first encode -EAGAIN assertion; that is expected and is not a test bug. */
 #import <Foundation/Foundation.h>
 #import <dispatch/dispatch.h>
 #include <assert.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
+
+// Capture the display-suspended diagnostics line emitted by the header. The
+// header only defines BG_LOG when the including translation unit has not.
+static char bg_test_log[512];
+#define BG_LOG(...) do { snprintf(bg_test_log,sizeof(bg_test_log),__VA_ARGS__); } while (0)
 
 static pthread_mutex_t mutex;
 static void bg_lock(void) { pthread_mutex_lock(&mutex); }
@@ -13,10 +27,22 @@ static void bg_unlock(void) { pthread_mutex_unlock(&mutex); }
 struct rwa_texture { unsigned surface; int refused; unsigned attempts; };
 static unsigned rwa_texture_surface_id(struct rwa_texture *t) { return t ? t->surface : 0; }
 static uint64_t generations;
+static unsigned ticket_end_calls, ticket_end_aborts;
+static uint64_t ticket_end_generation, ticket_end_epoch;
 static int rwa_texture_ticket_begin(struct rwa_texture *t,uint64_t *g,uint64_t *e) {
    ++t->attempts;
    if (t->refused) return t->refused;
    *g=++generations; *e=7; return 0;
+}
+/* Mirrors bg_ticket_end for the sealed path. Deferred/unticketed entries have
+ * generation 0 and must never reach this stub. */
+static int test_ticket_end(uint64_t generation,uint64_t epoch,int abort) {
+   ++ticket_end_calls; ticket_end_aborts += abort ? 1 : 0;
+   ticket_end_generation=generation; ticket_end_epoch=epoch;
+   return 0;
+}
+static void reset_ticket_end_stats(void) {
+   ticket_end_calls=ticket_end_aborts=0; ticket_end_generation=ticket_end_epoch=0;
 }
 @interface BGMTLTexture : NSObject
 - (struct rwa_texture *)rwaSurfaceTexture;
@@ -36,6 +62,7 @@ static int rwa_texture_ticket_begin(struct rwa_texture *t,uint64_t *g,uint64_t *
 @interface BGMTLCommandBuffer : NSObject {
  @public
    uint64_t _tgen[32],_tepoch[32]; uint32_t _tsurf[32]; unsigned _tcount;
+   uint32_t _dsurf[32]; unsigned _dcount;   // deferred while the presenter is suspended
    BOOL _admissionFailed,_committed; BGWriteOwner *_writeOwner;
    NSError *_error; dispatch_group_t _done;
 }
@@ -62,24 +89,69 @@ static int rwa_texture_ticket_begin(struct rwa_texture *t,uint64_t *g,uint64_t *
 - (void)commitPending {
    bg_lock(); _committed=_writeOwner->committed=YES; dispatch_group_enter(_done); bg_unlock();
 }
+// The real retire seals each nonzero generation, then releases registry entries.
+// Generation 0 is a deferred/unticketed destination: no BEGIN to seal.
 - (void)retire {
-   bg_lock(); _tcount=0; [self bgReleaseAdmissionOwners]; bg_unlock(); dispatch_group_leave(_done);
+   bg_lock();
+   for(unsigned i=0;i<_tcount;i++) if(_tgen[i]) test_ticket_end(_tgen[i],_tepoch[i],0);
+   _tcount=0; _dcount=0;
+   [self bgReleaseAdmissionOwners];
+   bg_unlock();
+   if(_committed) dispatch_group_leave(_done);
 }
 @end
+
+static unsigned registry_entries(unsigned surface) {
+   unsigned n=0;
+   for(unsigned i=0;i<BG_MAX_PENDING_WRITERS;i++)
+      if(bg_pending_writers[i].surface==surface) n++;
+   return n;
+}
+static unsigned registry_owned(BGWriteOwner *owner) {
+   unsigned n=0;
+   for(unsigned i=0;i<BG_MAX_PENDING_WRITERS;i++)
+      if(bg_pending_writers[i].surface && bg_pending_writers[i].owner==owner) n++;
+   return n;
+}
+static unsigned registry_generation(unsigned surface) {
+   for(unsigned i=0;i<BG_MAX_PENDING_WRITERS;i++)
+      if(bg_pending_writers[i].surface==surface) return (unsigned)bg_pending_writers[i].generation;
+   return ~0u;
+}
+static unsigned registry_total(void) {
+   unsigned n=0;
+   for(unsigned i=0;i<BG_MAX_PENDING_WRITERS;i++) if(bg_pending_writers[i].surface) n++;
+   return n;
+}
+static void clear_registry(void) { memset(bg_pending_writers,0,sizeof(bg_pending_writers)); }
+static void reset_suspended_stats(void) {
+   bg_suspended_events=bg_suspended_deferred=bg_suspended_reticketed=bg_suspended_unticketed=0;
+   memset(bg_test_log,0,sizeof(bg_test_log));
+}
+static const char *suspended_line(void) { return bg_test_log; }
+
 
 int main(void) { @autoreleasepool {
    pthread_mutexattr_t a; pthread_mutexattr_init(&a);
    pthread_mutexattr_settype(&a,PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&mutex,&a);
-   struct rwa_texture t[34]={0}; for(unsigned i=0;i<34;i++)t[i].surface=i+1;
+   struct rwa_texture t[40]={0}; for(unsigned i=0;i<40;i++)t[i].surface=i+1;
+   clear_registry();
+
+   /* ---------------------------------------------------------------- legacy */
    BGMTLCommandBuffer *cb=[BGMTLCommandBuffer new];
    for(unsigned i=0;i<32;i++)assert([cb bgAdmitRaw:&t[i]]);
    assert(cb->_tcount==32 && [cb bgAdmitRaw:&t[0]] && t[0].attempts==1);
    assert(![cb bgAdmitRaw:&t[32]] && cb->_admissionFailed && cb->_error && !t[32].attempts);
    [cb release];
+   assert(registry_total()==0);
+
    BGMTLCommandBuffer *uncommitted=[BGMTLCommandBuffer new], *refused=[BGMTLCommandBuffer new];
    assert([uncommitted bgAdmitRaw:&t[0]]);
-   assert(![refused bgAdmitRaw:&t[0]] && t[0].attempts==2);
+   unsigned attempts=t[0].attempts;
+   assert(![refused bgAdmitRaw:&t[0]] && t[0].attempts==attempts);
    [refused release]; [uncommitted release];
+   assert(registry_total()==0);
+
    // A committed owner retires on another thread. That thread needs the same
    // context lock; holding it over the bounded wait would make this test fail.
    BGMTLCommandBuffer *prior=[BGMTLCommandBuffer new], *next=[BGMTLCommandBuffer new];
@@ -87,27 +159,157 @@ int main(void) { @autoreleasepool {
    dispatch_async(dispatch_get_global_queue(0,0),^{ @autoreleasepool { [prior retire]; } });
    assert([next bgAdmitRaw:&t[0]] && !next->_admissionFailed);
    [prior release]; [next release];
+
    // Finishing our producer does not override external/display ownership.
    prior=[BGMTLCommandBuffer new]; next=[BGMTLCommandBuffer new];
    assert([prior bgAdmitRaw:&t[0]]); [prior commitPending]; t[0].refused=-EBUSY;
    dispatch_async(dispatch_get_global_queue(0,0),^{ @autoreleasepool { [prior retire]; } });
    assert(![next bgAdmitRaw:&t[0]] && next->_admissionFailed);
    [prior release]; [next release]; t[0].refused=0;
+
    // An unresolved producer never permits writes after a one-second deadline.
    prior=[BGMTLCommandBuffer new]; next=[BGMTLCommandBuffer new];
    assert([prior bgAdmitRaw:&t[0]]); [prior commitPending];
-   unsigned attempts=t[0].attempts;
+   attempts=t[0].attempts;
    assert(![next bgAdmitRaw:&t[0]] && t[0].attempts==attempts);
    [prior retire]; [prior release]; [next release];
+
    // Quarantine retains only a surface identity, never a dying CB pointer.
    cb=[BGMTLCommandBuffer new]; assert([cb bgAdmitRaw:&t[0]]);
    [cb bgQuarantineAdmissionOwners]; cb->_tcount=0; [cb release];
    next=[BGMTLCommandBuffer new]; assert(![next bgAdmitRaw:&t[0]]); [next release];
-   memset(bg_pending_writers,0,sizeof(bg_pending_writers));
+   clear_registry();
+
    // Bounded process registry capacity is fail-closed too.
    for(unsigned i=0;i<BG_MAX_PENDING_WRITERS;i++)bg_pending_writers[i].surface=100+i;
    cb=[BGMTLCommandBuffer new]; t[33].surface=99999;
    assert(![cb bgAdmitRaw:&t[33]] && !t[33].attempts); [cb release];
-   memset(bg_pending_writers,0,sizeof(bg_pending_writers));
-   puts("PASS: 32 destinations, dedup, cap, uncommitted refusal, pending retry outside lock, external refusal, timeout, quarantine, registry bound");
+   clear_registry(); t[33].surface=34;
+
+   /* ------------------------------------------------- deferred admission */
+   /* Encode -EAGAIN then replay BEGIN succeeds: the deferred destination is
+    * retried once, a real generation is stored and sealed exactly once at retire. */
+   reset_ticket_end_stats(); reset_suspended_stats();
+   t[0].refused=-EAGAIN; t[0].attempts=0;
+   cb=[BGMTLCommandBuffer new];
+   assert([cb bgAdmitRaw:&t[0]] && !cb->_admissionFailed);
+   assert(cb->_tcount==0 && cb->_dcount==1 && cb->_dsurf[0]==t[0].surface);
+   assert(t[0].attempts==1 && registry_entries(t[0].surface)==1);
+   assert(registry_owned(cb->_writeOwner)==1 && registry_generation(t[0].surface)==0);
+   assert(bg_suspended_events==1 && bg_suspended_deferred==1);
+   assert(!strcmp(suspended_line(),"render tickets: display suspended: 1 deferred, 0 ticketed at replay, 0 unticketed\n"));
+   [cb commitPending]; t[0].refused=0;
+   bg_suspended_events=99; // force the next event to emit the summary line
+   assert([cb bgAdmitRaw:&t[0]] && !cb->_admissionFailed);
+   assert(t[0].attempts==2 && cb->_dcount==0 && cb->_tcount==1 && cb->_tgen[0]!=0);
+   assert(registry_entries(t[0].surface)==1 && registry_generation(t[0].surface)==(unsigned)cb->_tgen[0]);
+   assert(bg_suspended_reticketed==1 && bg_suspended_events==100);
+   assert(!strcmp(suspended_line(),"render tickets: display suspended: 1 deferred, 1 ticketed at replay, 0 unticketed\n"));
+   // A further preflight pass must reuse the ticket, not BEGIN or duplicate.
+   assert([cb bgAdmitRaw:&t[0]] && t[0].attempts==2 && cb->_tcount==1);
+   uint64_t sealed_generation=cb->_tgen[0];
+   [cb retire];
+   assert(ticket_end_calls==1 && ticket_end_aborts==0 && ticket_end_generation==sealed_generation);
+   assert(ticket_end_epoch==7);
+   assert(registry_total()==0);
+   [cb release]; t[0].refused=0;
+
+   /* Encode -EAGAIN then replay -EAGAIN: admitted unticketed, CB succeeds, the
+    * entry is released and no generation is retired. Retry only once. */
+   reset_ticket_end_stats(); reset_suspended_stats();
+   t[0].refused=-EAGAIN; t[0].attempts=0;
+   cb=[BGMTLCommandBuffer new];
+   assert([cb bgAdmitRaw:&t[0]] && !cb->_admissionFailed);
+   assert(cb->_tcount==0 && cb->_dcount==1 && registry_owned(cb->_writeOwner)==1);
+   assert(bg_suspended_deferred==1);
+   [cb commitPending];
+   bg_suspended_events=99; // force the unticketed summary line
+   assert([cb bgAdmitRaw:&t[0]] && !cb->_admissionFailed);
+   assert(t[0].attempts==2 && cb->_dcount==0 && cb->_tcount==0);
+   assert(registry_entries(t[0].surface)==1 && registry_generation(t[0].surface)==0);
+   assert(bg_suspended_unticketed==1 && bg_suspended_events==100);
+   assert(!strcmp(suspended_line(),"render tickets: display suspended: 1 deferred, 0 ticketed at replay, 1 unticketed\n"));
+   // The retry budget is one per destination, even if replay preflight visits it
+   // again (e.g. two recorded work items sharing a surface).
+   assert([cb bgAdmitRaw:&t[0]] && !cb->_admissionFailed && t[0].attempts==2);
+   [cb retire];
+   assert(ticket_end_calls==0 && registry_total()==0);
+   [cb release]; t[0].refused=0;
+
+   /* Encode -EAGAIN then replay -EBUSY: explicit whole-CB failure before any
+    * recorded work, with the deferred identity still owned until release. */
+   reset_ticket_end_stats(); reset_suspended_stats();
+   t[0].refused=-EAGAIN; t[0].attempts=0;
+   cb=[BGMTLCommandBuffer new];
+   assert([cb bgAdmitRaw:&t[0]] && cb->_dcount==1 && cb->_tcount==0);
+   [cb commitPending]; t[0].refused=-EBUSY;
+   assert(![cb bgAdmitRaw:&t[0]] && cb->_admissionFailed && cb->_error);
+   assert(t[0].attempts==2 && registry_owned(cb->_writeOwner)==1);
+   assert(bg_suspended_reticketed==0 && bg_suspended_unticketed==0);
+   // The recorded clear/dispatch is never reached when _admissionFailed is set.
+   [cb retire];
+   assert(ticket_end_calls==0 && registry_total()==0);
+   [cb release]; t[0].refused=0;
+
+   /* A destination first discovered at replay on -EAGAIN is admitted unticketed. */
+   reset_ticket_end_stats(); reset_suspended_stats();
+   t[0].refused=-EAGAIN; t[0].attempts=0;
+   cb=[BGMTLCommandBuffer new]; [cb commitPending]; // mutable argument record reveals it now
+   assert([cb bgAdmitRaw:&t[0]] && !cb->_admissionFailed);
+   assert(cb->_tcount==0 && cb->_dcount==0 && t[0].attempts==1);
+   assert(registry_owned(cb->_writeOwner)==1 && registry_generation(t[0].surface)==0);
+   assert(bg_suspended_unticketed==1 && bg_suspended_deferred==0 && bg_suspended_events==1);
+   assert(!strcmp(suspended_line(),"render tickets: display suspended: 0 deferred, 0 ticketed at replay, 1 unticketed\n"));
+   assert([cb bgAdmitRaw:&t[0]] && t[0].attempts==1); // no second replay retry
+   [cb retire];
+   assert(ticket_end_calls==0 && registry_total()==0);
+   [cb release]; t[0].refused=0;
+
+   /* -ENOTSUP (tickets off) and -EBUSY remain explicit whole-CB failures. */
+   {
+      const int failures[]={-ENOTSUP,-EBUSY};
+      for(unsigned i=0;i<sizeof(failures)/sizeof(failures[0]);i++) {
+         reset_ticket_end_stats();
+         t[0].refused=failures[i]; t[0].attempts=0;
+         cb=[BGMTLCommandBuffer new];
+         assert(![cb bgAdmitRaw:&t[0]] && cb->_admissionFailed && cb->_error);
+         assert(t[0].attempts==1 && cb->_tcount==0 && cb->_dcount==0 && registry_total()==0);
+         [cb release];
+      }
+   }
+   t[0].refused=0;
+
+   /* Deferred destinations share the same 32-destination cap. */
+   reset_ticket_end_stats(); reset_suspended_stats();
+   for(unsigned i=0;i<33;i++) { t[i].refused=-EAGAIN; t[i].attempts=0; }
+   cb=[BGMTLCommandBuffer new];
+   for(unsigned i=0;i<32;i++)assert([cb bgAdmitRaw:&t[i]] && !cb->_admissionFailed);
+   assert(cb->_tcount==0 && cb->_dcount==32 && bg_suspended_deferred==32);
+   assert(![cb bgAdmitRaw:&t[32]] && cb->_admissionFailed && cb->_error);
+   assert(t[32].attempts==0 && cb->_dcount==32 && registry_owned(cb->_writeOwner)==32);
+   [cb commitPending]; [cb retire];
+   assert(ticket_end_calls==0 && registry_total()==0);
+   [cb release];
+   for(unsigned i=0;i<33;i++)t[i].refused=0;
+
+   /* A second CB on a surface whose first owner is deferred but uncommitted is
+    * still refused, and the first owner keeps the identity. */
+   reset_ticket_end_stats(); reset_suspended_stats();
+   BGMTLCommandBuffer *deferred=[BGMTLCommandBuffer new], *second=[BGMTLCommandBuffer new];
+   t[0].refused=-EAGAIN; t[0].attempts=0;
+   assert([deferred bgAdmitRaw:&t[0]] && deferred->_tcount==0 && deferred->_dcount==1);
+   assert(registry_owned(deferred->_writeOwner)==1);
+   assert(![second bgAdmitRaw:&t[0]] && second->_admissionFailed && second->_error);
+   assert(t[0].attempts==1 && deferred->_dcount==1 && deferred->_tcount==0);
+   assert(registry_owned(deferred->_writeOwner)==1 && registry_owned(second->_writeOwner)==0);
+   [second release];
+   // The original deferred CB can still retry after commit.
+   [deferred commitPending]; t[0].refused=0;
+   assert([deferred bgAdmitRaw:&t[0]] && deferred->_dcount==0 && deferred->_tgen[0]!=0 && t[0].attempts==2);
+   [deferred retire];
+   assert(ticket_end_calls==1 && registry_total()==0);
+   [deferred release]; t[0].refused=0;
+
+   assert(registry_total()==0);
+   puts("PASS: legacy admission + deferred encode/replay (ticket, unticketed, EBUSY, ENOTSUP, replay-discovered, 32 cap, uncommitted ownership, one retry, diagnostics)");
 } }

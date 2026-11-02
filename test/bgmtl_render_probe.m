@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Spike 3: textures, samplers and a render pass on BGMTLDevice (test process only, nothing registered).
-//   bgmtl_render_probe KERNELS.metallib RENDER.metallib
+//   bgmtl_render_probe KERNELS.metallib RENDER.metallib [--bb] [--upload-cache] [--display-off] [--display-wake-wait=FILE]
+// P23 is the display-suspended deferred-admission case; see README-display-off-admission.md for its runner.
 // P1-P3 compute with textures (read, sample through a sampler, write), P4 a coloured triangle with analytic pixel checks,
 // P5 a textured quad (nearest sampler) against the texture magnified and flipped by Metal's rules.
 #import <Foundation/Foundation.h>
@@ -25,8 +26,16 @@ extern id bgmtl_create_device(void);
 
 static int g_pass, g_fail;
 #define CHECK(cond, ...) do { if (cond) { g_pass++; } else { g_fail++; printf("  FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
+// A SKIP is not a check: it keeps the existing P0-P22 count unchanged when P23
+// cannot run because the phone is not in the requested display state.
+#define SKIP(...) do { printf("  SKIP: " __VA_ARGS__); printf("\n"); } while (0)
 
 static id g_dev, g_queue;
+// P23 only: the runner owns AppleCLCD power. The probe merely needs to know
+// whether the display-off situation was requested, and (optionally) a file to
+// wait on after the CB is encoded and before it is committed.
+static int g_p23_display_off;
+static const char *g_p23_wake_wait;
 
 @interface NSObject (BGNoCopyProbe)
 - (id)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length
@@ -96,6 +105,26 @@ static void admission_clear(id cb,id target) {
    d.colorAttachments[0].clearColor=MTLClearColorMake(1,0,0,1);
    [[cb renderCommandEncoderWithDescriptor:d]endEncoding];
 }
+// P23 runner handshake: a file marker after encoding and a file the runner
+// creates after it has powered the display back on. No power ioctl here.
+static int p23_signal_path(char *out,size_t size,const char *suffix) {
+   if (!g_p23_wake_wait || strlen(g_p23_wake_wait) + strlen(suffix) + 1 > size) return 0;
+   snprintf(out,size,"%s%s",g_p23_wake_wait,suffix);
+   return 1;
+}
+static BOOL p23_write_file(const char *path) {
+   FILE *f=fopen(path,"w");
+   if (!f) return NO;
+   fclose(f);
+   return YES;
+}
+static BOOL p23_wait_file(const char *path,unsigned milliseconds) {
+   for (unsigned i=0;i<milliseconds/10;i++) {
+      if (access(path,F_OK)==0) return YES;
+      usleep(10000);
+   }
+   return access(path,F_OK)==0;
+}
 
 int
 main(int argc, char **argv)
@@ -119,8 +148,16 @@ main(int argc, char **argv)
       for (int i=3; i<argc; i++) {
          if (!strcmp(argv[i], "--bb")) setenv("BGMTL_BB", "1", 1);
          if (!strcmp(argv[i], "--upload-cache")) setenv("BGMTL_NOCOPY_CACHE", "1", 1);
+         // P23: the display is already off; --display-wake-wait=FILE makes the
+         // probe encode while off, write FILE.encoded, then commit once the runner
+         // wakes the display and creates FILE (see README-display-off-admission.md).
+         if (!strcmp(argv[i], "--display-off")) g_p23_display_off = 1;
+         if (!strncmp(argv[i], "--display-wake-wait=", 20)) {
+            g_p23_wake_wait = argv[i] + 20;
+            g_p23_display_off = 1;
+         }
       }
-      if (argc < 3) { printf("usage: bgmtl_render_probe kernels.metallib render.metallib [--bb] [--upload-cache]\n"); return 2; }
+      if (argc < 3) { printf("usage: bgmtl_render_probe kernels.metallib render.metallib [--bb] [--upload-cache] [--display-off] [--display-wake-wait=FILE]\n"); return 2; }
       printf("== BGMTLDevice textures/render probe (iOS %s)\n", [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String]);
       g_dev = bgmtl_create_device();
 #ifdef BGMTL_REGISTERED_PROBE
@@ -1133,6 +1170,14 @@ main(int argc, char **argv)
          dispatch_release(entered); dispatch_release(gate);
       }
 #ifndef BGMTL_REGISTERED_PROBE
+      // P22 needs a live pending generation and a refused real BEGIN to set up
+      // its refusal preconditions. With the presenter suspended no ticket can
+      // be begun, so those display-on-only cases are skipped rather than turned
+      // into false failures. Display-on output below is unchanged.
+      if (g_p23_display_off) {
+         printf("== P22 imported destination admission/refusal/capacity\n");
+         SKIP("P22 needs the display on (covered by the display-on run)");
+      } else {
       printf("== P22 imported destination admission/refusal/capacity\n");
       { @autoreleasepool {
          id targets[33]={nil}; IOSurfaceRef surfaces[33]={NULL};
@@ -1227,6 +1272,85 @@ main(int argc, char **argv)
          [function release];[argBuffer release];[argPipeline release];
          [cp release];[source release];[testpool drain];
          for(unsigned i=0;i<33;i++){[targets[i]release];if(surfaces[i])CFRelease(surfaces[i]);}
+      }}
+      }
+      // P23: display-off/suspended deferred admission. The runner (not this
+      // probe) toggles AppleCLCD power0/power1. A successful BEGIN on a scratch
+      // imported surface means the display is on; -EAGAIN means suspended.
+      // Keep P20-P22 exactly as they were.
+      printf("== P23 display-suspended deferred admission\n");
+      { @autoreleasepool {
+         enum { N=16 };
+         const uint8_t redPixel[]={0,0,255,255};
+         uint8_t blue[N*N*4];for(unsigned i=0;i<sizeof(blue);i++)blue[i]=(i%4==0||i%4==3)?255:0;
+         IOSurfaceRef surface1=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@(N),(id)kIOSurfaceHeight:@(N),
+            (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@(N*4),(id)kIOSurfacePixelFormat:@(0x42475241u)});
+         MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:N height:N mipmapped:NO];
+         d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;d.storageMode=MTLStorageModeShared;
+         id target1=surface1?[g_dev newTextureWithDescriptor:d iosurface:surface1 plane:0]:nil;
+         [target1 replaceRegion:MTLRegionMake2D(0,0,N,N) mipmapLevel:0 withBytes:blue bytesPerRow:N*4];
+         char marker[512]={0},wake[512]={0};
+         BOOL canWake=g_p23_wake_wait && p23_signal_path(wake,sizeof(wake),"") && p23_signal_path(marker,sizeof(marker),".encoded");
+         if(canWake){unlink(wake);unlink(marker);}
+         uint64_t probeGen=0,probeEpoch=0;
+         int display=rwa_texture_ticket_begin([target1 rwaSurfaceTexture],&probeGen,&probeEpoch);
+         BOOL proceed=NO;
+         if(display==0){
+            // Display is on. Its ticket must not be left open.
+            if(rwa_ticket_end([g_dev rwa],probeGen,probeEpoch,1,0))
+               printf("  warning: could not abort display-state probe ticket\n");
+            if(g_p23_display_off)
+               CHECK(0,"--display-off was requested but ticket BEGIN succeeded (display is on)");
+            else
+               SKIP("display is on; run with the display powered off and pass --display-off");
+         }else if(display==-EAGAIN){
+            printf("  ticket BEGIN reports display suspended (-EAGAIN)\n");
+            proceed=YES;
+         }else if(g_p23_display_off){
+            CHECK(0,"--display-off was requested but ticket BEGIN returned %d, not -EAGAIN",display);
+         }else{
+            SKIP("ticket BEGIN returned %d; cannot confirm display-off (needs the deferred-admission build)",display);
+         }
+         if(proceed){
+            // Encoded and committed while off: BEGIN at encode is deferred, the
+            // replay retry still sees -EAGAIN and admits the CB unticketed. The
+            // clear must run and the command buffer must complete, not Error.
+            id cb=[g_queue commandBuffer];admission_clear(cb,target1);
+            BOOL ok=run(cb,"encoded+committed with display off");
+            CHECK(ok && [cb status]==MTLCommandBufferStatusCompleted,
+                  "display-off deferred CB must complete, status=%ld error=%s",(long)[cb status],
+                  [cb error]?[[[cb error] localizedDescription]UTF8String]:"none");
+            CHECK(flat_pixel(target1,redPixel),"display-off deferred CB exact pixels");
+            // Optional runner-driven second sub-case: encode while off, then let
+            // the runner power the display on before commit. The probe writes
+            // FILE.encoded and waits for FILE; it never toggles AppleCLCD.
+            if(canWake){
+               IOSurfaceRef surface2=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@(N),(id)kIOSurfaceHeight:@(N),
+                  (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@(N*4),(id)kIOSurfacePixelFormat:@(0x42475241u)});
+               id target2=surface2?[g_dev newTextureWithDescriptor:d iosurface:surface2 plane:0]:nil;
+               [target2 replaceRegion:MTLRegionMake2D(0,0,N,N) mipmapLevel:0 withBytes:blue bytesPerRow:N*4];
+               id cb2=[g_queue commandBuffer];admission_clear(cb2,target2); // deferred at encode
+               BOOL marked=p23_write_file(marker);
+               printf("  encoded while off; waiting for runner wake signal %s%s\n",wake,marked?"":" (marker write failed)");
+               BOOL woken=p23_wait_file(wake,30000);
+               CHECK(woken,"runner did not create wake signal %s within 30 s",wake);
+               uint64_t wg=0,we=0;
+               // Probe on target1, not target2: target2's deferred identity is
+               // about to be retried by the CB's own replay preflight.
+               int afterWake=rwa_texture_ticket_begin([target1 rwaSurfaceTexture],&wg,&we);
+               if(!afterWake && rwa_ticket_end([g_dev rwa],wg,we,1,0))
+                  printf("  warning: could not abort post-wake probe ticket\n");
+               CHECK(afterWake==0,"display did not accept tickets after wake signal (BEGIN %d)",afterWake);
+               BOOL ok2=run(cb2,"encoded off, committed after display wake");
+               CHECK(ok2 && [cb2 status]==MTLCommandBufferStatusCompleted && flat_pixel(target2,redPixel),
+                     "post-wake commit must complete with exact pixels, status=%ld error=%s",(long)[cb2 status],
+                     [cb2 error]?[[[cb2 error] localizedDescription]UTF8String]:"none");
+               [target2 release];if(surface2)CFRelease(surface2);
+            }else{
+               SKIP("second sub-case needs --display-wake-wait=FILE and a runner that wakes the display");
+            }
+         }
+         [target1 release];if(surface1)CFRelease(surface1);
       }}
 #endif
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
