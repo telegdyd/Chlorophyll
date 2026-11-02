@@ -923,6 +923,63 @@ main(int argc, char **argv)
          printf("  batch state transitions: %u wrong / %u values\n", bad, checked);
          [color release]; [sample release]; [pd release];
       }
+      // P19: a long RAW chain crosses deferred-group capacity boundaries.
+      // Every intermediate must remain alive and visible to its next consumer;
+      // reusing the chain in a second commit also checks fence/drain ordering.
+      printf("== P19 bounded submission dependency chain\n");
+      {
+         enum { COUNT = 80, N = 8 };
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_tex_inline"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         id sample = [g_dev newRenderPipelineStateWithDescriptor:pd error:NULL];
+         float quad[] = {-1,-1,0,1,1,0,0,1, 1,-1,0,1,1,0,0,1, -1,1,0,1,1,0,0,1,
+                          1,-1,0,1,1,0,0,1, 1,1,0,1,1,0,0,1, -1,1,0,1,1,0,0,1};
+         id vb = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+         id targets[COUNT] = {nil};
+         unsigned bad = 0, checked = 0;
+         BOOL ready = sample && vb;
+         for (unsigned i=0; i<COUNT; i++) {
+            targets[i] = tex2d(MTLPixelFormatBGRA8Unorm, N, N,
+                              MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+            ready = ready && targets[i];
+         }
+         if (!ready) bad++;
+         else for (unsigned commit=0; commit<2; commit++) { @autoreleasepool {
+            id cb = [g_queue commandBuffer];
+            for (unsigned i=0; i<COUNT; i++) {
+               MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+               rp.colorAttachments[0].texture = targets[i];
+               rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+               rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+               rp.colorAttachments[0].clearColor = i ? MTLClearColorMake(0,0,1,1) :
+                  commit ? MTLClearColorMake(0,1,0,1) : MTLClearColorMake(1,0,0,1);
+               id e = [cb renderCommandEncoderWithDescriptor:rp];
+               if (i) {
+                  [e setRenderPipelineState:sample];
+                  [e setVertexBuffer:vb offset:0 atIndex:0];
+                  [e setFragmentTexture:targets[i-1] atIndex:0];
+                  [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+               }
+               [e endEncoding];
+            }
+            if (!run(cb, "submission chain")) bad++;
+            for (unsigned i=0; i<COUNT; i++) {
+               uint8_t px[N*N*4];
+               [targets[i] getBytes:px bytesPerRow:N*4 fromRegion:MTLRegionMake2D(0,0,N,N) mipmapLevel:0];
+               for (unsigned j=0; j<N*N*4; j++) {
+                  unsigned c=j%4, want=(c==3 || c==(commit ? 1 : 2)) ? 255 : 0;
+                  if (px[j]!=want) bad++;
+                  checked++;
+               }
+            }
+         }}
+         CHECK(!bad, "submission chain: %u wrong / %u values", bad, checked);
+         printf("  submission chain: %u wrong / %u values\n", bad, checked);
+         for (unsigned i=0; i<COUNT; i++) [targets[i] release];
+         [vb release]; [sample release]; [pd release];
+      }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;
    }

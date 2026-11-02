@@ -34,12 +34,14 @@
 #include "air_metal.h"
 #ifdef RWA_SWEETGPU
 #include "util/sweet_state_profile.h"
+#include "util/sweet_submit_profile.h"
 #endif
 
 void rwa_state_profile_begin(unsigned render_passes)
 {
 #ifdef RWA_SWEETGPU
    sweet_m3_begin(render_passes);
+   sweet_m4_begin(render_passes);
 #endif
 }
 
@@ -47,6 +49,7 @@ void rwa_state_profile_end(void)
 {
 #ifdef RWA_SWEETGPU
    sweet_m3_end();
+   sweet_m4_end();
 #endif
 }
 

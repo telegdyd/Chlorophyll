@@ -1601,13 +1601,13 @@ bg_sync_commit(void)
    int defer_scheduled = bg_defer_scheduled();
    @synchronized (self) { if (_status != 5 && !defer_scheduled) _status = 3; }   // Scheduled
    struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
-   rwa_state_profile_end();
    if (_tcount) {   // jasmine: seal this command buffer's render tickets with its submit (bgTicketFor)
       uint32_t seqno = fence ? rwa_fence_seqno([dev rwa], fence) : 0;
       for (unsigned i = 0; i < _tcount; i++)
          rwa_ticket_end([dev rwa], _tgen[i], _tepoch[i], !seqno, seqno);
       _tcount = 0;
    }
+   rwa_state_profile_end(); // Include the ticket's deferred-submit drain in the inventory.
    uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    bg_unlock();
    dispatch_group_leave(_sched);
