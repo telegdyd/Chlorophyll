@@ -518,7 +518,12 @@ main(int argc, char **argv)
          CHECK(!unsupported && msError != nil, "multisample feedback must be refused");
          [unsupported release];
          pd.rasterSampleCount = 1;
-         if (pso) {
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_feedback_seed"];
+         id seed = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+         CHECK(seed != nil, "feedback seed pipeline: %s", err.localizedDescription.UTF8String);
+         // First exercise a retained barrier while optional GMEM is armed;
+         // then exercise an empty-batch fallback in the same process.
+         if (pso && seed) for (int seeded = 1; seeded >= 0; seeded--) {
             static const float quad[6 * 8] = {
                -1,-1,0,1, 1,1,1,1,  1,-1,0,1, 1,1,1,1, -1,1,0,1, 1,1,1,1,
                -1,1,0,1, 1,1,1,1,   1,-1,0,1, 1,1,1,1, 1,1,0,1, 1,1,1,1 };
@@ -533,21 +538,48 @@ main(int argc, char **argv)
                rp.colorAttachments[a].storeAction = MTLStoreActionStore;
             }
             id cb = [g_queue commandBuffer], e = [cb renderCommandEncoderWithDescriptor:rp];
-            [e setRenderPipelineState:pso]; [e setVertexBuffer:vb offset:0 atIndex:0];
+            [e setVertexBuffer:vb offset:0 atIndex:0];
+            if (seeded) {
+               [e setRenderPipelineState:seed];
+               [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            }
+            [e setRenderPipelineState:pso];
             for (int i = 0; i < 3; i++) [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
-            [e endEncoding]; CHECK(run(cb, "feedback"), "feedback did not complete");
+            [e endEncoding];
+            if (seeded) {
+               // A later clear must stay ordered after the fetching draws.
+               // Load color0, clear color1, then fetch into half the target.
+               rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+               rp.colorAttachments[1].clearColor = MTLClearColorMake(0,0,0,1);
+               e = [cb renderCommandEncoderWithDescriptor:rp];
+               [e setRenderPipelineState:pso]; [e setVertexBuffer:vb offset:0 atIndex:0];
+               [e setScissorRect:(MTLScissorRect){0,0,18,19}];
+               [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+               [e endEncoding];
+            }
+            CHECK(run(cb, "feedback"), "feedback did not complete");
             unsigned bad = 0;
             for (int a = 0; a < 2; a++) {
                float px[37*19*4];
                [targets[a] getBytes:px bytesPerRow:37*16 fromRegion:MTLRegionMake2D(0,0,37,19) mipmapLevel:0];
                float want[4] = { 10+a+3*(a?3:1),20+a+6,30+a+3*(a?1:3),1 };
-               for (unsigned i = 0; i < 37*19*4; i++) if (px[i] != want[i%4]) {
-                  if (bad < 3) printf("    feedback a%d i%u got %g want %g\n",a,i,px[i],want[i%4]); bad++;
+               for (unsigned i = 0; i < 37*19*4; i++) {
+                  unsigned c = i%4; BOOL left = (i/4)%37 < 18;
+                  float expected = want[c];
+                  if (seeded && c < 3) {
+                     if (a) expected = left ? (float)(3-c) : 0;
+                     else if (left) expected += c+1;
+                  }
+                  if (px[i] != expected) {
+                     if (bad < 3) printf("    feedback a%d i%u got %g want %g\n",a,i,px[i],expected); bad++;
+                  }
                }
             }
             CHECK(!bad, "feedback %u wrong values", bad);
             printf("  feedback: %u/5624 exact values\n",5624-bad);
+            [targets[0] release]; [targets[1] release]; [vb release];
          }
+         [seed release]; [pso release]; [pd release];
       }
       // jasmine P11: repeated CPU writes -> GPU reads, GPU writes -> direct CPU reads.
       printf("== P11 imported IOSurface visibility\n");

@@ -7700,6 +7700,19 @@ fd5_feedback_barrier(struct pipe_context *pipe) in_dt
                  why, refused[0], refused[1], refused[2], refused[3], kept);
       return false;
    }
+   /* These commands read attachment memory, not a GMEM tile. Mark the batch
+    * before recording them: the optional selector runs only at finalization.
+    * Metal uses its own barrier rather than fd5_texture_barrier(), so it must
+    * supply that function's sticky bypass constraint and diagnostic counts.
+    * Later sysmem clears already use ordered blitter draws; keep them in the
+    * batch just as before this constraint was made explicit. */
+   if (!batch->sweet_fb_barriers)
+      batch->sweet_fb_pre = MIN2(batch->num_draws, UINT16_MAX);
+   if (batch->sweet_fb_barriers < UINT16_MAX)
+      batch->sweet_fb_barriers++;
+   batch->a5xx_sysmem_barrier = true;
+   batch->a5xx_fbread = false;
+   ctx->sysmem_barrier_keeps_clears = true;
    struct fd_ringbuffer *ring = batch->draw;
    fd5_event_write(batch, ring, PC_CCU_FLUSH_COLOR_TS, true);
    if (batch->framebuffer.zsbuf.texture)
@@ -8342,7 +8355,19 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .count = draw->vertex_count,
          .index_bias = index_size ? draw->base_vertex : 0,
       };
+#ifdef RWA_SWEETGPU
+      /* Draw tracking may flush/replace the batch after the barrier. Carry
+       * the constraint through tracking to the batch that actually emits the
+       * fetching draw (patch 0030), including the empty-batch fallback. */
+      struct fd_context *fdctx = fd_context(pipe);
+      fdctx->sweet_metal_sysmem_draw = render->finfo.fbfetch_targets != 0;
+      if (fdctx->sweet_metal_sysmem_draw)
+         fdctx->sysmem_barrier_keeps_clears = true;
+#endif
       pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
+#ifdef RWA_SWEETGPU
+      fdctx->sweet_metal_sysmem_draw = false;
+#endif
    }
 
    /* Waited for here, on the same grounds as a dispatch: a picture that was never drawn

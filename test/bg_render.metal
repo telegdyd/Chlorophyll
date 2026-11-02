@@ -57,6 +57,12 @@ fragment float4 bg_fs_ca_color(CAV in [[stage_in]]) { return in.color; }
 
 // jasmine: two-attachment feedback, exact float arithmetic over successive draws.
 struct Feedback { float4 a [[color(0)]]; float4 b [[color(1)]]; };
+// Seed both attachments with an ordinary draw so the following fetch exercises
+// a retained barrier, with optional GMEM still armed (no empty-batch fallback).
+fragment Feedback bg_fs_feedback_seed(V in [[stage_in]])
+{
+   Feedback f; f.a = float4(10,20,30,1); f.b = float4(11,21,31,1); return f;
+}
 fragment Feedback bg_fs_feedback(V in [[stage_in]], float4 a [[color(0)]], float4 b [[color(1)]])
 {
    Feedback f; f.a = a + float4(1, 2, 3, 0); f.b = b + float4(3, 2, 1, 0); return f;
