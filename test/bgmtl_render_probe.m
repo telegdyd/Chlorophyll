@@ -74,6 +74,29 @@ run(id cb, const char *what)
    return [cb status] == 4;
 }
 
+@interface NSObject (BGAdmissionProbe)
+- (void *)rwa;
+- (void *)rwaSurfaceTexture;
+- (void *)rwaAdmissionTexture;
+- (void *)rwaAdmissionBuffer;
+@end
+extern int rwa_texture_ticket_begin(void *, uint64_t *, uint64_t *);
+extern int rwa_ticket_end(void *, uint64_t, uint64_t, int, uint32_t);
+extern int rwa_argbuf_encode_texture(void *, size_t, unsigned, void *, char *, size_t);
+static BOOL flat_pixel(id texture, const uint8_t expected[4]) {
+   uint8_t pixels[16*16*4]; memset(pixels,0x5a,sizeof(pixels));
+   [texture getBytes:pixels bytesPerRow:64 fromRegion:MTLRegionMake2D(0,0,16,16) mipmapLevel:0];
+   for(unsigned i=0;i<sizeof(pixels);i++)if(pixels[i]!=expected[i%4])return NO;
+   return YES;
+}
+static void admission_clear(id cb,id target) {
+   MTLRenderPassDescriptor *d=[MTLRenderPassDescriptor renderPassDescriptor];
+   d.colorAttachments[0].texture=target;d.colorAttachments[0].loadAction=MTLLoadActionClear;
+   d.colorAttachments[0].storeAction=MTLStoreActionStore;
+   d.colorAttachments[0].clearColor=MTLClearColorMake(1,0,0,1);
+   [[cb renderCommandEncoderWithDescriptor:d]endEncoding];
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1109,6 +1132,103 @@ main(int argc, char **argv)
          [target release]; [pso release]; [pd release]; [oversized release];
          dispatch_release(entered); dispatch_release(gate);
       }
+#ifndef BGMTL_REGISTERED_PROBE
+      printf("== P22 imported destination admission/refusal/capacity\n");
+      { @autoreleasepool {
+         id targets[33]={nil}; IOSurfaceRef surfaces[33]={NULL};
+         uint8_t blue[16*16*4]; for(unsigned i=0;i<sizeof(blue);i++)blue[i]=(i%4==0 || i%4==3)?255:0;
+         for(unsigned i=0;i<33;i++) {
+            surfaces[i]=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@16,(id)kIOSurfaceHeight:@16,
+               (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@64,(id)kIOSurfacePixelFormat:@(0x42475241u)});
+            MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:16 height:16 mipmapped:NO];
+            d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;
+            targets[i]=[g_dev newTextureWithDescriptor:d iosurface:surfaces[i] plane:0];
+            [targets[i]replaceRegion:MTLRegionMake2D(0,0,16,16) mipmapLevel:0 withBytes:blue bytesPerRow:64];
+         }
+         const uint8_t redPixel[]={0,0,255,255},bluePixel[]={255,0,0,255};
+         BOOL created=YES;for(unsigned i=0;i<33;i++)created &= targets[i]!=nil;
+         CHECK(created,"admission test imported targets");
+         NSAutoreleasePool *testpool=[NSAutoreleasePool new];
+         id cb=[g_queue commandBuffer];for(unsigned i=0;i<32;i++)admission_clear(cb,targets[i]);
+         BOOL ok=run(cb,"32 imported destinations");
+         for(unsigned i=0;i<32;i++)ok &= flat_pixel(targets[i],redPixel);
+         CHECK(ok,"32 imported destinations must all be admitted and written");
+         [testpool drain];testpool=[NSAutoreleasePool new];
+         // The 33rd destination fails the WHOLE CB before even the first clear.
+         id capSentinel=tex2d(MTLPixelFormatBGRA8Unorm,16,16,MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead);
+         [capSentinel replaceRegion:MTLRegionMake2D(0,0,16,16) mipmapLevel:0 withBytes:blue bytesPerRow:64];
+         cb=[g_queue commandBuffer];admission_clear(cb,capSentinel);
+         for(unsigned i=0;i<33;i++)admission_clear(cb,targets[i]);
+         [cb commit];[cb waitUntilCompleted];
+         // ABORT intentionally makes imported generations unreadable until a
+         // new valid producer; inspect the private first operation instead.
+         ok=[cb status]==MTLCommandBufferStatusError && flat_pixel(capSentinel,bluePixel) && flat_pixel(targets[32],bluePixel);
+         CHECK(ok,"capacity failure must be explicit and prevent dependent replay");
+         [capSentinel release];
+         [testpool drain];testpool=[NSAutoreleasePool new];
+         // An encoded but uncommitted producer must never be waited on implicitly.
+         id prior=[g_queue commandBuffer];admission_clear(prior,targets[32]);
+         id sentinel=tex2d(MTLPixelFormatBGRA8Unorm,16,16,MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead);
+         [sentinel replaceRegion:MTLRegionMake2D(0,0,16,16) mipmapLevel:0 withBytes:blue bytesPerRow:64];
+         cb=[g_queue commandBuffer];admission_clear(cb,sentinel);admission_clear(cb,targets[32]);
+         [cb commit];[cb waitUntilCompleted];
+         CHECK([cb status]==MTLCommandBufferStatusError && flat_pixel(sentinel,bluePixel),"uncommitted owner refusal must prevent dependent replay");
+         [sentinel release];
+         CHECK(run(prior,"original producer survives refusal") && flat_pixel(targets[32],redPixel),"refusal must preserve original producer");
+         [testpool drain];testpool=[NSAutoreleasePool new];
+         // Unknown kernel ownership is a refusal, never a local-producer retry.
+         uint64_t gen=0,epoch=0;int opened=rwa_texture_ticket_begin([targets[32]rwaSurfaceTexture],&gen,&epoch);
+         id unknownSentinel=tex2d(MTLPixelFormatBGRA8Unorm,16,16,MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead);
+         [unknownSentinel replaceRegion:MTLRegionMake2D(0,0,16,16) mipmapLevel:0 withBytes:blue bytesPerRow:64];
+         cb=[g_queue commandBuffer];admission_clear(cb,unknownSentinel);admission_clear(cb,targets[32]);[cb commit];[cb waitUntilCompleted];
+         ok=!opened && [cb status]==MTLCommandBufferStatusError && flat_pixel(unknownSentinel,bluePixel);
+         if(!opened)ok &= rwa_ticket_end([g_dev rwa],gen,epoch,1,0)==0;
+         [unknownSentinel release];
+         CHECK(ok,"unknown pending generation must refuse without writes");
+         [testpool drain];testpool=[NSAutoreleasePool new];
+         // Both explicit blit writes and actual AIR writable compute images join admission.
+         id source=tex2d(MTLPixelFormatBGRA8Unorm,16,16,MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget);
+         [source replaceRegion:MTLRegionMake2D(0,0,16,16) mipmapLevel:0 withBytes:blue bytesPerRow:64];
+         cb=[g_queue commandBuffer];id blit=[cb blitCommandEncoder];[blit copyFromTexture:source toTexture:targets[32]];[blit endEncoding];
+         CHECK(run(cb,"imported blit destination") && flat_pixel(targets[32],bluePixel),"blit destination admission");
+         id cp=compute_pso(klib,"bg_tex_write");cb=[g_queue commandBuffer];id ce=[cb computeCommandEncoder];
+         [ce setComputePipelineState:cp];[ce setTexture:targets[32] atIndex:0];
+         [ce dispatchThreads:MTLSizeMake(16,16,1) threadsPerThreadgroup:MTLSizeMake(4,4,1)];[ce endEncoding];
+         ok=run(cb,"imported compute image destination");
+         uint8_t center[4]={0};[targets[32]getBytes:center bytesPerRow:4 fromRegion:MTLRegionMake2D(8,8,1,1) mipmapLevel:0];
+         CHECK(ok && center[0]==128 && center[1]==128 && center[2]==128 && center[3]==255,"compute destination admission/pixel");
+         [targets[32]replaceRegion:MTLRegionMake2D(0,0,16,16) mipmapLevel:0 withBytes:blue bytesPerRow:64];
+         id function=[klib newFunctionWithName:@"bg_arg_write"];
+         // Public argument-encoder reflection is not implemented by this shim;
+         // construct its existing AIR encoder record directly for this regression.
+         id argBuffer=[g_dev newBufferWithLength:64 options:0]; char argWhy[256]={0};
+         BOOL argOK=rwa_argbuf_encode_texture([argBuffer rwaAdmissionBuffer],0,0,[targets[31]rwaAdmissionTexture],argWhy,sizeof(argWhy))==0;
+         id argPipeline=[g_dev newComputePipelineStateWithFunction:function error:NULL];
+         cb=[g_queue commandBuffer];ce=[cb computeCommandEncoder];
+         [ce setComputePipelineState:argPipeline];[ce setBuffer:argBuffer offset:0 atIndex:0];
+         [ce dispatchThreads:MTLSizeMake(16,16,1) threadsPerThreadgroup:MTLSizeMake(4,4,1)];[ce endEncoding];
+         argOK &= rwa_argbuf_encode_texture([argBuffer rwaAdmissionBuffer],0,0,[targets[32]rwaAdmissionTexture],argWhy,sizeof(argWhy))==0; // destination changes after encode
+         ok=run(cb,"changed imported argument-buffer destination");
+         [targets[32]getBytes:center bytesPerRow:4 fromRegion:MTLRegionMake2D(8,8,1,1) mipmapLevel:0];
+                  printf("  argument image: encode %u center %u/%u/%u/%u\n",argOK,center[0],center[1],center[2],center[3]);
+         CHECK(argOK && ok && center[0]==128 && center[1]==128 && center[2]==128 && center[3]==255 && flat_pixel(targets[31],redPixel),"argument image replay admission/pixel");
+         // A changed member with unknown pending ownership fails before an earlier
+         // dependent clear too, instead of skipping the dispatch and continuing.
+         argOK &= rwa_argbuf_encode_texture([argBuffer rwaAdmissionBuffer],0,0,[targets[31]rwaAdmissionTexture],argWhy,sizeof(argWhy))==0;
+         cb=[g_queue commandBuffer];admission_clear(cb,source);
+         ce=[cb computeCommandEncoder];[ce setComputePipelineState:argPipeline];[ce setBuffer:argBuffer offset:0 atIndex:0];
+         [ce dispatchThreads:MTLSizeMake(16,16,1) threadsPerThreadgroup:MTLSizeMake(4,4,1)];[ce endEncoding];
+         gen=epoch=0;opened=rwa_texture_ticket_begin([targets[30]rwaSurfaceTexture],&gen,&epoch);
+         argOK &= rwa_argbuf_encode_texture([argBuffer rwaAdmissionBuffer],0,0,[targets[30]rwaAdmissionTexture],argWhy,sizeof(argWhy))==0;[cb commit];[cb waitUntilCompleted];
+         ok=!opened && [cb status]==MTLCommandBufferStatusError && flat_pixel(source,bluePixel);
+         if(!opened)ok &= rwa_ticket_end([g_dev rwa],gen,epoch,1,0)==0;
+
+         CHECK(argOK && ok,"changed refused argument destination must prevent the entire replay");
+         [function release];[argBuffer release];[argPipeline release];
+         [cp release];[source release];[testpool drain];
+         for(unsigned i=0;i<33;i++){[targets[i]release];if(surfaces[i])CFRelease(surfaces[i]);}
+      }}
+#endif
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;
    }

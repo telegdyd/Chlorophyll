@@ -372,6 +372,7 @@ bg_install_fallback(Class c)
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device length:(NSUInteger)length;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device bytesNoCopy:(void *)p length:(NSUInteger)length deallocator:(void (^)(void *, NSUInteger))dealloc;
 - (struct rwa_buffer *)rwaBuffer;
+- (struct rwa_buffer *)rwaAdmissionBuffer;
 - (void *)contents;
 @end
 
@@ -389,6 +390,18 @@ bg_install_fallback(Class c)
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(id)descriptor;
 @end
 
+// Registry entries retain only this ownership token, never the CB itself: an
+// abandoned uncommitted CB must deallocate, and lookup must not resurrect one.
+@interface BGWriteOwner : NSObject { @public dispatch_group_t done; BOOL committed; }
+- (instancetype)initWithDone:(dispatch_group_t)group;
+@end
+@implementation BGWriteOwner
+- (instancetype)initWithDone:(dispatch_group_t)group {
+   self=[super init]; if (self) { done=group; dispatch_retain(done); } return self;
+}
+- (void)dealloc { dispatch_release(done); [super dealloc]; }
+@end
+
 @interface BGMTLCommandBuffer : _MTLCommandBuffer {
    BGMTLCommandQueue *_queue;
    NSMutableArray *_work;
@@ -399,14 +412,21 @@ bg_install_fallback(Class c)
    BOOL _scheduledDelivered, _completedDelivered; // delivery readiness is independent of public Error status
    dispatch_group_t _done;                                 // left when the completion (fence) has run: waitUntilCompleted
    dispatch_group_t _sched;                                // left when the replay has submitted: waitUntilScheduled
-   uint64_t _tgen[8], _tepoch[8];                          // jasmine: render tickets opened for this command buffer
-   uint32_t _tsurf[8];
+   uint64_t _tgen[32], _tepoch[32];                          // jasmine: render tickets opened for this command buffer
+   uint32_t _tsurf[32];
    unsigned _tcount;
    BOOL _ticketDrainFailed; // retain kernel protection if submitted writes could not be drained
+   BOOL _admissionFailed, _committed;
+   BGWriteOwner *_writeOwner;
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (void)bgTicketFor:(id)texture;
 - (void)bgRecord:(BGWork *)work;
+- (BOOL)bgAdmitRaw:(struct rwa_texture *)texture;
+- (BOOL)bgCollectWrites:(BGWork *)work;
+- (void)bgReleaseAdmissionOwners;
+- (void)bgQuarantineAdmissionOwners;
+- (BOOL)bgAdmissionReject:(NSString *)reason;
 @end
 
 @interface BGMTLComputeEncoder : _MTLCommandEncoder {
@@ -456,6 +476,7 @@ bg_install_fallback(Class c)
 - (void)bgCacheNoCopyLocked:(const void *)bytes length:(size_t)length;
 - (void)bgInvalidateUploadCache;
 - (struct rwa_texture *)rwaTexture;
+- (struct rwa_texture *)rwaAdmissionTexture;
 - (void)bgShadowLocked;   // jasmine: compositor render targets over an IOSurface draw in a shared shadow
 - (struct rwa_texture *)rwaSurfaceTexture;   // jasmine: the imported IOSurface itself (under a shadow too), or NULL
 - (struct rwa_texture *)rwaTextureSampled;  // also cleans the CPU cache of a surface another process wrote since
@@ -1059,6 +1080,7 @@ bg_air_slice(NSData *d)
    [super dealloc];
 }
 - (struct rwa_buffer *)rwaBuffer { if (_mapped && _contents) memcpy(_mapped, _contents, _length); return _buf; }
+- (struct rwa_buffer *)rwaAdmissionBuffer { return _buf; }
 - (void *)contents { return _contents; }
 - (NSUInteger)length { return _length; }
 - (id)device { return _owner; }
@@ -1132,6 +1154,8 @@ bg_air_slice(NSData *d)
    _presents = [[NSMutableArray alloc] init];
    _done = dispatch_group_create();
    _sched = dispatch_group_create();
+   _writeOwner = [[BGWriteOwner alloc] initWithDone:_done];
+   if (!_writeOwner) { [self release]; return nil; }
    _status = 1;   // MTLCommandBufferStatusEnqueued
    if (bg_timing()) bg_tm(BG_TM_CREATE, 0, 0, 0);
    return self;
@@ -1140,40 +1164,30 @@ bg_air_slice(NSData *d)
 {
    if (_tcount && !_ticketDrainFailed) {   // opened and never committed: give the generations up, or the display waits its 1 s bound for them
       bg_lock();
+      unsigned pending=0;
       for (unsigned i = 0; i < _tcount; i++)
-         rwa_ticket_end([(BGMTLDevice *)[_queue device] rwa], _tgen[i], _tepoch[i], true, 0);
+         if (rwa_ticket_end([(BGMTLDevice *)[_queue device] rwa], _tgen[i], _tepoch[i], true, 0)) {
+            _tgen[pending]=_tgen[i]; _tepoch[pending++]=_tepoch[i];
+         }
+      _tcount=pending;
       bg_unlock();
    }
+   [self bgReleaseAdmissionOwners];
+   [self bgQuarantineAdmissionOwners];
+   [_writeOwner release];
    [_queue release]; [_work release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
    if (_done) dispatch_release(_done);
    if (_sched) dispatch_release(_sched);
    [super dealloc];
 }
-/* jasmine: a render ticket (kernel j0110) for each IOSurface this command buffer draws into, opened when the pass is
- * encoded: CoreAnimation hands the framebuffer to the display without waiting for the GPU (Apple's display waits on the
- * GPU itself), and the kernel's presenter only knows the jobs already submitted, so it flipped frames the GPU then drew
- * (black bands rolling down the panel, tearing once drawn through a shadow). With a ticket the presenter shows the
- * surface only once commit sealed it and the GPU passed that submit. Refused (-EBUSY) while the surface is still on the
- * display: counted, as that is CA drawing into the frame being shown. */
-- (void)bgTicketFor:(id)texture
-{
-   if (!texture || _status >= 2 || _tcount == 8) return;
-   IOSurfaceRef s = (IOSurfaceRef)[(BGMTLTexture *)texture iosurface];
-   struct rwa_texture *imp = [(BGMTLTexture *)texture rwaSurfaceTexture];
-   if (!s || !imp) return;
-   uint32_t id = IOSurfaceGetID(s);
-   for (unsigned i = 0; i < _tcount; i++)
-      if (_tsurf[i] == id) return;
-   static unsigned busy, other, opened;
-   bg_lock();
-   int r = rwa_texture_ticket_begin(imp, &_tgen[_tcount], &_tepoch[_tcount]);
-   bg_unlock();
-   if (r == 0) { _tsurf[_tcount++] = id; if (++opened == 1) BG_LOG("render tickets: first opened (IOSurface %u)\n", id); }
-   else if (r == -EBUSY) { if (++busy % 100 == 1) BG_LOG("render tickets: %u refused busy (IOSurface %u still open or on the display)\n", busy, id); }
-   else if (++other <= 3) BG_LOG("render tickets: begin failed %d (IOSurface %u)\n", r, id);
-}
+#include "bg_write_admission.h"
+#include "bg_work_admission.h"
 - (id)device { return [_queue device]; }
-- (void)bgRecord:(BGWork *)w { [_work addObject:w]; }
+- (void)bgRecord:(BGWork *)w
+{
+   [_work addObject:w]; // retain dependent records even if the entire CB is refused
+   if (!_admissionFailed) [self bgCollectWrites:w];
+}
 - (NSInteger)status { return _status; }
 - (NSError *)error { return _error; }
 - (void)enqueue {}
@@ -1225,6 +1239,7 @@ struct bg_ticket_drain {
    struct rwa_fence *fence;
    char *why;
    size_t why_size;
+   BOOL no_writes; // whole-CB preflight refused before any replay/upload/write
 };
 static int bg_ticket_end(void *context, uint64_t generation, uint64_t epoch, int abort, uint32_t seqno)
 {
@@ -1234,7 +1249,9 @@ static int bg_ticket_end(void *context, uint64_t generation, uint64_t epoch, int
 static int bg_ticket_wait(void *context)
 {
    struct bg_ticket_drain *d = context;
-   return bg_fence_wait(d->device, d->fence, d->why, d->why_size);
+   // A preflight-refused CB executed no work, so ABORT acknowledges no writes.
+   // Ordinary replay errors still need the actual fence drain below.
+   return d->no_writes ? 0 : bg_fence_wait(d->device, d->fence, d->why, d->why_size);
 }
 
 - (void)bgFailWith:(NSString *)why code:(NSInteger)code
@@ -1384,9 +1401,12 @@ bg_sync_commit(void)
 {
    bgmtl_note_committed();
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-   @synchronized (self) { _status = 2; }   // Committed
    dispatch_group_enter(_done);
    dispatch_group_enter(_sched);
+   // A registry observer may wait as soon as committed is published. Enter both
+   // groups first, so it cannot mistake the pre-submit CB for a completed owner.
+   bg_lock(); _committed = _writeOwner->committed = YES; bg_unlock();
+   @synchronized (self) { if (!_admissionFailed) _status = 2; }   // Committed, or an explicit admission Error
    if (bg_async_replay() && !bg_trace() && !bg_sync_commit()) {
       static dispatch_queue_t replay;
       static dispatch_once_t once;
@@ -1410,12 +1430,16 @@ bg_sync_commit(void)
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    char why[512] = { 0 };
    bg_lock();
+   // Re-resolve mutable argument-buffer encodings before ANY replay operation.
+   // Unexpected imported destinations must be protected too, or fail the whole CB.
+   if (!_admissionFailed)
+      for (BGWork *w in _work) if (![self bgCollectWrites:w]) break;
    bg_refresh_epoch = ++bg_refresh_epochs;
    bg_upload_begin();
    rwa_state_profile_begin(_renderPasses);
    rwa_pass_profile_begin();
    // jasmine: surfaces this command buffer renders or blits into draw in their shared shadow (bgShadowLocked)
-   for (BGWork *w in _work) {
+   if (!_admissionFailed) for (BGWork *w in _work) {
       if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
          for (unsigned i = 0; i < w->color_count; i++)
             if (w->color[i]) [(BGMTLTexture *)w->color[i] bgShadowLocked];
@@ -1425,7 +1449,7 @@ bg_sync_commit(void)
    // The shared context, refresh epoch and M3/M4/M5 TLS scopes belong to this
    // entire replay. Encoding/context calls cannot run between its work items.
    // The fair mutex hands off at command-buffer boundaries.
-   for (BGWork *w in _work) {
+   if (!_admissionFailed) for (BGWork *w in _work) {
       // Keep the original upload/synchronization path for compute, attachments
       // and explicit blits. The exact-compare fast path is for render sampling.
       if ([w->src isKindOfClass:[BGMTLTexture class]]) [(BGMTLTexture *)w->src bgInvalidateUploadCache];
@@ -1636,14 +1660,15 @@ bg_sync_commit(void)
    // Otherwise ABORT would release the ticket while that work remained queued.
    struct rwa_fence *fence = rwa_flush([dev rwa]);
    if (_tcount) {   // jasmine: seal this command buffer's render tickets with its submit (bgTicketFor)
-      uint32_t seqno = fence ? rwa_fence_seqno([dev rwa], fence) : 0;
-      struct bg_ticket_drain drain = { dev, fence, why, sizeof(why) };
+      uint32_t seqno = !_admissionFailed && fence ? rwa_fence_seqno([dev rwa], fence) : 0;
+      struct bg_ticket_drain drain = { dev, fence, why, sizeof(why), _admissionFailed };
       if (bg_ticket_retire(_tgen, _tepoch, &_tcount, seqno, &drain,
                            bg_ticket_end, bg_ticket_wait)) {
          _ticketDrainFailed = _tcount != 0;
          [self bgFailWith:@"render ticket acknowledgement failed" code:3];
       }
    }
+   [self bgReleaseAdmissionOwners];
    rwa_pass_profile_end();
    rwa_state_profile_end(); // Include the ticket's deferred-submit drain in the inventory.
    uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -1893,6 +1918,11 @@ bg_sync_commit(void)
       if (d.colorAttachments[i].texture) [self bgTicketFor:d.colorAttachments[i].texture];
       if (d.colorAttachments[i].resolveTexture) [self bgTicketFor:d.colorAttachments[i].resolveTexture];
    }
+   [self bgTicketFor:d.depthAttachment.texture];
+   [self bgTicketFor:d.stencilAttachment.texture];
+   if (d.depthAttachment.texture && d.stencilAttachment.texture &&
+       d.depthAttachment.texture != d.stencilAttachment.texture)
+      [self bgAdmissionReject:@"separate depth/stencil attachment textures are not supported"];
    return [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease];
 }
 - (id)blitCommandEncoder { return [[[BGMTLBlitEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
@@ -2169,6 +2199,7 @@ bg_shadow_release(struct rwa_texture *sh)
  * did not hold (motion jumped back and forth). Opt-in since the render tickets (BGMTL_SHADOW=1; step 7 r17: no band and
  * no tearing without it, 6 MB less copied per frame). Caller holds bg_lock. */
 - (struct rwa_texture *)rwaSurfaceTexture { return _surfTex ? _surfTex : (_surface ? _tex : NULL); }
+- (struct rwa_texture *)rwaAdmissionTexture { return _tex; }
 - (void)bgShadowLocked
 {
    static int on = -1;

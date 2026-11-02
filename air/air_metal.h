@@ -1383,6 +1383,16 @@ void rwa_pass_profile_end(void);
 int rwa_lifetime_profile_active(void);
 void rwa_lifetime_attachment(struct rwa_texture *texture, unsigned slot, unsigned load, unsigned store);
 
+/* M7: enumerate actual shader image writes (including argument-buffer members),
+ * without binding or dispatching. Called under the device context lock. */
+typedef int (*rwa_write_destination_fn)(void *, struct rwa_texture *);
+unsigned rwa_texture_surface_id(const struct rwa_texture *texture);
+int rwa_compute_write_destinations(struct rwa_compute *, const struct rwa_bindings *,
+   const struct rwa_buffer_bind *, unsigned, rwa_write_destination_fn, void *, char *, size_t);
+int rwa_render_write_destinations(struct rwa_render *, const struct rwa_bindings *,
+   const struct rwa_buffer_bind *, unsigned, const struct rwa_bindings *,
+   const struct rwa_buffer_bind *, unsigned, rwa_write_destination_fn, void *, char *, size_t);
+
 #ifdef __cplusplus
 }
 #endif

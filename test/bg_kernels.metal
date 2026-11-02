@@ -75,3 +75,12 @@ kernel void bg_ms_read(texture2d_ms<float, access::read> t [[texture(0)]], devic
    if (gid < 4)
       out[gid] = t.read(at, gid);
 }
+
+// M7: writable argument-buffer member must participate in encode admission and
+// replay revalidation if the encoder record changes before commit.
+struct BGAdmissionImages { texture2d<float, access::write> destination [[id(0)]]; };
+kernel void bg_arg_write(constant BGAdmissionImages &images [[buffer(0)]], uint2 gid [[thread_position_in_grid]])
+{
+   if (gid.x < images.destination.get_width() && gid.y < images.destination.get_height())
+      images.destination.write(float4(0.5,0.5,0.5,1),gid);
+}

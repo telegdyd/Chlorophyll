@@ -4323,6 +4323,39 @@ struct rwa_bound {
    unsigned num_ssbo, num_views, num_images, num_samplers;
 };
 
+/* M7 shares AIR resource/member resolution with bind_stage, but performs no
+ * upload, binding, draw or dispatch. Read-only imported inputs need no ticket. */
+unsigned
+rwa_texture_surface_id(const struct rwa_texture *t)
+{
+   return t && t->imported ? t->lifetime_surface : 0;
+}
+static int
+stage_write_destinations(const struct air_shader_info *info, const struct rwa_bindings *bindings,
+   const struct rwa_buffer_bind *table, unsigned count, rwa_write_destination_fn visit,
+   void *context, char *why, size_t why_size)
+{
+   for (unsigned i=0; i<info->num_resources; i++) {
+      const struct air_resource *r=&info->resources[i];
+      if (r->kind != AIR_RESOURCE_IMAGE || !r->write) continue;
+      struct rwa_texture *texture=NULL;
+      if (r->argbuf_set != ~0u) {
+         struct rwa_buffer *buffer=NULL; size_t offset=0;
+         if (argbuf_member(r,table,count,"write admission",&buffer,&offset,&texture,NULL,why,why_size)) return -1;
+      } else if (r->index < bindings->texture_count) texture=bindings->textures[r->index];
+      if (!texture) { say(why,why_size,"write admission: missing writable image %u",r->index); return -1; }
+      if (visit(context,texture)) { say(why,why_size,"write admission: imported image %u refused",r->index); return -1; }
+   }
+   return 0;
+}
+int
+rwa_compute_write_destinations(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+   const struct rwa_buffer_bind *table, unsigned count, rwa_write_destination_fn visit,
+   void *context, char *why, size_t why_size)
+{
+   return stage_write_destinations(&compute->info,bindings,table,count,visit,context,why,why_size);
+}
+
 /*
  * Bind one stage's resources, each as the kind its own instructions ask for, and record
  * what was bound. This is air_run's compute binding with the shader stage lifted out of
@@ -6092,6 +6125,16 @@ struct rwa_render {
     */
    struct rwa_vertex_state vstate;
 };
+
+int
+rwa_render_write_destinations(struct rwa_render *render, const struct rwa_bindings *vertex,
+   const struct rwa_buffer_bind *vt, unsigned vn, const struct rwa_bindings *fragment,
+   const struct rwa_buffer_bind *ft, unsigned fn, rwa_write_destination_fn visit,
+   void *context, char *why, size_t why_size)
+{
+   return stage_write_destinations(&render->vinfo,vertex,vt,vn,visit,context,why,why_size) ||
+          stage_write_destinations(&render->finfo,fragment,ft,fn,visit,context,why,why_size) ? -1 : 0;
+}
 
 /* Clone, finalise and compile one stage, handing the driver a copy it may steal. The
  * clone is not freed on failure, for compute_state_for's reason: a driver that refused
