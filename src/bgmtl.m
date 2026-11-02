@@ -214,11 +214,12 @@ __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; } 
 @class BGMTLComputePipeline;
 
 // ---- recorded work ---------------------------------------------------------------------------------------------------
-enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF, BG_WORK_CLEAR, BG_WORK_MIPMAPS, BG_WORK_RESOLVE };
+enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF, BG_WORK_CLEAR, BG_WORK_MIPMAPS, BG_WORK_RESOLVE, BG_WORK_PASS };
 #define BG_MAX_TEX 16
 @interface BGWork : NSObject {
  @public
    int kind;
+   uint64_t pass_info[20]; // M5 opt-in descriptor marker; no GPU operation
    BGMTLComputePipeline *pipeline;
    id buffers[BG_MAX_BINDINGS];
    NSUInteger offsets[BG_MAX_BINDINGS];
@@ -1405,6 +1406,7 @@ bg_sync_commit(void)
    bg_refresh_epoch = ++bg_refresh_epochs;
    bg_upload_begin();
    rwa_state_profile_begin(_renderPasses);
+   rwa_pass_profile_begin();
    // jasmine: surfaces this command buffer renders or blits into draw in their shared shadow (bgShadowLocked)
    for (BGWork *w in _work) {
       if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
@@ -1427,6 +1429,11 @@ bg_sync_commit(void)
          for (unsigned i = 0; i < w->color_count; i++) [(BGMTLTexture *)w->color[i] bgInvalidateUploadCache];
          [(BGMTLTexture *)w->depth bgInvalidateUploadCache];
       }
+      if (w->kind == BG_WORK_PASS) {
+         rwa_pass_profile_pass(w->pass_info);
+         continue;
+      }
+      if (w->kind != BG_WORK_DRAW && w->kind != BG_WORK_CLEAR) rwa_pass_profile_work(w->kind);
       if (w->kind == BG_WORK_DISPATCH) {
          struct rwa_buffer *bufs[BG_MAX_BINDINGS] = { NULL };
          struct rwa_buffer_bind table[BG_MAX_BINDINGS] = { { NULL, 0 } };
@@ -1459,6 +1466,16 @@ bg_sync_commit(void)
             BG_LOG("clear skipped: %s\n", why);   // one bad clear no longer drops the rest of the frame (see the draw below)
       } else if (w->kind == BG_WORK_DRAW) {
          BGMTLRenderPipeline *rp = (BGMTLRenderPipeline *)w->render;
+         static int profile_shaders;
+         if (!profile_shaders) profile_shaders = getenv("BGMTL_PASS_PROFILE") && !strcmp(getenv("BGMTL_PASS_PROFILE"), "1") ? 1 : -1;
+         if (profile_shaders == 1) {
+            uint64_t tex[7]={0}; tex[6]=w->texture_count;
+            for (unsigned i=0;i<2 && i<w->texture_count;i++) {
+               BGMTLTexture *t=w->textures[i];
+               tex[i*3]=[t width]; tex[i*3+1]=[t height]; tex[i*3+2]=[t pixelFormat];
+            }
+            rwa_pass_profile_shader(rp->_names,tex);
+         }
          struct rwa_buffer *vb[BG_MAX_BINDINGS] = { NULL }, *fb[BG_MAX_BINDINGS] = { NULL };
          struct rwa_buffer_bind vt[BG_MAX_BINDINGS] = { { NULL, 0 } }, ft[BG_MAX_BINDINGS] = { { NULL, 0 } };
          struct rwa_vertex_stream streams[BG_MAX_BINDINGS] = { { NULL, 0 } };
@@ -1607,6 +1624,7 @@ bg_sync_commit(void)
          rwa_ticket_end([dev rwa], _tgen[i], _tepoch[i], !seqno, seqno);
       _tcount = 0;
    }
+   rwa_pass_profile_end();
    rwa_state_profile_end(); // Include the ticket's deferred-submit drain in the inventory.
    uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    bg_unlock();
@@ -1818,6 +1836,27 @@ bg_sync_commit(void)
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
 {
    _renderPasses++;
+   static int pass_profile;
+   if (!pass_profile) pass_profile = getenv("BGMTL_PASS_PROFILE") && !strcmp(getenv("BGMTL_PASS_PROFILE"), "1") ? 1 : -1;
+   if (pass_profile == 1) {
+      BGWork *w = [[[BGWork alloc] init] autorelease];
+      w->kind = BG_WORK_PASS;
+      id<MTLTexture> first = d.colorAttachments[0].texture ?: d.depthAttachment.texture ?: d.stencilAttachment.texture;
+      w->pass_info[0]=first.width; w->pass_info[1]=first.height; w->pass_info[2]=first.sampleCount;
+      for (unsigned i=0;i<8;i++) {
+         MTLRenderPassColorAttachmentDescriptor *a=d.colorAttachments[i];
+         if (!a.texture) continue;
+         w->pass_info[3]++; w->pass_info[4+i]=a.texture.pixelFormat;
+         w->pass_info[12] |= (uint64_t)a.loadAction << (i*4);
+         w->pass_info[13] |= (uint64_t)a.storeAction << (i*4);
+         if (a.resolveTexture) w->pass_info[14] |= 1u<<i;
+      }
+      w->pass_info[15]=d.depthAttachment.texture.pixelFormat;
+      w->pass_info[16]=d.depthAttachment.loadAction; w->pass_info[17]=d.depthAttachment.storeAction;
+      w->pass_info[18]=d.stencilAttachment.loadAction | ((uint64_t)d.stencilAttachment.storeAction<<4);
+      w->pass_info[19]=d.stencilAttachment.texture.pixelFormat;
+      [self bgRecord:w];
+   }
    id<MTLTexture> t = d.colorAttachments[0].texture;
    BG_TRACE("render pass: color0 %lux%lu fmt %lu load %lu store %lu\n", (unsigned long)t.width, (unsigned long)t.height,
             (unsigned long)t.pixelFormat, (unsigned long)d.colorAttachments[0].loadAction, (unsigned long)d.colorAttachments[0].storeAction);

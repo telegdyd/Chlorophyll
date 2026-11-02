@@ -1372,6 +1372,13 @@ int rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, c
 void rwa_state_profile_begin(unsigned render_passes);
 void rwa_state_profile_end(void);
 
+/* M5: bounded opt-in diagnostic; no-op on non-SweetGPU builds. */
+void rwa_pass_profile_begin(void);
+void rwa_pass_profile_pass(const uint64_t *values);
+void rwa_pass_profile_work(unsigned kind);
+void rwa_pass_profile_shader(const char *name, const uint64_t *textures);
+void rwa_pass_profile_end(void);
+
 #ifdef __cplusplus
 }
 #endif

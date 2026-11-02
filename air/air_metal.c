@@ -35,6 +35,7 @@
 #ifdef RWA_SWEETGPU
 #include "util/sweet_state_profile.h"
 #include "util/sweet_submit_profile.h"
+#include "util/sweet_pass_profile.h"
 #endif
 
 void rwa_state_profile_begin(unsigned render_passes)
@@ -50,6 +51,43 @@ void rwa_state_profile_end(void)
 #ifdef RWA_SWEETGPU
    sweet_m3_end();
    sweet_m4_end();
+#endif
+}
+
+void rwa_pass_profile_begin(void)
+{
+#ifdef RWA_SWEETGPU
+   sweet_m5_begin();
+#endif
+}
+void rwa_pass_profile_pass(const uint64_t *v)
+{
+#ifdef RWA_SWEETGPU
+   sweet_m5_pass(v);
+#else
+   (void)v;
+#endif
+}
+void rwa_pass_profile_work(unsigned kind)
+{
+#ifdef RWA_SWEETGPU
+   sweet_m5_work(kind);
+#else
+   (void)kind;
+#endif
+}
+void rwa_pass_profile_end(void)
+{
+#ifdef RWA_SWEETGPU
+   sweet_m5_end();
+#endif
+}
+void rwa_pass_profile_shader(const char *name, const uint64_t *textures)
+{
+#ifdef RWA_SWEETGPU
+   sweet_m5_shader(name, textures);
+#else
+   (void)name; (void)textures;
 #endif
 }
 
