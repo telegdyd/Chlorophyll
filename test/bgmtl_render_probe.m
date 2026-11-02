@@ -847,6 +847,24 @@ main(int argc, char **argv)
          printf("  no-copy lifecycle: %u wrong / %u values\n",bad,checked);
          [smp release];[sd release];[vb release];[pso release];[pd release];
       }
+      // P17: throttling diagnostics must not change texture-creation results.
+      printf("== P17 repeated unsupported texture refusals\n");
+      {
+         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)500 width:4 height:4 mipmapped:NO];
+         td.usage = MTLTextureUsageShaderRead;
+         unsigned accepted = 0;
+         for (unsigned i = 0; i < 1000; ++i) {
+            id t = [g_dev newTextureWithDescriptor:td];
+            if (t) { ++accepted; [t release]; }
+         }
+         td.pixelFormat = (MTLPixelFormat)501; // different reason must remain visible
+         id other = [g_dev newTextureWithDescriptor:td];
+         if (other) { ++accepted; [other release]; }
+         td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+         id good = [g_dev newTextureWithDescriptor:td];
+         CHECK(!accepted && good, "unsupported formats still return nil; supported creation survives: %u accepted", accepted);
+         [good release];
+      }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;
    }

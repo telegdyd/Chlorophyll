@@ -28,12 +28,15 @@
 #include <time.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "air_metal.h"
+#include "bg_refusal_log.h"
 
 // ---- the private bases (names only; their layouts are Metal's) -----------------------------------------------------
 @interface _MTLDevice : NSObject
@@ -94,6 +97,55 @@ bg_log(const char *fmt, ...)
       va_end(ap);
       fflush(tf);
    }
+}
+
+/* Only texture-creation diagnostics are aggregated. Results, fallback decisions
+ * and general errors are untouched. A separate lock avoids changing bg_lock's
+ * ownership; all call sites are outside it. */
+static void
+bg_refusal_output(void *unused, unsigned kind, const char *reason, uint64_t count)
+{
+   (void)unused;
+   const char *what = kind ? "no-copy texture" : "texture";
+   if (count) BG_LOG("%s refused: %s (suppressed %" PRIu64 " repeats)\n", what, reason, count);
+   else BG_LOG("%s refused: %s\n", what, reason);
+}
+
+static void
+bg_texture_refused(unsigned kind, const char *reason, MTLTextureDescriptor *d, int surface)
+{
+   static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+   static struct bg_refusal_log log;
+   static int callers = -1, captured500;
+   pthread_mutex_lock(&mutex);
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   uint64_t now = (uint64_t)ts.tv_sec * UINT64_C(1000000000) + ts.tv_nsec;
+   int first = bg_refusal_note(&log, kind, reason, now, bg_refusal_output, NULL);
+   if (callers < 0) {
+      const char *v = getenv("BGMTL_REFUSAL_CALLERS");
+      callers = v && !strcmp(v, "1");
+   }
+   /* One bounded stack per process, only with explicit diagnostics enabled.
+    * Module-relative PCs permit offline symbolication of private CA callers. */
+   if (first && callers && !captured500 && d.pixelFormat == 500) {
+      captured500 = 1;
+      BG_LOG("format 500 request: %lux%lu type %lu usage 0x%lx storage %lu %s; allocation still refused\n",
+             (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.textureType,
+             (unsigned long)d.usage, (unsigned long)d.storageMode, surface ? "iosurface" : "own memory");
+      void *pcs[16];
+      int n = backtrace(pcs, 16);
+      for (int i = 0; i < n; ++i) {
+         Dl_info info = {0};
+         if (dladdr(pcs[i], &info) && info.dli_fbase) {
+            const char *name = strrchr(info.dli_fname, '/');
+            BG_LOG("format 500 caller %d: %s+0x%lx %s\n", i, name ? name + 1 : info.dli_fname,
+                   (unsigned long)((uintptr_t)pcs[i] - (uintptr_t)info.dli_fbase),
+                   info.dli_sname ? info.dli_sname : "?");
+         }
+      }
+   }
+   pthread_mutex_unlock(&mutex);
 }
 
 // BGMTL_TRACE=1 or /private/var/tmp/bgmtl.trace: one line per command buffer, render pass, pipeline build and commit
@@ -790,7 +842,7 @@ bg_air_slice(NSData *d)
    if (!rc) [t bgCacheNoCopyLocked:p length:length];
    bg_unlock();
    if (rc != 0) {
-      BG_LOG("no-copy texture refused: %s\n", why);
+      bg_texture_refused(1, why, d, 0);
       [t release];
       return nil;
    }
@@ -2028,7 +2080,7 @@ bg_shadow_release(struct rwa_texture *sh)
       _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
       bg_unlock();
    }
-   if (!_tex) { BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
+   if (!_tex) { bg_texture_refused(0, why, d, surface != NULL); [self release]; return nil; }
    _owner = device;
    return self;
 }
