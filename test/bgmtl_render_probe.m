@@ -8,10 +8,12 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <dispatch/dispatch.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #ifdef BGMTL_REGISTERED_PROBE
 // jasmine: this executable links only Apple's frameworks, never libbgmtl.
@@ -1058,6 +1060,54 @@ main(int argc, char **argv)
          printf("  queued replay: %u/%u callbacks, %u/%u order/status errors, %u wrong values\n",
                 scheduled,completed,badScheduled,badCompleted,bad);
          [last release]; [target release]; [oversized release]; [pso release]; [pd release];
+      }
+      // P21: a failed CB waits behind an earlier completion callback. Register
+      // after Error is visible; it must not run inline ahead of that earlier CB.
+      printf("== P21 late error callback readiness\n");
+      if (getenv("BGMTL_SYNC") && !strcmp(getenv("BGMTL_SYNC"),"1")) {
+         CHECK(YES,"late retirement queue case requires asynchronous completion");
+      } else {
+         enum { N=8 };
+         id target=tex2d(MTLPixelFormatBGRA8Unorm,N,N,MTLTextureUsageRenderTarget);
+         dispatch_semaphore_t entered=dispatch_semaphore_create(0), gate=dispatch_semaphore_create(0);
+         __block unsigned released=0, calls=0, early=0;
+         MTLRenderPassDescriptor *d=[MTLRenderPassDescriptor renderPassDescriptor];
+         d.colorAttachments[0].texture=target; d.colorAttachments[0].loadAction=MTLLoadActionClear;
+         d.colorAttachments[0].storeAction=MTLStoreActionStore;
+         id first=[g_queue commandBuffer];
+         [[first renderCommandEncoderWithDescriptor:d] endEncoding];
+         [first addCompletedHandler:^(id b) {
+            dispatch_semaphore_signal(entered);
+            if (dispatch_semaphore_wait(gate,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC)))
+               __atomic_fetch_add(&early,1,__ATOMIC_RELAXED);
+         }];
+         [first commit];
+         BOOL firstEntered=dispatch_semaphore_wait(entered,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC))==0;
+         MTLRenderPipelineDescriptor *pd=[[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction=[rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction=[rlib newFunctionWithName:@"bg_fs_color"];
+         pd.colorAttachments[0].pixelFormat=MTLPixelFormatBGRA8Unorm;
+         id pso=[g_dev newRenderPipelineStateWithDescriptor:pd error:NULL];
+         id oversized=[g_dev newBufferWithLength:1<<20 options:0];
+         id failed=[g_queue commandBuffer], encoder=[failed renderCommandEncoderWithDescriptor:d];
+         [encoder setRenderPipelineState:pso]; [encoder setVertexBuffer:oversized offset:0 atIndex:0];
+         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [encoder endEncoding];
+         [failed commit];
+         for (unsigned n=0;[failed status]!=MTLCommandBufferStatusError && n<5000;n++) usleep(1000);
+         BOOL sawError=[failed status]==MTLCommandBufferStatusError;
+         [failed addCompletedHandler:^(id b) {
+            if (!__atomic_load_n(&released,__ATOMIC_ACQUIRE)) __atomic_fetch_add(&early,1,__ATOMIC_RELAXED);
+            __atomic_fetch_add(&calls,1,__ATOMIC_RELAXED);
+            [b addCompletedHandler:^(id again) { __atomic_fetch_add(&calls,1,__ATOMIC_RELAXED); }];
+         }];
+         BOOL held=__atomic_load_n(&calls,__ATOMIC_RELAXED)==0;
+         __atomic_store_n(&released,1,__ATOMIC_RELEASE); dispatch_semaphore_signal(gate);
+         [failed waitUntilCompleted]; [first waitUntilCompleted];
+         [failed addCompletedHandler:^(id b) { __atomic_fetch_add(&calls,1,__ATOMIC_RELAXED); }];
+         CHECK(firstEntered && sawError && held && calls==3 && !early && [failed status]==MTLCommandBufferStatusError,
+               "late error handler: gate/error/held %u/%u/%u, calls %u early %u",firstEntered,sawError,held,calls,early);
+         [target release]; [pso release]; [pd release]; [oversized release];
+         dispatch_release(entered); dispatch_release(gate);
       }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;

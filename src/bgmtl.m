@@ -396,6 +396,7 @@ bg_install_fallback(Class c)
    NSError *_error;
    NSInteger _status;
    NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
+   BOOL _scheduledDelivered, _completedDelivered; // delivery readiness is independent of public Error status
    dispatch_group_t _done;                                 // left when the completion (fence) has run: waitUntilCompleted
    dispatch_group_t _sched;                                // left when the replay has submitted: waitUntilScheduled
    uint64_t _tgen[8], _tepoch[8];                          // jasmine: render tickets opened for this command buffer
@@ -1176,23 +1177,10 @@ bg_air_slice(NSData *d)
 - (NSInteger)status { return _status; }
 - (NSError *)error { return _error; }
 - (void)enqueue {}
-- (void)addScheduledHandler:(void (^)(id))block
-{
-   if (!block) return;
-   BOOL now;
-   @synchronized (self) { now = _status >= 3; if (!now) [_scheduled addObject:[[block copy] autorelease]]; }   // delivered when submitted (compositor: when finished)
-   if (now) block(self);
-}
+#include "bg_callback_delivery.h"
 - (void)presentDrawable:(id)drawable { if (drawable) [_presents addObject:@[ drawable, @0.0, @0.0 ]]; }
 - (void)presentDrawable:(id)drawable atTime:(CFTimeInterval)t { if (drawable) [_presents addObject:@[ drawable, @(t), @0.0 ]]; }
 - (void)presentDrawable:(id)drawable afterMinimumDuration:(CFTimeInterval)d { if (drawable) [_presents addObject:@[ drawable, @0.0, @(d) ]]; }
-- (void)addCompletedHandler:(void (^)(id))block
-{
-   if (!block) return;
-   BOOL now;
-   @synchronized (self) { now = _status >= 4; if (!now) [_completed addObject:[[block copy] autorelease]]; }
-   if (now) block(self);
-}
 - (void)waitUntilScheduled
 {
    uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -1662,7 +1650,7 @@ bg_sync_commit(void)
    bg_unlock();
    dispatch_group_leave(_sched);
    if (!defer_scheduled)
-      for (void (^h)(id) in [self bgTake:_scheduled]) h(self);
+      [self bgDeliverHandlers:_scheduled completed:NO];
    if (bg_trace() || bg_sync_commit()) {
       if (bg_fence_wait(dev, fence, why, sizeof(why)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
@@ -1706,7 +1694,7 @@ bg_sync_commit(void)
 {
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    (void)dev;
-   for (void (^h)(id) in [self bgTake:_scheduled]) h(self);    // left here by the compositor's deferral (see commit)
+   [self bgDeliverHandlers:_scheduled completed:NO];    // left here by the compositor's deferral (see commit)
    // what the GPU wrote into an IOSurface becomes visible to the compositor before the drawable is presented
    // In the compositor (backboardd, BGMTL_BB) the IOSurfaces drawn into are its own framebuffers: the GPU writes DRAM, the display
    // reads DRAM, the CPU never touches them, so neither the cache clean nor the seed bump below is needed -- and each was a kernel
@@ -1841,14 +1829,7 @@ bg_sync_commit(void)
       }
    }
    [_presents removeAllObjects];
-   for (void (^h)(id) in [self bgTake:_completed]) h(self);
-}
-// The handlers of a list, taken out of it under the lock addScheduledHandler: / addCompletedHandler: use.
-- (NSArray *)bgTake:(NSMutableArray *)list
-{
-   NSArray *a;
-   @synchronized (self) { a = [[list copy] autorelease]; [list removeAllObjects]; }
-   return a;
+   [self bgDeliverHandlers:_completed completed:YES];
 }
 
 - (void)waitUntilCompleted
