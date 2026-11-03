@@ -2528,6 +2528,10 @@ bg_shadow_release(struct rwa_texture *sh)
 // writes into the buffer after the texture was made still show, as with Apple's aliasing.
 - (struct rwa_texture *)rwaTextureSampled
 {
+   /* The replay already holds bg_lock (recursive); taking it again here for every
+    * sampled texture was pure pthread traffic.  Same thread, same lock. */
+   if (bg_lock_depth)
+      return [self rwaTextureSampledLocked];
    bg_lock();
    struct rwa_texture *t = [self rwaTextureSampledLocked];
    bg_unlock();
@@ -2580,19 +2584,20 @@ bg_shadow_release(struct rwa_texture *sh)
 }
 - (struct rwa_texture *)rwaTexture
 {
+   const int held = bg_lock_depth != 0;
    if ((_ncBytes || _linSrc) && _tex) {
-      bg_lock();
+      if (!held) bg_lock();
       BOOL fresh = bg_refresh_epoch && _refreshEpoch == bg_refresh_epoch;
       _refreshEpoch = bg_refresh_epoch;
       if (fresh) [self bgUploadNote:_ncBytes ? 1 : 0 bytes:NULL length:0 status:1];
-      bg_unlock();
+      if (!held) bg_unlock();
       if (fresh) return _tex;
    }
    if (_ncBytes && _tex) {
-      bg_lock();
+      if (!held) bg_lock();
       if (bg_nc_cache_match(&_ncCache, _ncBytes)) {
          [self bgUploadNote:1 bytes:_ncBytes length:_ncLength status:2];
-         bg_unlock();
+         if (!held) bg_unlock();
          return _tex;
       }
       _ncCache.valid = 0;
@@ -2601,10 +2606,10 @@ bg_shadow_release(struct rwa_texture *sh)
       [self bgUploadNote:1 bytes:_ncBytes length:_ncLength status:rc];
       if (!rc) [self bgCacheNoCopyLocked:_ncBytes length:_ncLength];
       if (rc != 0) BG_LOG("no-copy texture refresh: %s\n", why);
-      bg_unlock();
+      if (!held) bg_unlock();
    }
    if (_linSrc && _tex) {
-      bg_lock();
+      if (!held) bg_lock();
       char why[256] = { 0 };
       const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
       const void *bytes = (const uint8_t *)bg_replay_bytes(_linSrc) + _linOff;
@@ -2621,7 +2626,7 @@ bg_shadow_release(struct rwa_texture *sh)
          rc = rwa_texture_write(_tex, 0, 0, o, sz, bytes, (unsigned)_linBpr, why, sizeof(why));
       [self bgUploadNote:0 bytes:bytes length:_linOff < length ? length - _linOff : 0 status:rc];
       if (rc != 0) BG_LOG("linear texture refresh: %s\n", why);
-      bg_unlock();
+      if (!held) bg_unlock();
    }
    return _tex;
 }
