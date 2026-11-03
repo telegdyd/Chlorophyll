@@ -200,22 +200,27 @@ static uint64_t bg_refresh_epoch, bg_refresh_epochs;
 // While the M8 timeline is armed a contended lock is timed and recorded with its call site (bg_tl_lock_wait).
 // site = file tag << 14 | source line; file 0 bgmtl.m, 1 bg_write_admission.h, 2 bg_work_admission.h.
 #define BG_TL_SITE(file, line) (((uint64_t)(file) << 14) | ((line) & 0x3fff))
+// This thread's hold count of the recursive context lock: deferred destroys drain only at depth 1, never inside a
+// replay or a transfer that already holds it (rwa_texture_destroy resets framebuffer state).
+static __thread unsigned bg_lock_depth;
 static void
 bg_lock_at(uint64_t site)
 {
    static pthread_once_t once = PTHREAD_ONCE_INIT;
    pthread_once(&once, bg_ctx_init);
-   if (__atomic_load_n(&bg_tl.state, __ATOMIC_RELAXED) == BG_TL_ARMED) {
-      if (!pthread_mutex_trylock(&bg_ctx_mutex)) return;
+   if (__atomic_load_n(&bg_tl.state, __ATOMIC_RELAXED) != BG_TL_ARMED) {
+      pthread_mutex_lock(&bg_ctx_mutex);
+   } else if (pthread_mutex_trylock(&bg_ctx_mutex)) {
       uint64_t t0 = mach_absolute_time();
       pthread_mutex_lock(&bg_ctx_mutex);
       bg_tl_lock_wait(site, t0);
-      return;
    }
-   pthread_mutex_lock(&bg_ctx_mutex);
+   bg_lock_depth++;
 }
 #define bg_lock() bg_lock_at(BG_TL_SITE(0, __LINE__))
-static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
+// The lock without waiting (the deallocs): 0 when held, as pthread_mutex_trylock.
+static int bg_trylock(void) { int rc = pthread_mutex_trylock(&bg_ctx_mutex); if (!rc) bg_lock_depth++; return rc; }
+static void bg_unlock(void) { bg_lock_depth--; pthread_mutex_unlock(&bg_ctx_mutex); }
 static void bg_defer_drain_locked(void);
 
 #include "bg_upload_profile.h"
@@ -285,6 +290,7 @@ bg_defer_note(const char *what)
 static void
 bg_defer_drain_locked(void)
 {
+   if (bg_lock_depth != 1) return;   // nested inside a replay or transfer: the next outermost holder drains
    uint64_t t0 = 0;
    if (__atomic_load_n(&bg_tl.state, __ATOMIC_ACQUIRE) == BG_TL_ARMED)
       t0 = mach_absolute_time();
@@ -1208,11 +1214,11 @@ bg_air_slice(NSData *d)
 - (void)dealloc
 {
    if (_buf) {
-      int lock_rc = pthread_mutex_trylock(&bg_ctx_mutex);
+      int lock_rc = bg_trylock();
       if (lock_rc == 0) {
          bg_defer_drain_locked();
          rwa_buffer_destroy(_buf);
-         pthread_mutex_unlock(&bg_ctx_mutex);
+         bg_unlock();
          _buf = NULL;
       } else if (lock_rc == EBUSY) {
          struct bg_defer_item *d = bg_defer_item_new();
@@ -2396,14 +2402,14 @@ bg_shadow_release(struct rwa_texture *sh)
 - (void)dealloc
 {
    if (_tex || _surfTex) {
-      int lock_rc = pthread_mutex_trylock(&bg_ctx_mutex);
+      int lock_rc = bg_trylock();
       if (lock_rc == 0) {
          /* Uncontended: the historical path, plus a chance to drain earlier deferrals. */
          bg_defer_drain_locked();
          bg_nc_cache_destroy(&_ncCache);
          if (_surfTex) { bg_shadow_release(_tex); rwa_texture_destroy(_surfTex); }
          else if (_tex) rwa_texture_destroy(_tex);
-         pthread_mutex_unlock(&bg_ctx_mutex);
+         bg_unlock();
       } else if (lock_rc == EBUSY) {
          struct bg_defer_item *d = bg_defer_item_new();
          if (d) {
