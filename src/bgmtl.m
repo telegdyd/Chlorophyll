@@ -256,13 +256,13 @@ static uint64_t
 bg_tl_pack_surface(unsigned pass, unsigned role, const struct rwa_dram_info *d,
                    unsigned load, unsigned store)
 {
-   return bg_tl_dram_pack_surface(pass, role, d->class, load, store,
+   return bg_tl_dram_pack_surface(pass, role, d->ubwc ? 0 : d->class, load, store,
                                   d->samples, d->bpp, d->width, d->height);
 }
 static uint64_t
 bg_tl_pack_blit(unsigned kind, const struct rwa_dram_info *src, const struct rwa_dram_info *dst)
 {
-   return bg_tl_dram_pack_blit(kind, src->class, dst->class);
+   return bg_tl_dram_pack_blit(kind, src->ubwc ? 0 : src->class, dst->ubwc ? 0 : dst->class);
 }
 static void
 bg_tl_pass_attach(uint64_t tlcb, unsigned pass, unsigned role, const struct rwa_dram_info *d,
@@ -2543,6 +2543,7 @@ bg_shadow_release(struct rwa_texture *sh)
       /* Screen-level allocation: freedreno takes fd_screen_lock around the batch-cache
        * invalidation and the BO cache has its own locks; tex_pool_take only takes its
        * mutex (expiry is in tex_pool_put under bg_lock).  No pipe_context here. */
+      _shape.ubwc_candidate = 1;
       _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
    }
    if (!_tex) { bg_texture_refused(0, why, d, surface != NULL); [self release]; return nil; }

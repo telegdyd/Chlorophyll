@@ -5,7 +5,7 @@
  *   pass_id:12 | role:2 | class:2 | load:2 | store:2 | samples:4 |
  *   bpp:8 | height:13 | width:13
  * role 0 colour, 1 depth/stencil, 2 sampled.  class 1 surface, 2 private,
- * 3 other.  b is bytes for one full base-level surface.
+ * 3 other, 0 UBWC-private.  b is bytes for one full base-level surface.
  *
  * a for BLIT: kind:4 | src_class:2 | dst_class:2; b is bytes.
  * PASS: a = pass id; b = draws:16 | attachments:8 (gmem bits reserved zero).

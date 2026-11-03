@@ -141,6 +141,8 @@ struct rwa_texture_shape {
 	unsigned mip_levels;
 	unsigned sample_count;
 	unsigned usage;
+	/* Own-memory render target, never an IOSurface or drawable shadow. */
+	unsigned ubwc_candidate;
 };
 
 struct rwa_texture *rwa_texture_create(struct rwa_device *device,

@@ -47,3 +47,12 @@ $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/inject/bgm
 $CC -dynamiclib -o "$OUT/bgmtl-inject.dylib" "$OUT/bgmtl.o" "$OUT/bgmtl_inject.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" \
     -framework Foundation -framework Metal -framework IOSurface -install_name /usr/local/lib/bgmtl/bgmtl-inject.dylib -Wl,-rpath,@loader_path
 ls -l "$OUT"
+
+# M9 UBWC: isolated pattern/readback probe and environment launcher.
+xcrun -sdk iphoneos metal -mios-version-min=18.0 -c "$HERE/test/bg_ubwc.metal" -o "$OUT/bg_ubwc.air"
+xcrun -sdk iphoneos metallib "$OUT/bg_ubwc.air" -o "$OUT/bg_ubwc.metallib"
+$CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations \
+    "$HERE/test/bgmtl_ubwc_probe.m" "$OUT/bgmtl.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" \
+    -framework Foundation -framework Metal -framework IOSurface \
+    -Wl,-rpath,@executable_path -o "$OUT/bgmtl_ubwc_probe"
+$CC -O2 -Wall -Werror "$HERE/test/bgmtl_ubwc_exec.c" -o "$OUT/bgmtl_ubwc_exec"

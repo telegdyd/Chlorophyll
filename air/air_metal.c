@@ -35,6 +35,7 @@
 #include "air_metal.h"
 #include "bg_argbuf_lock.h"
 #include "bg_read_unlocked.h"
+#include "bg_ubwc.h"
 
 /* Protects every read/mutation of rwa_argbuf_encoding / rwa_argbuf_slot lists.
  * Defined here because the rwa layer owns those records; bgmtl.m only needs the
@@ -368,6 +369,7 @@ struct rwa_texture {
     */
    bool shader_read, shader_write;
    bool imported;                   /* jasmine: the memory is an IOSurface's (rwa_texture_copy) */
+   bool ubwc_allocation;            /* stays true after a CPU map migrates to linear */
 
    /* Bergamota: the kernel's BO handle when the memory is an IOSurface (rwa_texture_from_surface), for the clean+invalidate that makes the GPU's
     * pixels visible to whoever composites the surface (rwa_texture_flush_surface) */
@@ -1481,6 +1483,22 @@ tex_pool_put(struct rwa_device *device, struct pipe_resource *res, struct pipe_s
    return kept;
 }
 
+static int ubwc_enabled;
+static void
+ubwc_init(void)
+{
+   const char *v = getenv("BGMTL_UBWC");
+   ubwc_enabled = v && !strcmp(v, "1");
+}
+
+static bool
+ubwc_on(void)
+{
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+   pthread_once(&once, ubwc_init);
+   return ubwc_enabled;
+}
+
 static struct rwa_texture *
 texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shape,
                  const struct rwa_surface_import *import, char *why, size_t why_size)
@@ -2000,6 +2018,26 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
    /* The layout is the allocation's business only: is_format_supported (above) refuses SAMPLER_VIEW | LINEAR, so the
     * flag asked there made every such texture a creation failure -- a nil MTLTexture, drawn black (c679731). A linear
     * allocation that is refused falls back to the tiled one. */
+   bool ubwc = !device->software && ubwc_on() &&
+      bg_ubwc_eligible(shape->pixel_format, shape->type, depth, array_size, mips,
+                       samples, shape->usage, shape->ubwc_candidate, false);
+   if (ubwc && device->screen->resource_create_with_modifiers) {
+      const uint64_t modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
+      texture->res = device->screen->resource_create_with_modifiers(device->screen,
+                                                                     &templ, &modifier, 1);
+      if (texture->res) {
+         texture->ubwc_allocation = fd_resource(texture->res)->layout.ubwc;
+      }
+      if (texture->ubwc_allocation) {
+         static uint64_t count, bytes;
+         uint64_t n = __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED);
+         uint64_t b = __atomic_add_fetch(&bytes, fd_resource(texture->res)->layout.size,
+                                       __ATOMIC_RELAXED);
+         if (!(n & (n - 1)))
+            fprintf(stderr, "bgair: UBWC created textures=%llu bytes=%llu\n",
+                    (unsigned long long)n, (unsigned long long)b);
+      }
+   }
    if (linear) {
       templ.bind |= PIPE_BIND_LINEAR;
       texture->res = tex_pool_take(device, &templ, &texture->view);
@@ -2008,7 +2046,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       if (!texture->res)
          templ.bind &= ~PIPE_BIND_LINEAR;
    }
-   if (!texture->res)
+   if (!texture->res && !ubwc)
       texture->res = tex_pool_take(device, &templ, &texture->view);
    if (!texture->res)
       texture->res = device->screen->resource_create(device->screen, &templ);
@@ -2234,7 +2272,8 @@ rwa_texture_destroy(struct rwa_texture *texture)
     * the moment the last reference went, which is the same trap delete_compute_state
     * below is about.
     */
-   if (!texture->surface_handle && texture->res &&
+   /* Keep explicit allocations out of the implicit pool after decompression too. */
+   if (!texture->surface_handle && !texture->ubwc_allocation && texture->res &&
        tex_pool_put(texture->device, texture->res, texture->view)) {
       free(texture);          /* the pool holds the resource's reference and the view now */
       return;
@@ -2406,6 +2445,17 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
    if (!texture_box(texture, level, layer, origin, size, &box, why, why_size) ||
        !caller_stride(texture, &box, stride, &row, why, why_size))
       return -1;
+
+   /* A CPU write can decompress the allocation in transfer_map. Drop the
+    * air view cache before that transition; fd5 also refreshes surviving
+    * views at emission (including views retained across a CPU read). */
+   if (!texture->device->software &&
+       fd_resource_ubwc_enabled(fd_resource(texture->res), level) && texture->view) {
+      unbind_tex_state(texture->device, texture->view);
+      texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
+      texture->view = NULL;
+      gs_invalidate(texture->device);
+   }
 
    /* The slice stride is the region's own rows, because the contract has one stride: a
     * caller handing over a 3D region hands over a packed stack of its rows, which is
