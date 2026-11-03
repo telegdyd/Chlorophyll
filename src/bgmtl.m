@@ -1822,7 +1822,13 @@ bg_sync_commit(void)
          // copied on the GPU, in order with the draws
       } else {
          // CPU blit on shared memory: everything dispatched so far must be done first
-         if (rwa_finish([dev rwa], why, sizeof(why)) != 0) { [self bgFailWith:[NSString stringWithUTF8String:why] code:3]; break; }
+         uint64_t wait0 = 0;
+         if (__atomic_load_n(&bg_tl.state, __ATOMIC_RELAXED) == BG_TL_ARMED)
+            wait0 = mach_absolute_time();
+         int wait_rc = rwa_finish([dev rwa], why, sizeof(why));
+         if (wait0)
+            bg_tl_event(BG_TL_REPLAY_WAIT, _tlcb, 1, mach_absolute_time() - wait0);
+         if (wait_rc != 0) { [self bgFailWith:[NSString stringWithUTF8String:why] code:3]; break; }
          if (w->kind == BG_WORK_TEXCOPY || w->kind == BG_WORK_BUF2TEX || w->kind == BG_WORK_TEX2BUF) {
             [self bgApplyTextureBlit:w];
          } else if (w->kind == BG_WORK_COPY)
@@ -1888,8 +1894,14 @@ bg_sync_commit(void)
    // failing this CB.
    uint64_t submit_errors0 = rwa_submit_failures();
    bg_tl_event(BG_TL_SUBMIT_BEGIN, _tlcb, 0, 0);
-   struct rwa_fence *fence = rwa_flush([dev rwa]);
+   struct rwa_fence *fence;
+   uint64_t seq0 = 0;
+   if (__atomic_load_n(&bg_tl.state, __ATOMIC_RELAXED) == BG_TL_ARMED)
+      seq0 = mach_absolute_time();
+   fence = rwa_flush([dev rwa]);
    uint32_t kseqno = fence ? rwa_fence_seqno([dev rwa], fence) : 0;
+   if (seq0)
+      bg_tl_event(BG_TL_REPLAY_WAIT, _tlcb, 2, mach_absolute_time() - seq0);
    BOOL submit_failed = fence && !kseqno && rwa_submit_failures() != submit_errors0;
    bg_tl_event(BG_TL_SUBMIT_END, _tlcb, kseqno, submit_failed ? 1 : 0);
    if (submit_failed)
