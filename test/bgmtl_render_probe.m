@@ -5,7 +5,8 @@
 // P23 is the display-suspended deferred-admission case; P24-P26 are the M7 closing cases:
 // see README-display-off-admission.md and README-m7-closing.md for their runners.
 // P1-P3 compute with textures (read, sample through a sampler, write), P4 a coloured triangle with analytic pixel checks,
-// P5 a textured quad (nearest sampler) against the texture magnified and flipped by Metal's rules.
+// P5 a textured quad (nearest sampler) against the texture magnified and flipped by Metal's rules. P27 is the
+// buffer-backed linear texture case (newLinearTextureWithDescriptor: aliasing the buffer's BO).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -139,6 +140,94 @@ static BOOL p23_wait_file(const char *path,unsigned milliseconds) {
       usleep(10000);
    }
    return access(path,F_OK)==0;
+}
+
+// P27: a buffer-backed linear texture. The tests use ordinary Metal API and check exact texels; the buffer-coupling
+// checks below are also what tells an aliasing implementation from a copying one.
+static id
+p27_linear(id buffer, MTLPixelFormat fmt, NSUInteger w, NSUInteger h, NSUInteger pitch,
+           NSUInteger offset, NSUInteger usage)
+{
+   MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                                                                width:w height:h mipmapped:NO];
+   d.usage = usage;
+   d.storageMode = MTLStorageModeShared;
+   return [buffer newLinearTextureWithDescriptor:d offset:offset bytesPerRow:pitch
+                                   bytesPerImage:pitch * h];
+}
+
+static void
+p27_pattern(uint8_t *p, unsigned w, unsigned h, size_t pitch, unsigned seed)
+{
+   memset(p, 0, pitch * h);
+   for (unsigned y = 0; y < h; y++)
+      for (unsigned x = 0; x < w; x++) {
+         uint8_t *q = p + (size_t)y * pitch + (size_t)x * 4;
+         q[0] = (uint8_t)(x * 7 + y * 3 + seed);
+         q[1] = (uint8_t)(x * 11 + y * 5 + seed);
+         q[2] = (uint8_t)(x * 13 + y * 7 + seed);
+         q[3] = 255;
+      }
+}
+
+// One full-screen textured quad into a same-size BGRA8 target; the source's bytes come back unchanged (nearest,
+// clamp, uv.y flips row h-1-y so source row r lands in target row h-1-r). out is w*h*4.
+static BOOL
+p27_sample(id texture, unsigned w, unsigned h, id pso, id vb, id smp, uint8_t *out)
+{
+   // The command buffer is autoreleased and holds one of the queue's 64 slots until it is freed: without a pool here the
+   // 64th command buffer of the suite blocks in -commandBuffer (as on Apple's Metal).
+   @autoreleasepool {
+   id rt = tex2d(MTLPixelFormatBGRA8Unorm, w, h, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+   if (!rt) return NO;
+   MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+   rp.colorAttachments[0].texture = rt;
+   rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+   rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+   rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+   id cb = [g_queue commandBuffer];
+   id e = [cb renderCommandEncoderWithDescriptor:rp];
+   [e setRenderPipelineState:pso];
+   [e setVertexBuffer:vb offset:0 atIndex:0];
+   [e setFragmentTexture:texture atIndex:0];
+   [e setFragmentSamplerState:smp atIndex:0];
+   [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+   [e endEncoding];
+   [cb commit];
+   [cb waitUntilCompleted];
+   BOOL ok = [cb status] == MTLCommandBufferStatusCompleted;
+   if (ok)
+      [rt getBytes:out bytesPerRow:(NSUInteger)w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+   [rt release];
+   return ok;
+   }
+}
+
+static void
+p27_check(BOOL ok, const char *name)
+{
+   printf("  %s %s\n", ok ? "PASS" : "FAIL", name);
+   if (ok) g_pass++; else g_fail++;
+}
+
+// The quad's uv.y flips the image: target row y is source row h-1-y.
+static BOOL
+p27_rows_match(const uint8_t *got, const uint8_t *src, unsigned w, unsigned h,
+               size_t src_pitch, size_t dst_pitch)
+{
+   for (unsigned y = 0; y < h; y++)
+      if (memcmp(got + (size_t)y * dst_pitch,
+                 src + (size_t)(h - 1 - y) * src_pitch, (size_t)w * 4))
+         return NO;
+   return YES;
+}
+
+static BOOL
+p27_near(const uint8_t *a, const uint8_t *b, size_t n)
+{
+   for (size_t i = 0; i < n; i++)
+      if (abs((int)a[i] - (int)b[i]) > 1) return NO;
+   return YES;
 }
 
 #ifndef BGMTL_REGISTERED_PROBE
@@ -1519,6 +1608,288 @@ main(int argc, char **argv)
          }
          [target1 release];if(surface1)CFRelease(surface1);
       }}
+      // ---- P27: -[MTLBuffer newLinearTextureWithDescriptor:...] aliases the buffer's GPU memory ----
+      printf("== P27 buffer-backed linear texture aliasing\n");
+      {
+         BOOL want_alias = !(getenv("BGMTL_LINEAR_ALIAS") && getenv("BGMTL_LINEAR_ALIAS")[0] == '0');
+         printf("  BGMTL_LINEAR_ALIAS -> expected %s\n", want_alias ? "alias" : "copy");
+         id big = [g_dev newBufferWithLength:12 * 1024 * 1024 options:0];
+         id small = [g_dev newBufferWithLength:64 * 1024 options:0];
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_tex"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         id pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:NULL];
+         static const float quad[6 * 8] = {
+            -1, -1, 0, 1, 1,1,1,1,   1, -1, 0, 1, 1,1,1,1,   -1, 1, 0, 1, 1,1,1,1,
+             1, -1, 0, 1, 1,1,1,1,   1,  1, 0, 1, 1,1,1,1,   -1, 1, 0, 1, 1,1,1,1 };
+         id vb = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+         MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+         sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+         id smp = [g_dev newSamplerStateWithDescriptor:sd];
+         [sd release];
+         [pd release];
+         if (!big || !small || !pso || !vb || !smp) {
+            p27_check(NO, "setup (12 MB buffer, pipeline, sampler)");
+         } else {
+            enum { LW = 128, LH = 64, LP = 512 };
+            uint8_t *pat = malloc((size_t)LP * LH);
+            uint8_t *got = malloc((size_t)LW * LH * 4);
+            if (!pat || !got) {
+               p27_check(NO, "pattern allocation");
+            } else {
+               p27_pattern(pat, LW, LH, LP, 3);
+               memcpy([big contents], pat, (size_t)LP * LH);
+               id t0 = p27_linear(big, MTLPixelFormatBGRA8Unorm, LW, LH, LP, 0, MTLTextureUsageShaderRead);
+               BOOL ok = t0 && p27_sample(t0, LW, LH, pso, vb, smp, got) &&
+                         p27_rows_match(got, pat, LW, LH, LP, (size_t)LW * 4);
+               p27_check(ok, "BGRA8 128x64 pitch 512 offset 0 samples exact texels");
+               [t0 release];
+
+               p27_pattern(pat, LW, LH, LP, 17);
+               memcpy((uint8_t *)[big contents] + 64, pat, (size_t)LP * LH);
+               id t1 = p27_linear(big, MTLPixelFormatBGRA8Unorm, LW, LH, LP, 64, MTLTextureUsageShaderRead);
+               ok = t1 && p27_sample(t1, LW, LH, pso, vb, smp, got) &&
+                    p27_rows_match(got, pat, LW, LH, LP, (size_t)LW * 4);
+               p27_check(ok, "BGRA8 128x64 pitch 512 offset 64 samples exact texels");
+
+               // (b) the CPU rewrites the buffer after the first CB: the next sample must show the new bytes.
+               p27_pattern(pat, LW, LH, LP, 99);
+               memcpy((uint8_t *)[big contents] + 64, pat, (size_t)LP * LH);
+               ok = t1 && p27_sample(t1, LW, LH, pso, vb, smp, got) &&
+                    p27_rows_match(got, pat, LW, LH, LP, (size_t)LW * 4);
+               p27_check(ok, "CPU rewrite after a completed CB is sampled");
+               [t1 release];
+            }
+            free(pat); free(got);
+
+            // (c) a render pass into the linear texture: the clear must land in the buffer's texels, and only there.
+            enum { RW = 64, RH = 64, RP = 256, ROFF = 1024 * 1024 };
+            uint8_t *area = (uint8_t *)[big contents] + ROFF;
+            memset(area, 0xaa, (size_t)RP * RH);
+            id tr = p27_linear(big, MTLPixelFormatBGRA8Unorm, RW, RH, RP, ROFF,
+                               MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+            BOOL rok = tr != nil;
+            if (rok) {
+               MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+               rp.colorAttachments[0].texture = tr;
+               rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+               rp.colorAttachments[0].clearColor = MTLClearColorMake(0.25, 0.5, 0.75, 1.0);
+               rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+               id cb = [g_queue commandBuffer];
+               id e = [cb renderCommandEncoderWithDescriptor:rp];
+               [e endEncoding];
+               [cb commit];
+               [cb waitUntilCompleted];
+               rok = [cb status] == MTLCommandBufferStatusCompleted;
+            }
+            const uint8_t want[4] = { 191, 128, 64, 255 };   // BGRA of (0.25, 0.5, 0.75, 1)
+            if (rok) {
+               // getBytes reads _tex directly; p27_sample would take the copy path's refresh from the buffer and
+               // hide the clear, which is exactly the difference this case checks.
+               uint8_t *rgba = malloc((size_t)RW * RH * 4);
+               rok = rgba != NULL;
+               if (rok) {
+                  [tr getBytes:rgba bytesPerRow:RW * 4 fromRegion:MTLRegionMake2D(0, 0, RW, RH) mipmapLevel:0];
+                  for (unsigned i = 0; i < RW * RH; i++)
+                     if (!p27_near(rgba + (size_t)i * 4, want, 4)) { rok = NO; break; }
+               }
+               free(rgba);
+            }
+            if (!rok) {
+               p27_check(NO, "render pass into a buffer-backed texture");
+            } else if (want_alias) {
+               BOOL ok = YES;
+               for (unsigned y = 0; y < RH && ok; y++)
+                  for (unsigned x = 0; x < RW; x++)
+                     if (!p27_near(area + (size_t)y * RP + (size_t)x * 4, want, 4)) { ok = NO; break; }
+               p27_check(ok, "render pass into alias writes the buffer texels");
+            } else {
+               BOOL ok = YES;
+               for (size_t i = 0; i < (size_t)RP * RH; i++)
+                  if (area[i] != 0xaa) { ok = NO; break; }
+               p27_check(ok, "copy path: render pass leaves the buffer alone");
+            }
+            [tr release];
+
+            // (d) replaceRegion writes the alias's memory, which is the buffer's. PW < PP/4 leaves row padding in the
+            // buffer that the write must not touch.
+            enum { PW = 61, PH = 64, PP = 256, POFF = 2 * 1024 * 1024 };
+            uint8_t *area2 = (uint8_t *)[big contents] + POFF;
+            memset(area2, 0x11, (size_t)PP * PH);
+            id tw = p27_linear(big, MTLPixelFormatBGRA8Unorm, PW, PH, PP, POFF, MTLTextureUsageShaderRead);
+            uint8_t *pat2 = malloc((size_t)PW * PH * 4);
+            uint8_t *got2 = malloc((size_t)PW * PH * 4);
+            BOOL wok = tw && pat2 && got2;
+            if (wok) {
+               p27_pattern(pat2, PW, PH, PW * 4, 41);
+               [tw replaceRegion:MTLRegionMake2D(0, 0, PW, PH) mipmapLevel:0 withBytes:pat2
+                    bytesPerRow:PW * 4 bytesPerImage:PW * PH * 4];
+               [tw getBytes:got2 bytesPerRow:PW * 4 bytesPerImage:PW * PH * 4
+                fromRegion:MTLRegionMake2D(0, 0, PW, PH) mipmapLevel:0 slice:0];
+               wok = !memcmp(got2, pat2, (size_t)PW * PH * 4);
+            }
+            p27_check(wok, "replaceRegion is visible to the texture");
+            if (wok) {
+               BOOL ok = YES;
+               for (unsigned y = 0; y < PH && ok; y++) {
+                  if (want_alias) {
+                     if (memcmp(area2 + (size_t)y * PP, pat2 + (size_t)y * PW * 4, (size_t)PW * 4)) ok = NO;
+                     for (unsigned x = PW * 4; x < PP; x++) if (area2[(size_t)y * PP + x] != 0x11) ok = NO;
+                  } else {
+                     for (unsigned x = 0; x < PP; x++) if (area2[(size_t)y * PP + x] != 0x11) ok = NO;
+                  }
+               }
+               p27_check(ok, want_alias ? "replaceRegion writes the alias buffer"
+                                        : "copy path: replaceRegion leaves the buffer alone");
+            }
+            free(pat2); free(got2); [tw release];
+
+            // (e) A8Unorm at 33x24 with a 64-byte pitch, over the small buffer (which may be heap-suballocated and so
+            // keep the copy path) and over the big one (alias if the pitch is taken, otherwise a clean copy fallback).
+            enum { AW = 33, AH = 24, AP = 64 };
+            uint8_t *apat = malloc((size_t)AP * AH);
+            uint8_t *agot = malloc((size_t)AW * AH * 4);
+            BOOL aok = apat && agot;
+            if (aok) {
+               memset(apat, 0, (size_t)AP * AH);
+               for (unsigned y = 0; y < AH; y++)
+                  for (unsigned x = 0; x < AW; x++) apat[(size_t)y * AP + x] = (uint8_t)(x * 9 + y * 17 + 7);
+               memset([small contents], 0, (size_t)AP * AH);
+               memcpy([small contents], apat, (size_t)AP * AH);
+               id ta = p27_linear(small, MTLPixelFormatA8Unorm, AW, AH, AP, 0, MTLTextureUsageShaderRead);
+               aok = ta && p27_sample(ta, AW, AH, pso, vb, smp, agot);
+               if (aok)
+                  for (unsigned y = 0; y < AH && aok; y++)
+                     for (unsigned x = 0; x < AW; x++)
+                        if (agot[((size_t)y * AW + x) * 4 + 3] != apat[(size_t)(AH - 1 - y) * AP + x]) { aok = NO; break; }
+               [ta release];
+            }
+            p27_check(aok, "A8Unorm 33x24 pitch 64 samples exact texels");
+            free(apat); free(agot);
+
+            // The small buffer's BGRA8 path: a sub-4 MB buffer may be heap-suballocated, in which case this is the
+            // copy fallback; either way the sampled bytes must be exact.
+            enum { SW = 64, SH = 32, SP = 256, SOFF = 8192 };
+            uint8_t *spat = malloc((size_t)SP * SH);
+            uint8_t *sgot = malloc((size_t)SW * SH * 4);
+            BOOL sok = spat && sgot;
+            if (sok) {
+               p27_pattern(spat, SW, SH, SP, 71);
+               memcpy((uint8_t *)[small contents] + SOFF, spat, (size_t)SP * SH);
+               id ts = p27_linear(small, MTLPixelFormatBGRA8Unorm, SW, SH, SP, SOFF, MTLTextureUsageShaderRead);
+               sok = ts && p27_sample(ts, SW, SH, pso, vb, smp, sgot) &&
+                     p27_rows_match(sgot, spat, SW, SH, SP, (size_t)SW * 4);
+               [ts release];
+            }
+            p27_check(sok, "small buffer BGRA8 64x32 pitch 256 samples exact texels");
+            free(spat); free(sgot);
+
+            uint8_t *area3 = (uint8_t *)[big contents] + 3 * 1024 * 1024;
+            memset(area3, 0, (size_t)AP * AH);
+            id ta2 = p27_linear(big, MTLPixelFormatA8Unorm, AW, AH, AP, 3 * 1024 * 1024,
+                                MTLTextureUsageShaderRead);
+            uint8_t *apat2 = malloc((size_t)AP * AH);
+            uint8_t *agot2 = malloc((size_t)AP * AH);
+            BOOL a2ok = ta2 && apat2 && agot2;
+            if (a2ok) {
+               memset(apat2, 0, (size_t)AP * AH);
+               memset(agot2, 0, (size_t)AP * AH);
+               for (unsigned y = 0; y < AH; y++)
+                  for (unsigned x = 0; x < AW; x++) apat2[(size_t)y * AP + x] = (uint8_t)(x * 5 + y * 3 + 101);
+               [ta2 replaceRegion:MTLRegionMake2D(0, 0, AW, AH) mipmapLevel:0 withBytes:apat2
+                    bytesPerRow:AP bytesPerImage:AP * AH];
+               [ta2 getBytes:agot2 bytesPerRow:AP bytesPerImage:AP * AH
+                fromRegion:MTLRegionMake2D(0, 0, AW, AH) mipmapLevel:0 slice:0];
+               a2ok = !memcmp(agot2, apat2, (size_t)AP * AH);
+            }
+            p27_check(a2ok, "A8 replaceRegion is visible to the texture");
+            if (a2ok) {
+               BOOL aliased = YES, untouched = YES;
+               for (unsigned y = 0; y < AH; y++)
+                  for (unsigned x = 0; x < AP; x++) {
+                     uint8_t b = area3[(size_t)y * AP + x];
+                     if (b != (x < AW ? apat2[(size_t)y * AP + x] : 0)) aliased = NO;
+                     if (b != 0) untouched = NO;
+                  }
+               if (aliased)
+                  p27_check(YES, "A8 33x24 pitch 64 aliases the buffer");
+               else if (untouched)
+                  // The pitch may be refused cleanly; that is the copy fallback, not a failure.
+                  p27_check(YES, want_alias ? "A8 33x24 pitch 64 kept the copy path (clean refusal)"
+                                            : "copy path: A8 replaceRegion leaves the buffer alone");
+               else
+                  p27_check(NO, "A8 33x24 pitch 64 buffer contents are neither alias nor untouched");
+            }
+            free(apat2); free(agot2); [ta2 release];
+
+            // The two compositor shapes: 1326x1160 BGRA8 at the 5312-byte pitch the device inventory measured.
+            enum { WW = 1326, WH = 1160, WP = 5312 };
+            size_t wsz = (size_t)WP * WH;
+            uint8_t *wpat = malloc(wsz);
+            uint8_t *wgot = malloc((size_t)WW * WH * 4);
+            BOOL wok2 = wpat && wgot;
+            if (wok2) {
+               p27_pattern(wpat, WW, WH, WP, 5);
+               memcpy([big contents], wpat, wsz);
+               id tw2 = p27_linear(big, MTLPixelFormatBGRA8Unorm, WW, WH, WP, 0, MTLTextureUsageShaderRead);
+               wok2 = tw2 && p27_sample(tw2, WW, WH, pso, vb, smp, wgot) &&
+                      p27_rows_match(wgot, wpat, WW, WH, WP, (size_t)WW * 4);
+               p27_check(wok2, "BGRA8 1326x1160 pitch 5312 samples exact texels");
+               // A 1x1 replace at a row and column that are not zero proves the big texture aliases too.
+               if (wok2 && want_alias) {
+                  const uint8_t one[4] = { 7, 8, 9, 10 };
+                  [tw2 replaceRegion:MTLRegionMake2D(1, 1, 1, 1) mipmapLevel:0 withBytes:one
+                        bytesPerRow:4 bytesPerImage:4];
+                  uint8_t *at = (uint8_t *)[big contents] + (size_t)WP + 4;
+                  p27_check(!memcmp(at, one, 4), "BGRA8 1326 case replaceRegion writes the buffer");
+               }
+               [tw2 release];
+            } else {
+               p27_check(NO, "1326x1160 allocation");
+            }
+
+            // M10: CoreAnimation's layer images are newBufferWithBytesNoCopy over its own pages (IOSurfaceAddress wrap).
+            // Sample, rewrite on the CPU after the CB completed, sample again: the new bytes must show. Fresh pages per
+            // case (0, 1); case 2 wraps the pages of case 1 again after that wrap was released (allocator reuse).
+            if (wpat && wgot) {
+               enum { NH = 200 };   /* 1326 wide at the measured pitch; 200 rows keep the suite inside sweetd 75 s */
+               size_t nsz = (size_t)WP * NH, psz = round_page(nsz + 64);
+               vm_address_t keep = 0, first = 0;
+               for (unsigned c = 0; c < 3; c++) {
+                  unsigned off = c == 0 ? 0 : 64;
+                  vm_address_t pages = keep;
+                  if (!pages && vm_allocate(mach_task_self(), &pages, psz, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+                     p27_check(NO, "no-copy page allocation"); break;
+                  }
+                  printf("  no-copy case %u: offset %u, %s pages\n", c, off, c == 2 ? "re-wrapped" : "fresh");
+                  fflush(stdout);
+                  id nb = [g_dev newBufferWithBytesNoCopy:(void *)pages length:psz options:0 deallocator:nil];
+                  p27_pattern(wpat, WW, NH, WP, 21 + c);
+                  memcpy((uint8_t *)pages + off, wpat, nsz);
+                  id tn = nb ? p27_linear(nb, MTLPixelFormatBGRA8Unorm, WW, NH, WP, off, MTLTextureUsageShaderRead) : nil;
+                  BOOL nok = tn && p27_sample(tn, WW, NH, pso, vb, smp, wgot) &&
+                             p27_rows_match(wgot, wpat, WW, NH, WP, (size_t)WW * 4);
+                  p27_check(nok, "no-copy BGRA8 1326x200 pitch 5312 samples exact texels");
+                  printf("  no-copy case %u: CPU rewrite\n", c); fflush(stdout);
+                  p27_pattern(wpat, WW, NH, WP, 77 + c);
+                  memcpy((uint8_t *)pages + off, wpat, nsz);
+                  printf("  no-copy case %u: sample again\n", c); fflush(stdout);
+                  nok = tn && p27_sample(tn, WW, NH, pso, vb, smp, wgot) &&
+                        p27_rows_match(wgot, wpat, WW, NH, WP, (size_t)WW * 4);
+                  p27_check(nok, "no-copy CPU rewrite after a completed CB is sampled");
+                  [tn release]; [nb release];
+                  if (c == 1) keep = pages; else if (c == 0) first = pages;
+               }
+               /* the pages go back after the loop: case 2 reuses case 1's */
+               if (first) vm_deallocate(mach_task_self(), first, psz);
+               if (keep) vm_deallocate(mach_task_self(), keep, psz);
+            }
+            free(wpat); free(wgot);
+         }
+         [big release]; [small release]; [pso release]; [vb release]; [smp release];
+      }
 #endif
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;

@@ -190,6 +190,35 @@ struct rwa_texture *rwa_texture_from_surface(struct rwa_device *device,
 					     unsigned row_bytes, char *why, size_t why_size);
 
 /*
+ * A linear 2D texture over a buffer this library allocated, sharing that buffer's
+ * BO: the same memory the processor writes through -[MTLBuffer contents], so a
+ * change to either is a change to both and no refresh copy is needed.
+ *
+ * This is what -[MTLBuffer newLinearTextureWithDescriptor:...] is on Apple's
+ * devices. The buffer must own its memory (not be a heap sub-allocation, which
+ * has no handle), and the region must fit inside it.
+ *
+ * Narrower than rwa_texture_create by everything an imported row-major image
+ * cannot be: one mip level, one slice, one sample, no compression, a plain 2D
+ * target, and no depth/stencil aspect whose layout is not the buffer's bytes.
+ * The pitch and offset are the caller's, as Metal's are, and both must be
+ * multiples of 64 (what this GPU's import accepts, freedreno_resource.c
+ * fd_layout_resource_for_handle). Anything else is NULL and a sentence, and the
+ * caller keeps its copy path.
+ *
+ * The import sets is_shared, but in this freedreno tree that does not by itself
+ * stop the transfer-map shadow path, so the alias write path maps
+ * PIPE_MAP_UNSYNCHRONIZED and the resource is never exported. Unlike
+ * rwa_texture_from_surface this does NOT set `imported` or `surface_handle`
+ * (there is no IOSurface and no kernel surface sync).
+ */
+struct rwa_texture *rwa_texture_create_over_buffer(struct rwa_device *device,
+						   const struct rwa_texture_shape *shape,
+						   struct rwa_buffer *buffer,
+						   size_t offset, size_t bytes_per_row,
+						   char *why, size_t why_size);
+
+/*
  * Pixels in and out, which is -replaceRegion:... and -getBytes:... on the Metal side. The
  * region is given in texels and `stride` in bytes per row of the caller's memory; a stride
  * of 0 means tightly packed. 0, or -1 and a sentence.

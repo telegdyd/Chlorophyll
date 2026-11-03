@@ -294,6 +294,63 @@ bg_shadow_requested(void)
    return bg_shadow_on == 1;
 }
 
+// jasmine: -[BGMTLBuffer newLinearTextureWithDescriptor:...] aliases the buffer's BO when the driver will take it,
+// instead of copying the buffer into a private texture at every refresh. BGMTL_LINEAR_ALIAS=0 keeps the copy path.
+static int
+bg_linear_alias(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("BGMTL_LINEAR_ALIAS");
+      on = !(v && v[0] == '0');
+   }
+   return on;
+}
+// One line for the first alias, then one per distinct geometry (bounded): the two big CA buffer textures have to be
+// visible in the device log without a line per texture.
+static void
+bg_alias_success(MTLTextureDescriptor *d, NSUInteger offset, NSUInteger bpr)
+{
+   static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+   static struct { unsigned long w, h, fmt; } seen[16];
+   static unsigned n;
+   pthread_mutex_lock(&m);
+   BOOL fresh = NO;
+   unsigned i;
+   for (i = 0; i < n; i++)
+      if (seen[i].w == (unsigned long)d.width && seen[i].h == (unsigned long)d.height &&
+          seen[i].fmt == (unsigned long)d.pixelFormat) break;
+   if (i == n && n < 16) {
+      seen[n].w = (unsigned long)d.width; seen[n].h = (unsigned long)d.height;
+      seen[n].fmt = (unsigned long)d.pixelFormat; n++;
+      fresh = YES;
+   }
+   if (fresh)
+      BG_LOG("linear alias: %lux%lu fmt %lu pitch %lu offset %lu -> buffer BO\n",
+             (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat,
+             (unsigned long)bpr, (unsigned long)offset);
+   pthread_mutex_unlock(&m);
+}
+// Same one-shot rule for refusals, keyed by the driver's reason. The table is small on purpose: a reason that keeps
+// repeating is the same reason.
+static void
+bg_alias_refused(MTLTextureDescriptor *d, NSUInteger offset, NSUInteger bpr, const char *why)
+{
+   static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+   static char seen[16][192];
+   static unsigned n;
+   pthread_mutex_lock(&m);
+   unsigned i;
+   for (i = 0; i < n; i++) if (!strcmp(seen[i], why)) break;
+   if (i == n && n < 16) {
+      snprintf(seen[n], sizeof(seen[n]), "%s", why); n++;
+      BG_LOG("linear alias refused: %lux%lu fmt %lu pitch %lu offset %lu: %s\n",
+             (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat,
+             (unsigned long)bpr, (unsigned long)offset, why);
+   }
+   pthread_mutex_unlock(&m);
+}
+
 #include "bg_upload_profile.h"
 #include "bg_nocopy_cache.h"
 #include "bg_defer_queue.h"
@@ -667,6 +724,8 @@ bg_install_fallback(Class c)
    BOOL _copied;
    @public
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
+   id _aliasBuf;         // jasmine: the buffer this texture's memory IS, when it aliases the buffer's BO (retained)
+   BOOL _wrapped;        // M10: _surface is an IOSurfaceAddress wrap of a no-copy buffer's pages (cleaned per epoch)
    NSUInteger _linOff, _linBpr;
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
    void *_ncCaller;      // the caller's pointer itself (for its deallocator); _ncBytes may be our alias (bg_pin)
@@ -679,9 +738,12 @@ bg_install_fallback(Class c)
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
+                         buffer:(BGMTLBuffer *)buffer offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr;
 - (void)bgUploadNote:(unsigned)kind bytes:(const void *)bytes length:(size_t)length status:(int)status;
 - (void)bgCacheNoCopyLocked:(const void *)bytes length:(size_t)length;
 - (void)bgInvalidateUploadCache;
+- (BOOL)bgImportsSurface;   // the memory is the IOSurface itself (not a copy of it)
 - (struct rwa_texture *)rwaTexture;
 - (struct rwa_texture *)rwaAdmissionTexture;
 - (void)bgShadowLocked;   // jasmine: compositor render targets over an IOSurface draw in a shared shadow
@@ -1344,6 +1406,60 @@ static void *bg_replay_bytes(id b) { return [b isKindOfClass:[BGMTLBuffer class]
 - (id)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
 {
    (void)bpi;
+   // A buffer this library allocated can be sampled in place: same BO, no copy. A newBufferWithBytesNoCopy buffer keeps
+   // the copy path, because its GPU memory is refreshed from the caller's bytes in -rwaBuffer and is not the caller's map.
+   if (bg_linear_alias() && !_mapped && _buf && d && d.textureType == MTLTextureType2D &&
+       d.mipmapLevelCount <= 1 && d.arrayLength <= 1 && d.depth <= 1 && d.sampleCount <= 1) {
+      BGMTLTexture *a = [[BGMTLTexture alloc] initWithBGDevice:_owner descriptor:d buffer:self offset:offset bytesPerRow:bpr];
+      if (a) return a;
+   }
+   // M10: a newBufferWithBytesNoCopy buffer (CoreAnimation's layer images, up to 1326x1326 BGRA8, were copied into a
+   // private texture at nearly every command buffer): wrap the bytes in an IOSurfaceAddress surface (the kernel's
+   // client-memory wrap) and import it, so the GPU samples the pages themselves. The wrap is over our pinned alias of
+   // the caller's pages (bgReplayBytes), which stays mapped while the texture retains this buffer. Cleaned once per
+   // refresh epoch in -rwaTextureSampledLocked: the CPU writes these pages without an IOSurface lock, so no seed moves.
+   if (bg_linear_alias() && _mapped && d && d.textureType == MTLTextureType2D && d.mipmapLevelCount <= 1 &&
+       d.arrayLength <= 1 && d.depth <= 1 && d.sampleCount <= 1 && bpr % 64 == 0 && offset % 64 == 0 &&
+       !(d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) {
+      OSType pf = 0; unsigned bpe = 0;
+      switch (d.pixelFormat) {
+      case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB: pf = 'BGRA'; bpe = 4; break;
+      case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: pf = 'RGBA'; bpe = 4; break;
+      case MTLPixelFormatA8Unorm: case MTLPixelFormatR8Unorm: pf = 'L008'; bpe = 1; break;
+      default: break;
+      }
+      size_t h = d.height ? d.height : 1, need = (h - 1) * bpr + (size_t)d.width * bpe;
+      if (pf && bpr >= (size_t)d.width * bpe && offset <= _length && need <= _length - offset) {
+         uintptr_t base = (uintptr_t)[self bgReplayBytes] + offset;
+         NSDictionary *props = @{ @"IOSurfaceAddress": @((unsigned long long)base),
+                                  @"IOSurfaceAllocSize": @((unsigned long long)(bpr * h)),
+                                  @"IOSurfaceWidth": @(d.width), @"IOSurfaceHeight": @(h),
+                                  @"IOSurfaceBytesPerRow": @(bpr), @"IOSurfaceBytesPerElement": @(bpe),
+                                  @"IOSurfacePixelFormat": @(pf) };
+         IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+         BGMTLTexture *w = nil;
+         if (s) {
+            w = [[BGMTLTexture alloc] initWithBGDevice:_owner descriptor:d iosurface:(void *)s plane:0];
+            CFRelease(s);
+         }
+         if (w && [w bgImportsSurface]) {
+            w->_aliasBuf = [self retain];
+            w->_wrapped = YES;
+            static int logged;
+            if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+               BG_LOG("linear wrap: %lux%lu fmt %lu pitch %lu offset %lu -> IOSurfaceAddress import\n",
+                      (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat,
+                      (unsigned long)bpr, (unsigned long)offset);
+            return w;
+         }
+         [w release];
+         static int refused;
+         if (__atomic_fetch_add(&refused, 1, __ATOMIC_RELAXED) < 4)
+            BG_LOG("linear wrap refused: %lux%lu fmt %lu pitch %lu offset %lu (surface %s)\n",
+                   (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat,
+                   (unsigned long)bpr, (unsigned long)offset, s ? "made, import refused" : "not made");
+      }
+   }
    BGMTLTexture *t = [[BGMTLTexture alloc] initWithBGDevice:_owner descriptor:d];
    if (!t) return nil;
    t->_linSrc = [self retain];
@@ -2487,6 +2603,21 @@ bg_shadow_release(struct rwa_texture *sh)
 }
 
 // ---- texture / sampler / render pipeline ----------------------------------------------------------------------------
+static void
+bg_texture_shape_from_descriptor(struct rwa_texture_shape *shape, MTLTextureDescriptor *d)
+{
+   shape->pixel_format = (unsigned)[d pixelFormat];
+   shape->type = (unsigned)[d textureType];
+   shape->width = (unsigned)[d width];
+   shape->height = (unsigned)[d height];
+   shape->depth = (unsigned)[d depth];
+   shape->array_length = (unsigned)[d arrayLength];
+   shape->mip_levels = (unsigned)[d mipmapLevelCount];
+   shape->sample_count = (unsigned)[d sampleCount];
+   shape->usage = (unsigned)[d usage];
+   shape->ubwc_candidate = 0;
+}
+
 @implementation BGMTLTexture
 + (void)load { ensure_protocol(self, "MTLTexture"); ensure_protocol(self, "MTLTextureImplementation"); }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
@@ -2501,15 +2632,7 @@ bg_shadow_release(struct rwa_texture *sh)
    self = [super init];
    if (!self) return nil;
    if (![device rwa] || !d) { [self release]; return nil; }
-   _shape.pixel_format = (unsigned)[d pixelFormat];
-   _shape.type = (unsigned)[d textureType];
-   _shape.width = (unsigned)[d width];
-   _shape.height = (unsigned)[d height];
-   _shape.depth = (unsigned)[d depth];
-   _shape.array_length = (unsigned)[d arrayLength];
-   _shape.mip_levels = (unsigned)[d mipmapLevelCount];
-   _shape.sample_count = (unsigned)[d sampleCount];
-   _shape.usage = (unsigned)[d usage];
+   bg_texture_shape_from_descriptor(&_shape, d);
    char why[512] = { 0 };
    if (surface) {
       _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
@@ -2562,6 +2685,31 @@ bg_shadow_release(struct rwa_texture *sh)
    _owner = device;
    return self;
 }
+// jasmine: the linear texture metal promises over a buffer: the buffer's BO, not a copy of its bytes. Returns nil with
+// the driver's reason (bg_alias_refused) when the import cannot share that BO, and the caller keeps the copy path.
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
+                         buffer:(BGMTLBuffer *)buffer offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr
+{
+   self = [super init];
+   if (!self) return nil;
+   if (![device rwa] || !d || !buffer) { [self release]; return nil; }
+   bg_texture_shape_from_descriptor(&_shape, d);
+   _shape.ubwc_candidate = 0;   // a buffer's rows are the caller's, never a UBWC allocation
+   char why[512] = { 0 };
+   struct rwa_buffer *buf = [buffer rwaBuffer];
+   bg_lock();
+   _tex = rwa_texture_create_over_buffer([device rwa], &_shape, buf, offset, bpr, why, sizeof(why));
+   bg_unlock();
+   if (!_tex) {
+      bg_alias_refused(d, offset, bpr, why[0] ? why : "the driver refused the import");
+      [self release];
+      return nil;
+   }
+   bg_alias_success(d, offset, bpr);
+   _aliasBuf = [buffer retain];
+   _owner = device;
+   return self;
+}
 - (void)dealloc
 {
    if (_tex || _surfTex) {
@@ -2606,6 +2754,7 @@ bg_shadow_release(struct rwa_texture *sh)
    if (_surface) CFRelease(_surface);
    if (_copySurface) CFRelease(_copySurface);
    [_linSrc release];
+   [_aliasBuf release];
    bg_unpin(&_ncPin);
    if (_ncDealloc) { _ncDealloc(_ncCaller, _ncLength); Block_release(_ncDealloc); }
    [super dealloc];
@@ -2650,7 +2799,8 @@ bg_shadow_release(struct rwa_texture *sh)
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (BOOL)isDrawable { return _surface != NULL; }
 // A linear texture over a buffer reads the buffer's current bytes each time it is handed to the GPU (at commit), so CPU
-// writes into the buffer after the texture was made still show, as with Apple's aliasing.
+// writes into the buffer after the texture was made still show, as with Apple's aliasing. A buffer alias of the BO
+// has _linSrc nil and needs no refresh at all.
 - (struct rwa_texture *)rwaTextureSampled
 {
    /* The replay already holds bg_lock (recursive); taking it again here for every
@@ -2669,7 +2819,13 @@ bg_shadow_release(struct rwa_texture *sh)
    // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
    // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
    // (one kernel clean per surface, ever) left those layers stale or missing until this.
-   if (_surface && _tex) {
+   if (_wrapped && _tex) {
+      // Plain CPU stores into a no-copy buffer move no seed: clean the pages once per refresh epoch (every time outside one).
+      if (!(bg_refresh_epoch && _refreshEpoch == bg_refresh_epoch)) {
+         _refreshEpoch = bg_refresh_epoch;
+         rwa_texture_flush_surface(_tex);
+      }
+   } else if (_surface && _tex) {
       static NSMutableDictionary *seeds;
       static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
       NSNumber *key = @(IOSurfaceGetID((IOSurfaceRef)_surface));
@@ -2699,6 +2855,7 @@ bg_shadow_release(struct rwa_texture *sh)
    bg_nc_cache_store(&_ncCache, bytes, total);
 }
 - (void)bgInvalidateUploadCache { _ncCache.valid = 0; }
+- (BOOL)bgImportsSurface { return _surface && !_copySurface && _tex; }
 - (void)bgUploadNote:(unsigned)kind bytes:(const void *)bytes length:(size_t)length status:(int)status
 {
    if (!status) _uploadWrites++;
@@ -2796,6 +2953,11 @@ bg_shadow_release(struct rwa_texture *sh)
    [self bgInvalidateUploadCache];
    if (rwa_texture_write(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("replaceRegion: %s\n", why);
    bg_unlock();
+}
+- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr
+          bytesPerImage:(NSUInteger)bpi
+{
+   [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:bpi];
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr
 {

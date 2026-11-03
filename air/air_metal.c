@@ -369,6 +369,7 @@ struct rwa_texture {
     */
    bool shader_read, shader_write;
    bool imported;                   /* jasmine: the memory is an IOSurface's (rwa_texture_copy) */
+   bool buffer_alias;               /* jasmine: the memory is an MTLBuffer's BO (rwa_texture_create_over_buffer) */
    bool ubwc_allocation;            /* stays true after a CPU map migrates to linear */
 
    /* Bergamota: the kernel's BO handle when the memory is an IOSurface (rwa_texture_from_surface), for the clean+invalidate that makes the GPU's
@@ -2097,6 +2098,226 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
    return texture_of_shape(device, shape, &import, why, why_size);
 }
 
+/* jasmine: a linear texture over an MTLBuffer's BO. The import is the same
+ * resource_from_handle path as an IOSurface, but the handle is the buffer's own
+ * GEM handle and there is no kernel surface behind it: the texture and the
+ * buffer must end up on one fd_bo, which fd_bo_from_handle guarantees by
+ * looking the handle up in the device's table first. `imported` and
+ * `surface_handle` stay clear so no surface sync, ticket or DRAM-surface path
+ * treats this as somebody else's scan-out memory.
+ */
+struct rwa_texture *
+rwa_texture_create_over_buffer(struct rwa_device *device,
+                               const struct rwa_texture_shape *shape,
+                               struct rwa_buffer *buffer,
+                               size_t offset, size_t bytes_per_row,
+                               char *why, size_t why_size)
+{
+   if (!device || !shape || !buffer || !buffer->res || buffer->res->target != PIPE_BUFFER) {
+      say(why, why_size, "a buffer-backed linear texture without a device, descriptor or buffer");
+      return NULL;
+   }
+   if (device->software || !device->screen->resource_from_handle) {
+      say(why, why_size, "%s imports no memory, so a texture cannot share a buffer's BO",
+          rwa_device_name(device));
+      return NULL;
+   }
+
+   const struct rwa_pixel_format *fmt = pixel_format(shape->pixel_format);
+   if (!fmt) {
+      say(why, why_size, "pixel format %u is %s", shape->pixel_format,
+          pixel_format_refusal(shape->pixel_format));
+      return NULL;
+   }
+
+   unsigned width = shape->width;
+   unsigned height = shape->height ? shape->height : 1;
+   unsigned depth = shape->depth ? shape->depth : 1;
+   unsigned layers = shape->array_length ? shape->array_length : 1;
+   unsigned mips = shape->mip_levels ? shape->mip_levels : 1;
+   unsigned samples = shape->sample_count ? shape->sample_count : 1;
+   const char *type_name = texture_type_name(shape->type);
+
+   if (shape->type != RWA_TYPE_2D) {
+      say(why, why_size, "a %s over a buffer: a buffer is one row-major image and only "
+                         "MTLTextureType2D is that", type_name ? type_name : "texture type");
+      return NULL;
+   }
+   if (!width || !height) {
+      say(why, why_size, "a %ux%u texture over a buffer has no texels", width, height);
+      return NULL;
+   }
+   if (depth != 1 || layers != 1) {
+      say(why, why_size, "a depth of %u and %u slices over a buffer: the import is one plane",
+          depth, layers);
+      return NULL;
+   }
+   if (mips != 1) {
+      say(why, why_size, "%u mip levels over a buffer: the import is told one pitch and "
+                         "nothing about smaller levels", mips);
+      return NULL;
+   }
+   if (samples != 1) {
+      say(why, why_size, "%u samples per texel over a buffer: the import is one sample",
+          samples);
+      return NULL;
+   }
+   if (util_format_is_compressed(fmt->pipe)) {
+      say(why, why_size, "%s is a compressed format, and a buffer's rows are not blocks",
+          fmt->name);
+      return NULL;
+   }
+   /* The a5xx has no R5G5B5A1, so the normal upload exchanges red and blue in
+    * memory for BGR5A1; an alias cannot rewrite the caller's buffer. */
+   if (bgr5a1_exchanged && fmt->pipe == PIPE_FORMAT_B5G5R5A1_UNORM) {
+      say(why, why_size, "%s needs the CPU upload's red/blue exchange for this GPU's "
+                         "B5G5R5A1, which an alias cannot do", fmt->name);
+      return NULL;
+   }
+   /* A depth/stencil texture can live in two resources (Z32_FLOAT_S8X24), and a
+    * CPU write to one does not land in a buffer's bytes. */
+   if (format_is_depth_stencil(fmt->pipe)) {
+      say(why, why_size, "%s is a depth/stencil format whose layout is not the buffer's bytes",
+          fmt->name);
+      return NULL;
+   }
+
+   unsigned texel = util_format_get_blocksize(fmt->pipe);
+   if (bytes_per_row < (size_t)width * texel) {
+      say(why, why_size, "%zu bytes a row for %u texels of %u bytes need at least %zu",
+          bytes_per_row, width, texel, (size_t)width * texel);
+      return NULL;
+   }
+   if (offset % 64 != 0) {
+      say(why, why_size, "offset %zu over a buffer is not a multiple of 64, which this "
+                         "GPU's import requires", offset);
+      return NULL;
+   }
+   if (bytes_per_row % 64 != 0) {
+      say(why, why_size, "%zu bytes a row is not a multiple of 64, which this GPU's import "
+                         "requires", bytes_per_row);
+      return NULL;
+   }
+   if (bytes_per_row > UINT32_MAX) {
+      say(why, why_size, "%zu bytes a row does not fit the import's 32-bit stride",
+          bytes_per_row);
+      return NULL;
+   }
+
+   size_t last_row = (size_t)width * texel;
+   size_t need = last_row;
+   if (height > 1) {
+      if ((size_t)(height - 1) > (SIZE_MAX - last_row) / bytes_per_row) {
+         say(why, why_size, "%u rows of %zu bytes over a buffer overflow a size_t",
+             height, bytes_per_row);
+         return NULL;
+      }
+      need = (size_t)(height - 1) * bytes_per_row + last_row;
+   }
+   if (offset > buffer->size || need > buffer->size - offset) {
+      say(why, why_size, "a %ux%u region at offset %zu, %zu bytes a row spans %zu bytes of "
+                         "a %zu-byte buffer", width, height, offset, bytes_per_row, need,
+          buffer->size);
+      return NULL;
+   }
+   /* A render target is resolved through the a5xx GMEM path, which aligns the height to
+    * 32 rows, so even the padded rows have to be inside the buffer. */
+   if (shape->usage & RWA_USAGE_RENDER_TARGET) {
+      size_t rows = ((size_t)height + 31) & ~(size_t)31;
+      size_t full = 0;
+      bool overflow = bytes_per_row > (SIZE_MAX - offset) / rows;
+      if (!overflow)
+         full = offset + bytes_per_row * rows;
+      if (overflow || full > buffer->size) {
+         say(why, why_size, "a %ux%u render target at offset %zu with %zu bytes a row needs "
+                            "more than the %zu-byte buffer has", width, height, offset,
+             bytes_per_row, buffer->size);
+         return NULL;
+      }
+   }
+
+   unsigned known = RWA_USAGE_SHADER_READ | RWA_USAGE_SHADER_WRITE |
+                    RWA_USAGE_RENDER_TARGET | RWA_USAGE_PIXEL_FORMAT_VIEW;
+   if (shape->usage & ~known) {
+      say(why, why_size, "usage bits 0x%x are not MTLTextureUsage's", shape->usage & ~known);
+      return NULL;
+   }
+   bool read = shape->usage == 0 || (shape->usage & RWA_USAGE_SHADER_READ);
+   bool write = shape->usage == 0 || (shape->usage & RWA_USAGE_SHADER_WRITE);
+   unsigned bind = (read ? PIPE_BIND_SAMPLER_VIEW : 0) |
+                   (write ? PIPE_BIND_SHADER_IMAGE : 0) |
+                   ((shape->usage & RWA_USAGE_RENDER_TARGET) ? PIPE_BIND_RENDER_TARGET : 0);
+   if (!bind) {
+      bind = PIPE_BIND_SAMPLER_VIEW;
+      read = true;
+   }
+
+   if (!device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D, 0, 0,
+                                            bind)) {
+      say(why, why_size, "%s cannot give %s as a buffer-backed 2D texture with usage 0x%x",
+          rwa_device_name(device), fmt->name, shape->usage);
+      return NULL;
+   }
+
+   struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D, .format = fmt->pipe,
+      .width0 = width, .height0 = height, .depth0 = 1,
+      .array_size = 1, .last_level = 0, .nr_samples = 0,
+      .nr_storage_samples = 0,
+      .bind = bind, .usage = PIPE_USAGE_DEFAULT };
+   struct fd_bo *bo = fd_resource(buffer->res)->bo;
+   if (!bo) {
+      say(why, why_size, "the buffer has no BO to share");
+      return NULL;
+   }
+   uint32_t handle = fd_bo_handle(bo);
+   if (!handle) {
+      say(why, why_size, "the buffer's BO is sub-allocated from a heap (no GEM handle), and "
+                         "this import needs a shareable handle");
+      return NULL;
+   }
+   struct winsys_handle whandle = {
+      .type = WINSYS_HANDLE_TYPE_KMS,
+      .handle = handle,
+      .stride = (unsigned)bytes_per_row,
+      .offset = (unsigned)offset,
+      .size = (unsigned)buffer->size,
+      .modifier = DRM_FORMAT_MOD_LINEAR,
+   };
+   struct pipe_resource *res =
+      device->screen->resource_from_handle(device->screen, &templ, &whandle,
+                                           PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   if (!res) {
+      say(why, why_size, "the driver would not import the buffer's handle as a %ux%u %s with "
+                         "%zu bytes a row from offset %zu, and the pitch and the shape are "
+                         "both acceptable", width, height, fmt->name, bytes_per_row, offset);
+      return NULL;
+   }
+   if (fd_resource(res)->bo != bo) {
+      say(why, why_size, "the import made a different BO than the buffer's, so the texture "
+                         "would not share its memory");
+      pipe_resource_reference(&res, NULL);
+      return NULL;
+   }
+
+   struct rwa_texture *texture = calloc(1, sizeof(*texture));
+   if (!texture) {
+      pipe_resource_reference(&res, NULL);
+      say(why, why_size, "out of memory making a buffer-backed texture");
+      return NULL;
+   }
+   texture->lifetime_id = __atomic_add_fetch(&lifetime_next, 1, __ATOMIC_RELAXED);
+   texture->device = device;
+   texture->shape = *shape;
+   texture->format_name = fmt->name;
+   texture->layers = 1;
+   texture->shader_read = read;
+   texture->shader_write = write;
+   texture->buffer_alias = true;
+   texture->res = res;
+   return texture;
+}
+
 /* Make what the GPU wrote into an IOSurface-backed texture visible to the CPU and to the compositor (clean+invalidate of the kernel alias).
  * Call after the work that wrote it has completed (rwa_finish). A texture that is not over a surface: nothing to do. */
 int
@@ -2278,9 +2499,10 @@ rwa_texture_destroy(struct rwa_texture *texture)
     * the moment the last reference went, which is the same trap delete_compute_state
     * below is about.
     */
-   /* Keep explicit allocations out of the implicit pool after decompression too. */
-   if (!texture->surface_handle && !texture->ubwc_allocation && texture->res &&
-       tex_pool_put(texture->device, texture->res, texture->view)) {
+   /* Keep explicit allocations out of the implicit pool after decompression too;
+    * a buffer alias is another resource's BO and must never be pooled. */
+   if (!texture->surface_handle && !texture->ubwc_allocation && !texture->buffer_alias &&
+       texture->res && tex_pool_put(texture->device, texture->res, texture->view)) {
       free(texture);          /* the pool holds the resource's reference and the view now */
       return;
    }
@@ -2391,6 +2613,35 @@ rwa_texture_region_bytes(const struct rwa_texture *texture, const unsigned size[
    return (rows - 1) * stride + row;
 }
 
+/* A buffer-backed texture writes into the shared BO. PIPE_MAP_UNSYNCHRONIZED
+ * keeps fd_resource_transfer_map on its direct path: without it a busy texture
+ * with DISCARD_RANGE may go through fd_try_shadow_resource, which would give the
+ * texture a new BO and leave the buffer behind. The caller owns the wait (Metal
+ * makes CPU/GPU access of one resource undefined without it). */
+static int
+texture_write_unsynchronized(struct rwa_texture *texture, unsigned level,
+                             const struct pipe_box *box, const void *bytes,
+                             size_t stride, size_t image_stride,
+                             char *why, size_t why_size)
+{
+   struct pipe_context *pipe = texture->device->pipe;
+   struct pipe_transfer *xfer = NULL;
+   uint8_t *map = pipe->texture_map(pipe, texture->res, level,
+                                    PIPE_MAP_WRITE | PIPE_MAP_UNSYNCHRONIZED, box, &xfer);
+   if (!map) {
+      say(why, why_size, "the driver would not map a %ux%u region of the buffer for the "
+                         "processor", box->width, box->height);
+      return -1;
+   }
+   size_t row = (size_t)box->width * util_format_get_blocksize(texture->res->format);
+   for (int z = 0; z < box->depth; z++)
+      for (int y = 0; y < box->height; y++)
+         memcpy(map + (size_t)z * xfer->layer_stride + (size_t)y * xfer->stride,
+                (const uint8_t *)bytes + (size_t)z * image_stride + (size_t)y * stride, row);
+   pipe->texture_unmap(pipe, xfer);
+   return 0;
+}
+
 int
 rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                   const unsigned origin[3], const unsigned size[3], const void *bytes,
@@ -2486,6 +2737,10 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
       free(tmp);
       return 0;
    }
+   if (texture->buffer_alias)
+      return texture_write_unsynchronized(texture, level, &box, bytes, row,
+                                          row * util_format_get_nblocksy(texture->res->format, box.height),
+                                          why, why_size);
    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
                                           PIPE_MAP_WRITE, &box, bytes, row,
                                           row * util_format_get_nblocksy(texture->res->format, box.height));
@@ -4590,6 +4845,8 @@ rwa_texture_dram_info(const struct rwa_texture *texture, struct rwa_dram_info *o
    size_t stride = util_format_get_stride(r->format, r->width0);
    uint64_t rows = util_format_get_nblocksy(r->format, r->height0);
    out->bytes = (uint64_t)stride * rows * out->samples;
+   /* A buffer alias is not an IOSurface: it is this library's own buffer BO,
+    * counted with the private allocations it belongs to. */
    out->class = (texture->imported || texture->surface_handle) ? RWA_DRAM_SURFACE
                                                                : RWA_DRAM_PRIVATE;
    out->tiled = fd_resource_tile_mode(r, 0) != 0;
