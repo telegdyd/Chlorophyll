@@ -24,6 +24,10 @@
  * 1024-entry registry capacity, a stale epoch and
  * tickets-off (-ENOTSUP) or any other BEGIN result still fail the whole CB before any
  * recorded work; only the bit-3 display-unavailable case is deferred. */
+#ifdef BG_TL_SITE
+#undef bg_lock
+#define bg_lock() bg_lock_at(BG_TL_SITE(1, __LINE__))
+#endif
 #ifndef BG_LOG
 #define BG_LOG(...) do { } while (0)
 #endif
@@ -185,3 +189,7 @@ bg_suspended_event(int force)
    if (texture && !_admissionFailed)
       [self bgAdmitRaw:[(BGMTLTexture *)texture rwaSurfaceTexture]];
 }
+#ifdef BG_TL_SITE
+#undef bg_lock
+#define bg_lock() bg_lock_at(BG_TL_SITE(0, __LINE__))
+#endif

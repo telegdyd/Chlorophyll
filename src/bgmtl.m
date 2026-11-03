@@ -197,7 +197,24 @@ bg_ctx_init(void)
 // that sampled it, each upload after the first into a texture the open batch already read (freedreno shadows or flushes),
 // 4 % of the compositor's commit. 0 outside a commit: refresh every time. Under bg_lock.
 static uint64_t bg_refresh_epoch, bg_refresh_epochs;
-static void bg_lock(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, bg_ctx_init); pthread_mutex_lock(&bg_ctx_mutex); }
+// While the M8 timeline is armed a contended lock is timed and recorded with its call site (bg_tl_lock_wait).
+// site = file tag << 14 | source line; file 0 bgmtl.m, 1 bg_write_admission.h, 2 bg_work_admission.h.
+#define BG_TL_SITE(file, line) (((uint64_t)(file) << 14) | ((line) & 0x3fff))
+static void
+bg_lock_at(uint64_t site)
+{
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+   pthread_once(&once, bg_ctx_init);
+   if (__atomic_load_n(&bg_tl.state, __ATOMIC_RELAXED) == BG_TL_ARMED) {
+      if (!pthread_mutex_trylock(&bg_ctx_mutex)) return;
+      uint64_t t0 = mach_absolute_time();
+      pthread_mutex_lock(&bg_ctx_mutex);
+      bg_tl_lock_wait(site, t0);
+      return;
+   }
+   pthread_mutex_lock(&bg_ctx_mutex);
+}
+#define bg_lock() bg_lock_at(BG_TL_SITE(0, __LINE__))
 static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 
 #include "bg_upload_profile.h"
@@ -1949,6 +1966,7 @@ bg_sync_commit(void)
    // Read before the handlers run: a completed handler may drop the last reference to self.
    uint32_t tlcb = _tlcb;
    uint64_t tlstatus = (uint32_t)_status;
+   bg_tl_event(BG_TL_HANDLERS_BEGIN, tlcb, (uint64_t)[_completed count], bg_tl_tid());
    [self bgDeliverHandlers:_completed completed:YES];
    bg_tl_completed(tlcb, tlstatus,
                    (bg_trace() || bg_sync_commit()) ? BG_TL_Q_INLINE : BG_TL_Q_COMPLETION);

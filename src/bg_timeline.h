@@ -33,8 +33,12 @@ enum {
 enum {
    BG_TL_CREATE = 1, BG_TL_COMMIT_ENTER, BG_TL_REPLAY_BEGIN, BG_TL_TICKET_BEGIN,
    BG_TL_SUBMIT_BEGIN, BG_TL_SUBMIT_END, BG_TL_REPLAY_END, BG_TL_SCHEDULED_RUN,
-   BG_TL_FENCE_OBSERVED, BG_TL_COMPLETED_RUN, BG_TL_PRESENT_POST, BG_TL_PRESENT_ENTER
+   BG_TL_FENCE_OBSERVED, BG_TL_COMPLETED_RUN, BG_TL_PRESENT_POST, BG_TL_PRESENT_ENTER,
+   BG_TL_LOCK_WAIT, BG_TL_HANDLERS_BEGIN
 };
+/* LOCK_WAIT belongs to no CB: a = file<<62 | line<<48 | thread id, b = ticks waited. */
+#define BG_TL_NO_CB 0xffffffffu
+#define BG_TL_LOCK_WAIT_MIN_NS 100000ull
 enum { BG_TL_Q_REPLAY = 0, BG_TL_Q_COMPLETION = 1, BG_TL_Q_INLINE = 2 };
 
 struct bg_tl_rec {
@@ -202,6 +206,16 @@ bg_tl_ticket(uint32_t cb, uint64_t generation, uint64_t epoch, int deferred)
 {
    bg_tl_event(BG_TL_TICKET_BEGIN, cb, generation,
                deferred ? (epoch | BG_TL_TICKET_DEFERRED) : epoch);
+}
+
+/* A bg_lock that did not get the lock at once and waited at least 100 us. t0: before the blocking lock. */
+static inline void
+bg_tl_lock_wait(uint64_t site, uint64_t t0)
+{
+   uint64_t now = mach_absolute_time();
+   if ((now - t0) * bg_tl.tb.numer / bg_tl.tb.denom < BG_TL_LOCK_WAIT_MIN_NS) return;
+   bg_tl_append_at(now, BG_TL_LOCK_WAIT, BG_TL_NO_CB,
+                   (site << 48) | (bg_tl_tid() & 0xffffffffffffull), now - t0);
 }
 
 static void

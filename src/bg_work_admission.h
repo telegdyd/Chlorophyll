@@ -1,4 +1,8 @@
 /* SPDX-License-Identifier: MIT */
+#ifdef BG_TL_SITE
+#undef bg_lock
+#define bg_lock() bg_lock_at(BG_TL_SITE(2, __LINE__))
+#endif
 struct bg_shader_writes { struct rwa_texture *texture[BG_MAX_WRITE_DESTINATIONS]; unsigned count; };
 static int bg_collect_destination(void *context,struct rwa_texture *texture)
 {
@@ -50,3 +54,7 @@ static int bg_collect_destination(void *context,struct rwa_texture *texture)
    if (result && !_admissionFailed) [self bgAdmissionReject:[NSString stringWithUTF8String:why]];
    return !_admissionFailed;
 }
+#ifdef BG_TL_SITE
+#undef bg_lock
+#define bg_lock() bg_lock_at(BG_TL_SITE(0, __LINE__))
+#endif
