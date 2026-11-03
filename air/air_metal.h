@@ -1406,6 +1406,7 @@ void rwa_lifetime_attachment(struct rwa_texture *texture, unsigned slot, unsigne
  * buffer record access. */
 typedef int (*rwa_write_destination_fn)(void *, struct rwa_texture *);
 unsigned rwa_texture_surface_id(const struct rwa_texture *texture);
+int rwa_texture_is_ubwc(const struct rwa_texture *texture);   /* M9: explicit UBWC allocation */
 
 /* M9 bandwidth instrumentation: immutable surface description for the timeline.
  * `class` is RWA_DRAM_SURFACE (imported/IOSurface/linear) or RWA_DRAM_PRIVATE

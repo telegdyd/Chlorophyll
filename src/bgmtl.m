@@ -2544,9 +2544,19 @@ bg_shadow_release(struct rwa_texture *sh)
        * invalidation and the BO cache has its own locks; tex_pool_take only takes its
        * mutex (expiry is in tex_pool_put under bg_lock).  No pipe_context here. */
       /* UBWC only where Metal forbids CPU access (replaceRegion/getBytes on private
-       * storage), so the a5xx CPU-access uncompress path never matters. */
-      _shape.ubwc_candidate = d.storageMode == MTLStorageModePrivate;
+       * or memoryless storage), so the a5xx CPU-access uncompress path never matters.
+       * CoreAnimation's full-screen 828x1792 intermediates are memoryless (capture ubwc2). */
+      _shape.ubwc_candidate = d.storageMode == MTLStorageModePrivate ||
+                              d.storageMode == MTLStorageModeMemoryless;
       _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+      /* M9 UBWC bring-up: which large render targets stay uncompressed, and why. */
+      static int ubwc_seen;
+      if (_tex && (d.usage & MTLTextureUsageRenderTarget) && d.width >= 256 && d.height >= 256 &&
+          getenv("BGMTL_UBWC") && __atomic_fetch_add(&ubwc_seen, 1, __ATOMIC_RELAXED) < 40)
+         fprintf(stderr, "BGMTL UBWC rt %lux%lu fmt %lu type %lu usage 0x%lx storage %lu mips %lu samples %lu -> ubwc %d\n",
+                 (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat,
+                 (unsigned long)d.textureType, (unsigned long)d.usage, (unsigned long)d.storageMode,
+                 (unsigned long)d.mipmapLevelCount, (unsigned long)d.sampleCount, rwa_texture_is_ubwc(_tex));
    }
    if (!_tex) { bg_texture_refused(0, why, d, surface != NULL); [self release]; return nil; }
    _owner = device;

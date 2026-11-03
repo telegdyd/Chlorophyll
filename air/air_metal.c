@@ -4571,6 +4571,12 @@ rwa_texture_surface_id(const struct rwa_texture *t)
 }
 
 int
+rwa_texture_is_ubwc(const struct rwa_texture *texture)
+{
+   return texture && texture->ubwc_allocation;
+}
+
+int
 rwa_texture_dram_info(const struct rwa_texture *texture, struct rwa_dram_info *out)
 {
    if (!texture || !texture->res || !out)
