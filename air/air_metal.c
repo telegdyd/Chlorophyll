@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "air_metal.h"
+#include "bg_read_unlocked.h"
 #ifdef RWA_SWEETGPU
 #include "util/sweet_state_profile.h"
 #include "util/sweet_submit_profile.h"
@@ -2526,6 +2527,113 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
             swap_rb5551(dst + ((size_t)z * box.height + y) * row, box.width);
 
    pipe->texture_unmap(pipe, xfer);
+   return 0;
+}
+
+/*
+ * The unlocked linear readback used by -[BGMTLTexture getBytes:] (M8 fix A).
+ *
+ * The completed CB's GPU work has been fenced, and Metal leaves CPU/GPU
+ * concurrent access of the same texture undefined.  What this must not race is
+ * freedreno's own state: rsc->bo/layout can be swapped by
+ * fd_try_shadow_resource (freedreno_resource.c:414-449 takes fd_screen_lock),
+ * and a batch can attach a writer under the same lock (fd_batch_resource_write,
+ * freedreno_batch.c:526-589, asserts fd_screen_assert_locked).  So the gates and
+ * the BO ref below are read under fd_screen_lock; the fence wait and copy are
+ * after dropping it.  Any gate failure returns NOT_ELIGIBLE and the caller uses
+ * the existing rwa_texture_read under bg_lock.
+ */
+int
+rwa_texture_read_unlocked(struct rwa_texture *texture, unsigned level, unsigned layer,
+                          const unsigned origin[3], const unsigned size[3], void *bytes,
+                          size_t stride, char *why, size_t why_size)
+{
+   if (!texture || !texture->res || !bytes) {
+      say(why, why_size, "unlocked readback: no texture or destination");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   if (texture->res->target != PIPE_TEXTURE_2D) {
+      say(why, why_size, "unlocked readback: only 2D textures are eligible");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   if (format_is_depth_stencil(texture->res->format)) {
+      say(why, why_size, "unlocked readback: depth/stencil texture");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   if (texture->res->nr_samples > 1) {
+      say(why, why_size, "unlocked readback: multisample texture");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   if (bgr5a1_exchanged && texture->res->format == PIPE_FORMAT_B5G5R5A1_UNORM) {
+      say(why, why_size, "unlocked readback: B5G5R5A1 needs the exchange copy");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+
+   struct pipe_box box;
+   size_t row;
+   if (!texture_box(texture, level, layer, origin, size, &box, why, why_size) ||
+       !caller_stride(texture, &box, stride, &row, why, why_size))
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+
+   struct pipe_screen *pscreen = texture->device->screen;
+   struct fd_screen *screen = fd_screen(pscreen);
+   struct fd_resource *rsc = fd_resource(texture->res);
+   const size_t bsize = util_format_get_blocksize(texture->res->format);
+   size_t texel_row = (size_t)box.width * bsize;
+   uint32_t pitch, offset;
+   struct fd_bo *bo;
+
+   fd_screen_lock(screen);
+   if (!bg_read_unlocked_eligible(texture->res->target == PIPE_TEXTURE_2D,
+                                  format_is_depth_stencil(texture->res->format),
+                                  (int)texture->res->nr_samples,
+                                  (int)fd_resource_tile_mode(texture->res, level),
+                                  (int)fd_resource_ubwc_enabled(rsc, level),
+                                  (int)rsc->valid, rsc->track->write_batch)) {
+      fd_screen_unlock(screen);
+      say(why, why_size, "unlocked readback: tiled/UBWC/invalid/pending-writer resource");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   bo = rsc->bo;
+   if (!bo) {
+      fd_screen_unlock(screen);
+      say(why, why_size, "unlocked readback: resource has no BO");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   pitch = fd_resource_pitch(rsc, level);
+   offset = fd_resource_offset(rsc, level, box.z);
+   if (pitch < texel_row ||
+       (size_t)offset + (size_t)box.y * pitch + (size_t)box.x * bsize +
+          (size_t)(box.height - 1) * pitch + texel_row > fd_bo_size(bo)) {
+      fd_screen_unlock(screen);
+      say(why, why_size, "unlocked readback: level/slice does not fit the BO");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   fd_bo_ref(bo);
+   fd_screen_unlock(screen);
+
+   if (fd_bo_cpu_prep(bo, NULL, FD_BO_PREP_READ)) {
+      fd_bo_del(bo);
+      say(why, why_size, "unlocked readback: BO fence wait failed");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   const uint8_t *map = fd_bo_map(bo);
+   if (!map) {
+      fd_bo_del(bo);
+      say(why, why_size, "unlocked readback: BO map failed");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+
+   uint8_t *dst = bytes;
+   if (bg_copy_linear_rows(dst, row, map, offset, pitch, (unsigned)box.x,
+                           (unsigned)box.y, (unsigned)box.width,
+                           (unsigned)box.height, bsize) != 0) {
+      fd_bo_del(bo);
+      say(why, why_size, "unlocked readback: driver pitch is narrower than a row");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+
+   fd_bo_del(bo);
    return 0;
 }
 

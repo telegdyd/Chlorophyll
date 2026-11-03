@@ -203,6 +203,14 @@ int rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer
 		     const unsigned origin[3], const unsigned size[3], void *bytes,
 		     size_t stride, char *why, size_t why_size);
 
+/* The no-context readback fast path. Returns 0 or RWA_READ_UNLOCKED_NOT_ELIGIBLE
+ * (all gates/map failures); a caller must fall back to rwa_texture_read. It never
+ * touches pipe_context. */
+#define RWA_READ_UNLOCKED_NOT_ELIGIBLE 1
+int rwa_texture_read_unlocked(struct rwa_texture *texture, unsigned level, unsigned layer,
+			      const unsigned origin[3], const unsigned size[3], void *bytes,
+			      size_t stride, char *why, size_t why_size);
+
 /* CPU no-copy images: tightly packed 2D mip levels, with optional allocation padding
  * after the last level. Validate the entire chain before reading any caller bytes.
  * Allocation length is a bound, never a row stride (CA rounds it up to a page). */

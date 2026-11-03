@@ -2641,6 +2641,33 @@ bg_shadow_release(struct rwa_texture *sh)
    unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
    unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
    char why[256] = { 0 };
+   uint64_t nbytes = _tex ? (uint64_t)rwa_texture_region_bytes(_tex, sz, bpr) : 0;
+   static unsigned long fast_count, slow_count;
+   static int fast_logged, slow_logged;
+
+   /* The completed CB's GPU work is fenced; Metal makes CPU/GPU access of the
+    * same texture undefined.  Try the no-context linear path, but never for a
+    * shadow or a private surface copy (those are not the imported BO). */
+   if (_tex && !_surfTex && !_copySurface) {
+      int rc = rwa_texture_read_unlocked(_tex, (unsigned)level, (unsigned)slice, o, sz,
+                                         bytes, bpr, why, sizeof(why));
+      if (rc == 0) {
+         ++fast_count;
+         if (!fast_logged) { fast_logged = 1; BG_LOG("getBytes: unlocked linear fast path\n"); }
+         bg_tl_event(BG_TL_GETBYTES, BG_TL_NO_CB, 1, nbytes);
+         return;
+      }
+      ++slow_count;
+      if (!slow_logged) { slow_logged = 1; BG_LOG("getBytes: locked fallback: %s\n", why[0] ? why : "not eligible"); }
+   } else {
+      ++slow_count;
+      if (!slow_logged) {
+         slow_logged = 1;
+         BG_LOG("getBytes: locked fallback: %s\n",
+                _surfTex ? "shadow texture" : _copySurface ? "private surface copy" : "no texture");
+      }
+   }
+   bg_tl_event(BG_TL_GETBYTES, BG_TL_NO_CB, 0, nbytes);
    bg_lock();
    if (rwa_texture_read(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("getBytes: %s\n", why);
    bg_unlock();
