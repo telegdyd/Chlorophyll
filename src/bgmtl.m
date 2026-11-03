@@ -38,6 +38,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "air_metal.h"
+#include "bg_argbuf_lock.h"
 #include "bg_refusal_log.h"
 #include "bg_timeline.h"
 
@@ -220,8 +221,45 @@ bg_lock_at(uint64_t site)
 #define bg_lock() bg_lock_at(BG_TL_SITE(0, __LINE__))
 // The lock without waiting (the deallocs): 0 when held, as pthread_mutex_trylock.
 static int bg_trylock(void) { int rc = pthread_mutex_trylock(&bg_ctx_mutex); if (!rc) bg_lock_depth++; return rc; }
+
+/* Argument-buffer records have their own process-wide mutex (air_metal.c).
+ * Lock order is bg_lock -> bg_argbuf_mutex; nothing under it may take bg_lock,
+ * touch pipe_context, take a ticket, or wait on the GPU. File tag 3 marks these
+ * waits in the timeline. */
+static void
+bg_argbuf_lock_at(uint32_t line)
+{
+   if (__atomic_load_n(&bg_tl.state, __ATOMIC_RELAXED) != BG_TL_ARMED) {
+      pthread_mutex_lock(&bg_argbuf_mutex);
+      return;
+   }
+   if (!pthread_mutex_trylock(&bg_argbuf_mutex))
+      return;
+   uint64_t t0 = mach_absolute_time();
+   pthread_mutex_lock(&bg_argbuf_mutex);
+   bg_tl_lock_wait(((uint64_t)3 << 14) | (line & 0x3fff), t0);
+}
+#define bg_argbuf_lock() bg_argbuf_lock_at(__LINE__)
+#define bg_argbuf_unlock() pthread_mutex_unlock(&bg_argbuf_mutex)
 static void bg_unlock(void) { bg_lock_depth--; pthread_mutex_unlock(&bg_ctx_mutex); }
 static void bg_defer_drain_locked(void);
+
+/* The optional drawable shadow changes _tex under bg_lock (bgShadowLocked), so
+ * bgCollectWrites keeps the old bg_lock path when it is on. */
+static int bg_shadow_on;
+static void
+bg_shadow_init(void)
+{
+   bg_shadow_on = getenv("BGMTL_BB") && getenv("BGMTL_SHADOW") &&
+                  getenv("BGMTL_SHADOW")[0] == '1';
+}
+static int
+bg_shadow_requested(void)
+{
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+   pthread_once(&once, bg_shadow_init);
+   return bg_shadow_on == 1;
+}
 
 #include "bg_upload_profile.h"
 #include "bg_nocopy_cache.h"
@@ -2460,9 +2498,7 @@ bg_shadow_release(struct rwa_texture *sh)
 - (struct rwa_texture *)rwaAdmissionTexture { return _tex; }
 - (void)bgShadowLocked
 {
-   static int on = -1;
-   if (on < 0) on = getenv("BGMTL_BB") && getenv("BGMTL_SHADOW") && getenv("BGMTL_SHADOW")[0] == '1';
-   if (!on || _surfTex || !_surface || !_tex) return;
+   if (!bg_shadow_requested() || _surfTex || !_surface || !_tex) return;
    struct rwa_texture *sh = bg_shadow_get(_owner, (IOSurfaceRef)_surface, &_shape, _tex);
    if (!sh) return;
    _surfTex = _tex;

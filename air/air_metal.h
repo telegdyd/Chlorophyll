@@ -1400,7 +1400,8 @@ int rwa_lifetime_profile_active(void);
 void rwa_lifetime_attachment(struct rwa_texture *texture, unsigned slot, unsigned load, unsigned store);
 
 /* M7: enumerate actual shader image writes (including argument-buffer members),
- * without binding or dispatching. Called under the device context lock. */
+ * without binding or dispatching. The caller holds bg_argbuf_mutex for argument-
+ * buffer record access. */
 typedef int (*rwa_write_destination_fn)(void *, struct rwa_texture *);
 unsigned rwa_texture_surface_id(const struct rwa_texture *texture);
 int rwa_compute_write_destinations(struct rwa_compute *, const struct rwa_bindings *,

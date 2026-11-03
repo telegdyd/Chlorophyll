@@ -31,7 +31,12 @@ static int bg_collect_destination(void *context,struct rwa_texture *texture)
    struct rwa_texture *textures[BG_MAX_TEX]={0};
    char why[256]={0};
    struct bg_shader_writes writes={0};
-   bg_lock();
+   /* Only the argument-buffer records need a lock here: the BGWork retains the
+    * buffers/textures, _buf never changes, and _tex is stable unless the optional
+    * shadow is on (then keep bg_lock, because bgShadowLocked swaps _tex under it). */
+   int shadow = bg_shadow_requested();
+   if (shadow) bg_lock();
+   bg_argbuf_lock();
    for (unsigned i=0;i<w->vcount;i++) {
       vb[i]=[(BGMTLBuffer *)w->vbuffers[i] rwaAdmissionBuffer];
       vt[i]=(struct rwa_buffer_bind){vb[i],w->voffsets[i]};
@@ -46,7 +51,8 @@ static int bg_collect_destination(void *context,struct rwa_texture *texture)
    int result=w->kind == BG_WORK_DISPATCH ?
       rwa_compute_write_destinations(w->pipeline->_compute,&fragment,ft,w->count,bg_collect_destination,&writes,why,sizeof(why)) :
       rwa_render_write_destinations(((BGMTLRenderPipeline *)w->render)->_render,&vertex,vt,w->vcount,&fragment,ft,w->count,bg_collect_destination,&writes,why,sizeof(why));
-   bg_unlock();
+   bg_argbuf_unlock();
+   if (shadow) bg_unlock();
    // Do not wait for another producer while holding the recursive context lock.
    // At replay, the outer CB lock stays held and _committed forbids retry waits.
    if (!result)

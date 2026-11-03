@@ -30,9 +30,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "air_metal.h"
+#include "bg_argbuf_lock.h"
 #include "bg_read_unlocked.h"
+
+/* Protects every read/mutation of rwa_argbuf_encoding / rwa_argbuf_slot lists.
+ * Defined here because the rwa layer owns those records; bgmtl.m only needs the
+ * extern declaration for the write-destination walk. */
+pthread_mutex_t bg_argbuf_mutex = PTHREAD_MUTEX_INITIALIZER;
 #ifdef RWA_SWEETGPU
 #include "util/sweet_state_profile.h"
 #include "util/sweet_submit_profile.h"
@@ -3202,30 +3209,37 @@ rwa_argbuf_encode_buffer(struct rwa_buffer *dest, size_t dest_offset, unsigned i
                          struct rwa_buffer *buffer, size_t offset, char *why,
                          size_t why_size)
 {
+   pthread_mutex_lock(&bg_argbuf_mutex);
    struct rwa_argbuf_encoding *e =
       argbuf_begin_member(dest, dest_offset, id, "a buffer", why, why_size);
 
-   if (!e)
+   if (!e) {
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
+   }
    if (!buffer) {
       say(why, why_size, "no buffer was encoded at id %u, and a member of a set cannot "
                          "be unbound: this library binds every member a shader declares "
                          "and refuses the draw otherwise", id);
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
    }
    if (buffer->device != dest->device) {
       say(why, why_size, "the buffer encoded at id %u belongs to another device", id);
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
    }
    if (offset > buffer->size) {
       say(why, why_size, "the buffer encoded at id %u is bound at offset %zu of %zu "
                          "bytes", id, offset, buffer->size);
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
    }
    if (!e->slot[id].set)
       e->members++;
    e->slot[id] = (struct rwa_argbuf_slot){ .set = true, .kind = RWA_ARGBUF_BUFFER,
                                            .buffer = buffer, .offset = offset };
+   pthread_mutex_unlock(&bg_argbuf_mutex);
    return 0;
 }
 
@@ -3233,24 +3247,30 @@ int
 rwa_argbuf_encode_texture(struct rwa_buffer *dest, size_t dest_offset, unsigned id,
                           struct rwa_texture *texture, char *why, size_t why_size)
 {
+   pthread_mutex_lock(&bg_argbuf_mutex);
    struct rwa_argbuf_encoding *e =
       argbuf_begin_member(dest, dest_offset, id, "a texture", why, why_size);
 
-   if (!e)
+   if (!e) {
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
+   }
    if (!texture) {
       say(why, why_size, "no texture was encoded at id %u, and a member of a set cannot "
                          "be unbound", id);
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
    }
    if (texture->device != dest->device) {
       say(why, why_size, "the texture encoded at id %u belongs to another device", id);
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
    }
    if (!e->slot[id].set)
       e->members++;
    e->slot[id] = (struct rwa_argbuf_slot){ .set = true, .kind = RWA_ARGBUF_TEXTURE,
                                            .texture = texture };
+   pthread_mutex_unlock(&bg_argbuf_mutex);
    return 0;
 }
 
@@ -3258,33 +3278,48 @@ int
 rwa_argbuf_encode_sampler(struct rwa_buffer *dest, size_t dest_offset, unsigned id,
                           struct rwa_sampler *sampler, char *why, size_t why_size)
 {
+   pthread_mutex_lock(&bg_argbuf_mutex);
    struct rwa_argbuf_encoding *e =
       argbuf_begin_member(dest, dest_offset, id, "a sampler", why, why_size);
 
-   if (!e)
+   if (!e) {
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
+   }
    if (!sampler) {
       say(why, why_size, "no sampler was encoded at id %u, and a member of a set cannot "
                          "be unbound", id);
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
    }
    if (sampler->device != dest->device) {
       say(why, why_size, "the sampler encoded at id %u belongs to another device", id);
+      pthread_mutex_unlock(&bg_argbuf_mutex);
       return -1;
    }
    if (!e->slot[id].set)
       e->members++;
    e->slot[id] = (struct rwa_argbuf_slot){ .set = true, .kind = RWA_ARGBUF_SAMPLER,
                                            .sampler = sampler };
+   pthread_mutex_unlock(&bg_argbuf_mutex);
    return 0;
+}
+
+static unsigned
+argbuf_encoded_members_unlocked(const struct rwa_buffer *dest, size_t dest_offset)
+{
+   const struct rwa_argbuf_encoding *e = argbuf_find(dest, dest_offset);
+
+   return e ? e->members : 0;
 }
 
 unsigned
 rwa_argbuf_encoded_members(const struct rwa_buffer *dest, size_t dest_offset)
 {
-   const struct rwa_argbuf_encoding *e = argbuf_find(dest, dest_offset);
-
-   return e ? e->members : 0;
+   pthread_mutex_lock(&bg_argbuf_mutex);
+   unsigned members = argbuf_encoded_members_unlocked(dest, dest_offset);
+   pthread_mutex_unlock(&bg_argbuf_mutex);
+   return members;
 }
 
 /*
@@ -3300,6 +3335,7 @@ static void
 argbuf_scrub(struct rwa_device *device, const struct rwa_buffer *buffer,
              const struct rwa_texture *texture, const struct rwa_sampler *sampler)
 {
+   pthread_mutex_lock(&bg_argbuf_mutex);
    for (struct rwa_buffer *b = device ? device->encoded : NULL; b; b = b->next_encoded) {
       for (struct rwa_argbuf_encoding *e = b->encodings; e; e = e->next) {
          for (unsigned i = 0; i < e->slots; i++) {
@@ -3318,6 +3354,7 @@ argbuf_scrub(struct rwa_device *device, const struct rwa_buffer *buffer,
          }
       }
    }
+   pthread_mutex_unlock(&bg_argbuf_mutex);
 }
 
 /* And the records of a buffer that is itself going away. Called from
@@ -3326,6 +3363,7 @@ argbuf_scrub(struct rwa_device *device, const struct rwa_buffer *buffer,
 static void
 argbuf_forget_all(struct rwa_buffer *dest)
 {
+   pthread_mutex_lock(&bg_argbuf_mutex);
    struct rwa_argbuf_encoding *e = dest->encodings;
 
    while (e) {
@@ -3346,6 +3384,7 @@ argbuf_forget_all(struct rwa_buffer *dest)
       dest->listed = false;
       dest->next_encoded = NULL;
    }
+   pthread_mutex_unlock(&bg_argbuf_mutex);
 }
 
 /*
@@ -3468,7 +3507,7 @@ argbuf_member(const struct air_resource *r, const struct rwa_buffer_bind *table,
     * one except the absence of that record. The alternative to this sentence is not a
     * worse picture, it is drawing over whatever resource index 0 happens to hold.
     */
-   if (rwa_argbuf_encoded_members(bind->buffer, bind->offset) == 0) {
+   if (argbuf_encoded_members_unlocked(bind->buffer, bind->offset) == 0) {
       say(why, why_size, "the buffer bound as the argument buffer at Metal buffer index "
                          "%u (offset %zu) was never filled through an MTLArgumentEncoder, "
                          "so there is no record of what %s's %s `%s` (id %u) should be. "
@@ -4313,9 +4352,14 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
       size_t moffset = 0;
       bool member = r->argbuf_set != ~0u;
 
-      if (member && argbuf_member(r, table, table_count, name, &mbuffer, &moffset,
-                                  &mtexture, NULL, why, why_size) != 0)
-         return -1;
+      if (member) {
+         pthread_mutex_lock(&bg_argbuf_mutex);
+         int rc = argbuf_member(r, table, table_count, name, &mbuffer, &moffset,
+                                &mtexture, NULL, why, why_size);
+         pthread_mutex_unlock(&bg_argbuf_mutex);
+         if (rc != 0)
+            return -1;
+      }
 
       switch (r->kind) {
       case AIR_RESOURCE_CONSTANT_BUFFER:
@@ -4533,8 +4577,11 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
        * could disagree with itself.
        */
       if (r->argbuf_set != ~0u) {
-         if (argbuf_member(r, table, table_count, name, &b, &boffset, &t, &sm, why,
-                           why_size) != 0)
+         pthread_mutex_lock(&bg_argbuf_mutex);
+         int rc = argbuf_member(r, table, table_count, name, &b, &boffset, &t, &sm, why,
+                                why_size);
+         pthread_mutex_unlock(&bg_argbuf_mutex);
+         if (rc != 0)
             return -1;
       } else {
          switch (r->kind) {
