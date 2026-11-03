@@ -2028,6 +2028,12 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       if (texture->res) {
          texture->ubwc_allocation = fd_resource(texture->res)->layout.ubwc;
       }
+      static int ubwc_dbg;
+      if (__atomic_fetch_add(&ubwc_dbg, 1, __ATOMIC_RELAXED) < 4)
+         fprintf(stderr, "bgair: UBWC request %ux%u fmt %u bind 0x%x -> res %p ubwc %d tile %d\n",
+                 width, height, (unsigned)templ.format, templ.bind, (void *)texture->res,
+                 texture->res ? (int)fd_resource(texture->res)->layout.ubwc : -1,
+                 texture->res ? (int)fd_resource(texture->res)->layout.tile_mode : -1);
       if (texture->ubwc_allocation) {
          static uint64_t count, bytes;
          uint64_t n = __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED);
@@ -2038,7 +2044,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
                     (unsigned long long)n, (unsigned long long)b);
       }
    }
-   if (linear) {
+   if (linear && !texture->res) {   /* never replace (and leak) the explicit UBWC allocation */
       templ.bind |= PIPE_BIND_LINEAR;
       texture->res = tex_pool_take(device, &templ, &texture->view);
       if (!texture->res)

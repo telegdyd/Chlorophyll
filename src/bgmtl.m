@@ -2543,7 +2543,9 @@ bg_shadow_release(struct rwa_texture *sh)
       /* Screen-level allocation: freedreno takes fd_screen_lock around the batch-cache
        * invalidation and the BO cache has its own locks; tex_pool_take only takes its
        * mutex (expiry is in tex_pool_put under bg_lock).  No pipe_context here. */
-      _shape.ubwc_candidate = 1;
+      /* UBWC only where Metal forbids CPU access (replaceRegion/getBytes on private
+       * storage), so the a5xx CPU-access uncompress path never matters. */
+      _shape.ubwc_candidate = d.storageMode == MTLStorageModePrivate;
       _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
    }
    if (!_tex) { bg_texture_refused(0, why, d, surface != NULL); [self release]; return nil; }
