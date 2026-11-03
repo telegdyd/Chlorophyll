@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include "air_metal.h"
 #include "bg_argbuf_lock.h"
+#include "bg_tl_dram.h"
 #include "bg_refusal_log.h"
 #include "bg_timeline.h"
 
@@ -243,6 +244,38 @@ bg_argbuf_lock_at(uint32_t line)
 #define bg_argbuf_unlock() pthread_mutex_unlock(&bg_argbuf_mutex)
 static void bg_unlock(void) { bg_lock_depth--; pthread_mutex_unlock(&bg_ctx_mutex); }
 static void bg_defer_drain_locked(void);
+
+/* M9 bandwidth events.  Keep the 64-bit timeline record: a packs the surface
+ * shape/class/load-store and pass id, b is bytes for one full base surface.
+ * PASS: a = pass id, b = draws | attachments<<16 (gmem bits reserved zero:
+ * freedreno does not cheaply expose the batch mode here).
+ * ATTACH/SAMPLE: a = pass(12) | role(2) | class(2) | load(2) | store(2) |
+ * samples(4) | bpp(8) | height(13) | width(13); role 0 colour, 1 depth/stencil,
+ * 2 sampled. BLIT: a = kind(4) | src_class<<4 | dst_class<<6; b = bytes. */
+static uint64_t
+bg_tl_pack_surface(unsigned pass, unsigned role, const struct rwa_dram_info *d,
+                   unsigned load, unsigned store)
+{
+   return bg_tl_dram_pack_surface(pass, role, d->class, load, store,
+                                  d->samples, d->bpp, d->width, d->height);
+}
+static uint64_t
+bg_tl_pack_blit(unsigned kind, const struct rwa_dram_info *src, const struct rwa_dram_info *dst)
+{
+   return bg_tl_dram_pack_blit(kind, src->class, dst->class);
+}
+static void
+bg_tl_pass_attach(uint64_t tlcb, unsigned pass, unsigned role, const struct rwa_dram_info *d,
+                  unsigned load, unsigned store)
+{
+   bg_tl_event(BG_TL_PASS_ATTACH, (uint32_t)tlcb, bg_tl_pack_surface(pass, role, d, load, store),
+               d->bytes);
+}
+static void
+bg_tl_pass_sample(uint64_t tlcb, unsigned pass, const struct rwa_dram_info *d)
+{
+   bg_tl_event(BG_TL_PASS_SAMPLE, (uint32_t)tlcb, bg_tl_pack_surface(pass, 2, d, 0, 0), d->bytes);
+}
 
 /* The optional drawable shadow changes _tex under bg_lock (bgShadowLocked), so
  * bgCollectWrites keeps the old bg_lock path when it is on. */
@@ -1650,6 +1683,10 @@ bg_sync_commit(void)
                (bg_async_replay() && !bg_trace() && !bg_sync_commit()) ? 1 : 0, bg_tl_tid());
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    char why[512] = { 0 };
+   unsigned pass_id = 0, pass_draws = 0, pass_atts = 0;
+   struct rwa_texture *pass_seen[64];
+   unsigned n_pass_seen = 0;
+   BOOL pass_open = NO;
    bg_lock();
    bg_defer_drain_locked();
    // Re-resolve mutable argument-buffer encodings before ANY replay operation.
@@ -1684,6 +1721,30 @@ bg_sync_commit(void)
          [(BGMTLTexture *)w->depth bgInvalidateUploadCache];
       }
       if (w->kind == BG_WORK_PASS) {
+         if (pass_open)
+            bg_tl_event(BG_TL_PASS, _tlcb, pass_id,
+                        (uint64_t)(pass_draws & 0xffff) | ((uint64_t)(pass_atts & 0xff) << 16));
+         pass_id = (pass_id + 1) & 0xfff;
+         pass_draws = pass_atts = 0;
+         n_pass_seen = 0;
+         pass_open = YES;
+         for (unsigned i = 0; i < 8; i++) if (w->color[i]) {
+            struct rwa_dram_info d;
+            if (rwa_texture_dram_info([(BGMTLTexture *)w->color[i] rwaSurfaceTexture], &d) == 0) {
+               unsigned load = (unsigned)((w->pass_info[12] >> (i * 4)) & 15);
+               unsigned store = (unsigned)((w->pass_info[13] >> (i * 4)) & 15);
+               bg_tl_pass_attach(_tlcb, pass_id, 0, &d, load, store);
+               pass_atts++;
+            }
+         }
+         if (w->depth) {
+            struct rwa_dram_info d;
+            if (rwa_texture_dram_info([(BGMTLTexture *)w->depth rwaSurfaceTexture], &d) == 0) {
+               bg_tl_pass_attach(_tlcb, pass_id, 1, &d,
+                                 (unsigned)w->pass_info[16], (unsigned)w->pass_info[17]);
+               pass_atts++;
+            }
+         }
          rwa_pass_profile_pass(w->pass_info);
          if (rwa_lifetime_profile_active()) {
             for (unsigned i=0;i<8;i++) if (w->color[i])
@@ -1693,6 +1754,39 @@ bg_sync_commit(void)
                w->pass_info[16], w->pass_info[17]);
          }
          continue;
+      }
+      if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
+         pass_draws++;
+         for (unsigned i = 0; i < w->texture_count; i++) if (w->textures[i]) {
+            struct rwa_texture *t = [(BGMTLTexture *)w->textures[i] rwaTextureSampled];
+            BOOL seen = NO;
+            for (unsigned k = 0; k < n_pass_seen; k++) if (pass_seen[k] == t) { seen = YES; break; }
+            if (!seen && t) {
+               struct rwa_dram_info d;
+               if (rwa_texture_dram_info(t, &d) == 0) {
+                  bg_tl_pass_sample(_tlcb, pass_id, &d);
+                  if (n_pass_seen < 64) pass_seen[n_pass_seen++] = t;
+               }
+            }
+         }
+      }
+      if (w->kind == BG_WORK_TEXCOPY || w->kind == BG_WORK_BUF2TEX ||
+          w->kind == BG_WORK_TEX2BUF || w->kind == BG_WORK_COPY || w->kind == BG_WORK_FILL ||
+          w->kind == BG_WORK_MIPMAPS || w->kind == BG_WORK_RESOLVE) {
+         struct rwa_dram_info si = { .class = RWA_DRAM_OTHER };
+         struct rwa_dram_info di = { .class = RWA_DRAM_OTHER };
+         if ([w->src isKindOfClass:[BGMTLTexture class]])
+            rwa_texture_dram_info([(BGMTLTexture *)w->src rwaSurfaceTexture], &si);
+         if ([w->dst isKindOfClass:[BGMTLTexture class]])
+            rwa_texture_dram_info([(BGMTLTexture *)w->dst rwaSurfaceTexture], &di);
+         unsigned kind = w->kind == BG_WORK_TEXCOPY ? 1 : w->kind == BG_WORK_BUF2TEX ? 2 :
+                         w->kind == BG_WORK_TEX2BUF ? 3 : w->kind == BG_WORK_COPY ? 4 :
+                         w->kind == BG_WORK_FILL ? 5 : w->kind == BG_WORK_MIPMAPS ? 6 : 7;
+         uint64_t bytes = w->kind == BG_WORK_COPY || w->kind == BG_WORK_FILL ? w->size :
+            (uint64_t)w->t_size[0] * w->t_size[1] * w->t_size[2] * (si.bpp ? si.bpp : 4);
+         if (w->kind == BG_WORK_MIPMAPS || w->kind == BG_WORK_RESOLVE)
+            bytes = di.bytes;
+         bg_tl_event(BG_TL_BLIT, _tlcb, bg_tl_pack_blit(kind, &si, &di), bytes);
       }
       if (w->kind != BG_WORK_DRAW && w->kind != BG_WORK_CLEAR) rwa_pass_profile_work(w->kind);
       if (w->kind == BG_WORK_DISPATCH) {
@@ -1847,6 +1941,9 @@ bg_sync_commit(void)
       }
       if ([w->dst isKindOfClass:[BGMTLTexture class]]) [(BGMTLTexture *)w->dst bgInvalidateUploadCache];
    }
+   if (pass_open)
+      bg_tl_event(BG_TL_PASS, _tlcb, pass_id,
+                  (uint64_t)(pass_draws & 0xffff) | ((uint64_t)(pass_atts & 0xff) << 16));
    // jasmine: drawables written through their shadow (texture init) get the frame in one GPU blit, in order after the draws.
    if (_status != 5) {
       NSMutableSet *shadowed = nil;
@@ -2151,7 +2248,8 @@ bg_sync_commit(void)
    _renderPasses++;
    static int pass_profile;
    if (!pass_profile) pass_profile = getenv("BGMTL_PASS_PROFILE") && !strcmp(getenv("BGMTL_PASS_PROFILE"), "1") ? 1 : -1;
-   if (pass_profile == 1) {
+   int tl_pass = bg_tl_on();
+   if (pass_profile == 1 || tl_pass) {
       BGWork *w = [[[BGWork alloc] init] autorelease];
       w->kind = BG_WORK_PASS;
       id<MTLTexture> first = d.colorAttachments[0].texture ?: d.depthAttachment.texture ?: d.stencilAttachment.texture;
@@ -2159,14 +2257,14 @@ bg_sync_commit(void)
       for (unsigned i=0;i<8;i++) {
          MTLRenderPassColorAttachmentDescriptor *a=d.colorAttachments[i];
          if (!a.texture) continue;
-         if (getenv("BGMTL_LIFETIME_PROFILE") && !strcmp(getenv("BGMTL_LIFETIME_PROFILE"), "1"))
+         if (tl_pass || (getenv("BGMTL_LIFETIME_PROFILE") && !strcmp(getenv("BGMTL_LIFETIME_PROFILE"), "1")))
             w->color[i]=[a.texture retain];
          w->pass_info[3]++; w->pass_info[4+i]=a.texture.pixelFormat;
          w->pass_info[12] |= (uint64_t)a.loadAction << (i*4);
          w->pass_info[13] |= (uint64_t)a.storeAction << (i*4);
          if (a.resolveTexture) w->pass_info[14] |= 1u<<i;
       }
-      if (getenv("BGMTL_LIFETIME_PROFILE") && !strcmp(getenv("BGMTL_LIFETIME_PROFILE"), "1"))
+      if (tl_pass || (getenv("BGMTL_LIFETIME_PROFILE") && !strcmp(getenv("BGMTL_LIFETIME_PROFILE"), "1")))
          w->depth=[(d.depthAttachment.texture ?: d.stencilAttachment.texture) retain];
       w->pass_info[15]=d.depthAttachment.texture.pixelFormat;
       w->pass_info[16]=d.depthAttachment.loadAction; w->pass_info[17]=d.depthAttachment.storeAction;

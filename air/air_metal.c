@@ -4513,6 +4513,27 @@ rwa_texture_surface_id(const struct rwa_texture *t)
 {
    return t && t->imported ? t->lifetime_surface : 0;
 }
+
+int
+rwa_texture_dram_info(const struct rwa_texture *texture, struct rwa_dram_info *out)
+{
+   if (!texture || !texture->res || !out)
+      return -1;
+   struct pipe_resource *r = texture->res;
+   memset(out, 0, sizeof(*out));
+   out->width = r->width0;
+   out->height = r->height0;
+   out->bpp = util_format_get_blocksize(r->format);
+   out->samples = MAX2(r->nr_samples, 1u);
+   size_t stride = util_format_get_stride(r->format, r->width0);
+   uint64_t rows = util_format_get_nblocksy(r->format, r->height0);
+   out->bytes = (uint64_t)stride * rows * out->samples;
+   out->class = (texture->imported || texture->surface_handle) ? RWA_DRAM_SURFACE
+                                                               : RWA_DRAM_PRIVATE;
+   out->tiled = fd_resource_tile_mode(r, 0) != 0;
+   out->ubwc = fd_resource_ubwc_enabled(fd_resource(r), 0) ? 1 : 0;
+   return 0;
+}
 static int
 stage_write_destinations(const struct air_shader_info *info, const struct rwa_bindings *bindings,
    const struct rwa_buffer_bind *table, unsigned count, rwa_write_destination_fn visit,

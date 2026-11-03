@@ -1404,6 +1404,17 @@ void rwa_lifetime_attachment(struct rwa_texture *texture, unsigned slot, unsigne
  * buffer record access. */
 typedef int (*rwa_write_destination_fn)(void *, struct rwa_texture *);
 unsigned rwa_texture_surface_id(const struct rwa_texture *texture);
+
+/* M9 bandwidth instrumentation: immutable surface description for the timeline.
+ * `class` is RWA_DRAM_SURFACE (imported/IOSurface/linear) or RWA_DRAM_PRIVATE
+ * (driver-allocated); `bytes` is one full base-level surface including samples.
+ * It performs no mapping, waits, or pipe call. */
+enum { RWA_DRAM_SURFACE = 1, RWA_DRAM_PRIVATE = 2, RWA_DRAM_OTHER = 3 };
+struct rwa_dram_info {
+   unsigned width, height, bpp, samples, class, tiled, ubwc;
+   uint64_t bytes;
+};
+int rwa_texture_dram_info(const struct rwa_texture *texture, struct rwa_dram_info *out);
 int rwa_compute_write_destinations(struct rwa_compute *, const struct rwa_bindings *,
    const struct rwa_buffer_bind *, unsigned, rwa_write_destination_fn, void *, char *, size_t);
 int rwa_render_write_destinations(struct rwa_render *, const struct rwa_bindings *,

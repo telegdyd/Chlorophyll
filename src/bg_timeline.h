@@ -35,8 +35,12 @@ enum {
    BG_TL_SUBMIT_BEGIN, BG_TL_SUBMIT_END, BG_TL_REPLAY_END, BG_TL_SCHEDULED_RUN,
    BG_TL_FENCE_OBSERVED, BG_TL_COMPLETED_RUN, BG_TL_PRESENT_POST, BG_TL_PRESENT_ENTER,
    BG_TL_LOCK_WAIT, BG_TL_HANDLERS_BEGIN, BG_TL_DEFER_DRAIN, BG_TL_GETBYTES,
-   BG_TL_REPLAY_WAIT
+   BG_TL_REPLAY_WAIT, BG_TL_PASS, BG_TL_PASS_ATTACH, BG_TL_PASS_SAMPLE, BG_TL_BLIT
 };
+/* M9 bandwidth records: see bg_tl_dram.h for the packed `a` fields.
+ * PASS: a = pass id, b = draws | attachments<<16.
+ * PASS_ATTACH/PASS_SAMPLE: b = full-surface bytes (sample = upper bound).
+ * BLIT: b = bytes, a = kind | src class<<4 | dst class<<6. */
 /* LOCK_WAIT belongs to no CB: a = file<<62 | line<<48 | thread id, b = ticks waited. */
 #define BG_TL_NO_CB 0xffffffffu
 #define BG_TL_LOCK_WAIT_MIN_NS 100000ull
