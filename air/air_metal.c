@@ -140,6 +140,7 @@ struct pipe_screen *fd_screen_create(int, const struct pipe_screen_config *, str
 #include "freedreno_fence.h"
 #include <errno.h>
 #include "util/u_sampler.h"
+#include "util/u_framebuffer.h"
 #include "util/u_debug.h"
 #include "util/u_gen_mipmap.h"
 #include "util/simple_mtx.h"
@@ -223,6 +224,8 @@ struct rwa_device {
     * deletes graphics state calls gs_invalidate. RWA_STATE_CACHE=0 binds everything every draw, as before. */
    struct {
       bool valid;
+      bool fb_valid;
+      struct pipe_framebuffer_state fb;
       void *blend, *dsa, *rast, *vs, *fs, *velem;
       struct pipe_viewport_state vp;
       struct pipe_scissor_state sc;
@@ -253,6 +256,7 @@ static void
 gs_invalidate(struct rwa_device *device)
 {
    device->gs.valid = false;
+   device->gs.fb_valid = false;
    for (unsigned st = 0; st < MESA_SHADER_STAGES; st++)
       for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++)
          device->gs.cb[st][i].set = false;
@@ -2179,7 +2183,15 @@ static void
 fb_bind(struct rwa_device *device, const struct pipe_framebuffer_state *fb, struct rwa_texture *const *color,
         unsigned color_count, struct rwa_texture *depth)
 {
+   if (device->gs.fb_valid && util_framebuffer_state_equal(&device->gs.fb, fb)) {
+      for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
+         device->fb_color[i] = i < color_count ? color[i] : NULL;
+      device->fb_depth = depth;
+      return;
+   }
    device->pipe->set_framebuffer_state(device->pipe, fb);
+   device->gs.fb = *fb;
+   device->gs.fb_valid = true;
    for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
       device->fb_color[i] = i < color_count ? color[i] : NULL;
    device->fb_depth = depth;
@@ -2189,12 +2201,14 @@ fb_bind(struct rwa_device *device, const struct pipe_framebuffer_state *fb, stru
 static void
 fb_release_texture(struct rwa_device *device, struct rwa_texture *t)
 {
+   device->gs.fb_valid = false;
    bool held = device->fb_depth == t;
    for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
       held |= device->fb_color[i] == t;
    if (!held)
       return;
    device->pipe->set_framebuffer_state(device->pipe, &(struct pipe_framebuffer_state){ 0 });
+   device->gs.fb_valid = false;
    memset(device->fb_color, 0, sizeof(device->fb_color));
    device->fb_depth = NULL;
 }
