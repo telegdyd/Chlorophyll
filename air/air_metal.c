@@ -1365,13 +1365,18 @@ static struct {
 static uint64_t tex_pool_total;
 static simple_mtx_t tex_pool_mtx = SIMPLE_MTX_INITIALIZER;
 
+static int tex_pool_enabled;
+static void
+tex_pool_init(void)
+{
+   tex_pool_enabled = !(getenv("RWA_TEX_POOL") && getenv("RWA_TEX_POOL")[0] == '0');
+}
 static bool
 tex_pool_on(void)
 {
-   static int on = -1;
-   if (on < 0)
-      on = !(getenv("RWA_TEX_POOL") && getenv("RWA_TEX_POOL")[0] == '0');
-   return on;
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+   pthread_once(&once, tex_pool_init);
+   return tex_pool_enabled;
 }
 
 static uint64_t
@@ -1411,7 +1416,8 @@ tex_pool_take(struct rwa_device *device, const struct pipe_resource *t, struct p
       return NULL;
    struct pipe_resource *res = NULL;
    simple_mtx_lock(&tex_pool_mtx);
-   tex_pool_expire(os_time_get_nano());
+   /* No expiry here: tex_pool_drop() destroys sampler views on the pipe, and the
+    * create path runs without bg_lock (M8).  tex_pool_put() expires under bg_lock. */
    for (unsigned k = 0; k < TEX_POOL_N; k++) {
       const struct pipe_resource *r = tex_pool[k].res;
       if (r && tex_pool[k].dev == device && r->target == t->target && r->format == t->format &&
