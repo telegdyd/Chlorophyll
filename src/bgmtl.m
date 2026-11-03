@@ -216,9 +216,83 @@ bg_lock_at(uint64_t site)
 }
 #define bg_lock() bg_lock_at(BG_TL_SITE(0, __LINE__))
 static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
+static void bg_defer_drain_locked(void);
 
 #include "bg_upload_profile.h"
 #include "bg_nocopy_cache.h"
+#include "bg_defer_queue.h"
+
+static void bg_shadow_release(struct rwa_texture *sh);
+
+/* Destruction deferred from a contended dealloc.  The node owns the pipe-side
+ * objects and the surface references; the caller frees caller-memory bookkeeping
+ * before returning.  bg_defer_node.destroy runs under bg_lock on the replay
+ * worker, then release runs after it, preserving the current destroy-before-
+ * CFRelease order. */
+struct bg_defer_item {
+   struct bg_defer_node node;   /* must be first: drain hands back this pointer */
+   struct rwa_texture *tex;
+   struct rwa_texture *surf;
+   struct rwa_buffer *buf;
+   CFTypeRef surface, copy_surface;
+   struct bg_nc_cache nc;
+};
+static int bg_defer_logged;
+
+static void
+bg_defer_item_destroy(struct bg_defer_node *n)
+{
+   struct bg_defer_item *d = (struct bg_defer_item *)n;
+   if (d->buf) {
+      rwa_buffer_destroy(d->buf);
+      return;
+   }
+   bg_nc_cache_destroy(&d->nc);
+   if (d->surf) {
+      bg_shadow_release(d->tex);
+      rwa_texture_destroy(d->surf);
+   } else if (d->tex) {
+      rwa_texture_destroy(d->tex);
+   }
+}
+
+static void
+bg_defer_item_release(struct bg_defer_node *n)
+{
+   struct bg_defer_item *d = (struct bg_defer_item *)n;
+   if (d->surface) CFRelease(d->surface);
+   if (d->copy_surface) CFRelease(d->copy_surface);
+}
+
+static struct bg_defer_item *
+bg_defer_item_new(void)
+{
+   struct bg_defer_item *d = calloc(1, sizeof(*d));
+   if (d) {
+      d->node.destroy = bg_defer_item_destroy;
+      d->node.release = bg_defer_item_release;
+   }
+   return d;
+}
+
+static void
+bg_defer_note(const char *what)
+{
+   if (!__atomic_exchange_n(&bg_defer_logged, 1, __ATOMIC_ACQ_REL))
+      BG_LOG("%s destroy: deferred (bg_lock contended)\n", what);
+}
+
+static void
+bg_defer_drain_locked(void)
+{
+   uint64_t t0 = 0;
+   if (__atomic_load_n(&bg_tl.state, __ATOMIC_ACQUIRE) == BG_TL_ARMED)
+      t0 = mach_absolute_time();
+   unsigned n = bg_defer_drain();
+   if (n && t0)
+      bg_tl_event(BG_TL_DEFER_DRAIN, BG_TL_NO_CB, n, mach_absolute_time() - t0);
+}
+
 
 // jasmine: caller memory (newBufferWithBytesNoCopy, newTextureWithBytesNoCopy) is read at replay. Inline that is inside
 // commit; async it is later, on the replay worker, and CoreAnimation can unmap a layer buffer (VM_MEMORY_LAYERKIT) whose
@@ -1133,7 +1207,34 @@ bg_air_slice(NSData *d)
 }
 - (void)dealloc
 {
-   if (_buf) { bg_lock(); rwa_buffer_destroy(_buf); bg_unlock(); }
+   if (_buf) {
+      int lock_rc = pthread_mutex_trylock(&bg_ctx_mutex);
+      if (lock_rc == 0) {
+         bg_defer_drain_locked();
+         rwa_buffer_destroy(_buf);
+         pthread_mutex_unlock(&bg_ctx_mutex);
+         _buf = NULL;
+      } else if (lock_rc == EBUSY) {
+         struct bg_defer_item *d = bg_defer_item_new();
+         if (d) {
+            d->buf = _buf; _buf = NULL;
+            bg_defer_note("buffer");
+            bg_defer_push(&d->node);
+         } else {
+            bg_lock();
+            bg_defer_drain_locked();
+            rwa_buffer_destroy(_buf);
+            bg_unlock();
+            _buf = NULL;
+         }
+      } else {
+         bg_lock();
+         bg_defer_drain_locked();
+         rwa_buffer_destroy(_buf);
+         bg_unlock();
+         _buf = NULL;
+      }
+   }
    bg_unpin(&_pin);
    if (_deallocator) { _deallocator(_contents, _length); Block_release(_deallocator); }
    [super dealloc];
@@ -1506,6 +1607,7 @@ bg_sync_commit(void)
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    char why[512] = { 0 };
    bg_lock();
+   bg_defer_drain_locked();
    // Re-resolve mutable argument-buffer encodings before ANY replay operation.
    // Unexpected imported destinations must be protected too, or fail the whole CB.
    if (!_admissionFailed)
@@ -2293,11 +2395,45 @@ bg_shadow_release(struct rwa_texture *sh)
 }
 - (void)dealloc
 {
-   bg_lock();
-   bg_nc_cache_destroy(&_ncCache);
-   if (_surfTex) { bg_shadow_release(_tex); rwa_texture_destroy(_surfTex); }
-   else if (_tex) rwa_texture_destroy(_tex);
-   bg_unlock();
+   if (_tex || _surfTex) {
+      int lock_rc = pthread_mutex_trylock(&bg_ctx_mutex);
+      if (lock_rc == 0) {
+         /* Uncontended: the historical path, plus a chance to drain earlier deferrals. */
+         bg_defer_drain_locked();
+         bg_nc_cache_destroy(&_ncCache);
+         if (_surfTex) { bg_shadow_release(_tex); rwa_texture_destroy(_surfTex); }
+         else if (_tex) rwa_texture_destroy(_tex);
+         pthread_mutex_unlock(&bg_ctx_mutex);
+      } else if (lock_rc == EBUSY) {
+         struct bg_defer_item *d = bg_defer_item_new();
+         if (d) {
+            d->tex = _tex; d->surf = _surfTex;
+            d->surface = _surface; d->copy_surface = _copySurface;
+            d->nc = _ncCache;
+            memset(&_ncCache, 0, sizeof(_ncCache));
+            _tex = NULL; _surfTex = NULL; _surface = NULL; _copySurface = NULL;
+            bg_defer_note("texture");
+            bg_defer_push(&d->node);
+         } else {
+            /* OOM: fall back to today's blocking destroy. */
+            bg_lock();
+            bg_defer_drain_locked();
+            bg_nc_cache_destroy(&_ncCache);
+            if (_surfTex) { bg_shadow_release(_tex); rwa_texture_destroy(_surfTex); }
+            else if (_tex) rwa_texture_destroy(_tex);
+            bg_unlock();
+         }
+      } else {
+         bg_lock();
+         bg_defer_drain_locked();
+         bg_nc_cache_destroy(&_ncCache);
+         if (_surfTex) { bg_shadow_release(_tex); rwa_texture_destroy(_surfTex); }
+         else if (_tex) rwa_texture_destroy(_tex);
+         bg_unlock();
+      }
+   } else {
+      bg_nc_cache_destroy(&_ncCache);
+   }
    if (_surface) CFRelease(_surface);
    if (_copySurface) CFRelease(_copySurface);
    [_linSrc release];
