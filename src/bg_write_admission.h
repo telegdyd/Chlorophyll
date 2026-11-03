@@ -1,7 +1,15 @@
 /* SPDX-License-Identifier: MIT */
 /* M7 encode-time write ownership. The registry retains a token, not the CB: CB destruction
- * removes its entries under bg_lock. An unresolved terminal entry is quarantined
+ * removes its entries under bg_adm_mutex. An unresolved terminal entry is quarantined
  * (surface remains set, owner NULL), never a dangling object pointer.
+ *
+ * Locking (M8). The table and the suspended counters are guarded by bg_adm_mutex.
+ * Admission also needs bg_lock (its BEGIN reaches the context) and always takes
+ * bg_lock first, then bg_adm_mutex, holding both across check + BEGIN + insert.
+ * Release and quarantine take only bg_adm_mutex: completion used to wait on
+ * bg_lock for the whole replay of the next command buffer (fence->completed p50
+ * 9.9 ms in the M8 captures) just to walk this table. Nothing under
+ * bg_adm_mutex takes bg_lock.
  *
  * Display-suspended policy. The kernel clears ticket bit 3 while the presenter is
  * unavailable (display asleep, queue fallback/power-off/terminal), and BEGIN then
@@ -23,8 +31,11 @@
 #define BG_MAX_PENDING_WRITERS 1024
 static struct { unsigned surface; BGWriteOwner *owner; uint64_t generation; }
    bg_pending_writers[BG_MAX_PENDING_WRITERS];
+static pthread_mutex_t bg_adm_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void bg_adm_lock(void) { bg_lock(); pthread_mutex_lock(&bg_adm_mutex); }
+static void bg_adm_unlock(void) { pthread_mutex_unlock(&bg_adm_mutex); bg_unlock(); }
 /* Process counters for suspended admission; first event and every 100th are logged,
- * so a long display sleep cannot flood the console. Called under bg_lock. */
+ * so a long display sleep cannot flood the console. Called under bg_adm_mutex. */
 static unsigned bg_suspended_events, bg_suspended_deferred, bg_suspended_reticketed,
                 bg_suspended_unticketed;
 static void
@@ -45,7 +56,7 @@ bg_suspended_event(int force)
 - (void)bgReleaseAdmissionOwners
 {
    if (!_writeOwner) return;
-   bg_lock();
+   pthread_mutex_lock(&bg_adm_mutex);
    for (unsigned n=0;n<BG_MAX_PENDING_WRITERS;n++) {
       if (bg_pending_writers[n].owner != _writeOwner) continue;
       // Deferred/unticketed entries have no generation and are released here;
@@ -58,24 +69,24 @@ bg_suspended_event(int force)
          memset(&bg_pending_writers[n],0,sizeof(bg_pending_writers[n]));
       }
    }
-   bg_unlock();
+   pthread_mutex_unlock(&bg_adm_mutex);
 }
 - (void)bgQuarantineAdmissionOwners
 {
    if (!_writeOwner) return;
-   bg_lock();
+   pthread_mutex_lock(&bg_adm_mutex);
    for (unsigned n=0;n<BG_MAX_PENDING_WRITERS;n++)
       if (bg_pending_writers[n].owner == _writeOwner) {
          [bg_pending_writers[n].owner release]; bg_pending_writers[n].owner=nil;
       }
-   bg_unlock();
+   pthread_mutex_unlock(&bg_adm_mutex);
 }
 - (BOOL)bgAdmitRaw:(struct rwa_texture *)texture
 {
    unsigned surface=rwa_texture_surface_id(texture);
    if (!surface) return YES;
-   bg_lock();
-   if (_admissionFailed) { bg_unlock(); return NO; }
+   bg_adm_lock();
+   if (_admissionFailed) { bg_adm_unlock(); return NO; }
    BGWriteOwner *prior=nil;
    unsigned vacant=BG_MAX_PENDING_WRITERS;
    for (unsigned n=0;n<BG_MAX_PENDING_WRITERS;n++) {
@@ -87,7 +98,7 @@ bg_suspended_event(int force)
          // a still-suspended destination is never retried twice.
          unsigned d=0;
          while (d<_dcount && _dsurf[d]!=surface) d++;
-         if (!_committed || bg_pending_writers[n].generation || d==_dcount) { bg_unlock(); return YES; }
+         if (!_committed || bg_pending_writers[n].generation || d==_dcount) { bg_adm_unlock(); return YES; }
          uint64_t generation=0,epoch=0;
          int result=rwa_texture_ticket_begin(texture,&generation,&epoch);
          if (!result) {
@@ -105,24 +116,24 @@ bg_suspended_event(int force)
             bg_tl_ticket(_tlcb, 0, 0, 1);
          } else {
             _dsurf[d]=_dsurf[--_dcount];
-            bg_unlock();
+            bg_adm_unlock();
             return [self bgAdmissionReject:[NSString stringWithFormat:@"imported destination %u BEGIN refused (%d); no writes replayed",surface,result]];
          }
-         bg_unlock();
+         bg_adm_unlock();
          return YES;
       }
       prior=bg_pending_writers[n].owner;
       // A replay-time discovery cannot wait while holding the context. An
       // uncommitted producer may depend on this caller to commit: never wait.
       if (!prior || !prior->committed || _committed) {
-         bg_unlock();
+         bg_adm_unlock();
          return [self bgAdmissionReject:@"imported destination has an uncommitted, replay-time or unresolved owner"];
       }
       [prior retain];
       break;
    }
    if (prior) {
-      bg_unlock();
+      bg_adm_unlock();
       // One bounded wait, outside the context lock and callback monitor. Full
       // completion also covers different devices and CPU-blit ownership.
       long timedout=dispatch_group_wait(prior->done,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC));
@@ -130,17 +141,17 @@ bg_suspended_event(int force)
       if (timedout) return [self bgAdmissionReject:@"imported destination prior producer did not complete within admission deadline"];
       // Requery kernel ownership exactly once. Queue/show/retire protection may
       // still refuse it; waiting for our producer never overrides that result.
-      bg_lock();
+      bg_adm_lock();
       vacant=BG_MAX_PENDING_WRITERS;
       for (unsigned n=0;n<BG_MAX_PENDING_WRITERS;n++) {
          if (!bg_pending_writers[n].surface) vacant=n;
          if (bg_pending_writers[n].surface == surface) {
-            bg_unlock(); return [self bgAdmissionReject:@"imported destination still owned after producer completion"];
+            bg_adm_unlock(); return [self bgAdmissionReject:@"imported destination still owned after producer completion"];
          }
       }
    }
    if (_tcount + _dcount + _ucount >= BG_MAX_WRITE_DESTINATIONS || vacant == BG_MAX_PENDING_WRITERS) {
-      bg_unlock(); return [self bgAdmissionReject:@"imported destination admission capacity exceeded"];
+      bg_adm_unlock(); return [self bgAdmissionReject:@"imported destination admission capacity exceeded"];
    }
    uint64_t generation=0,epoch=0;
    int result=rwa_texture_ticket_begin(texture,&generation,&epoch);
@@ -154,11 +165,11 @@ bg_suspended_event(int force)
       else { _dsurf[_dcount++]=surface; ++bg_suspended_deferred; }
       bg_suspended_event(0);
       bg_tl_ticket(_tlcb, 0, 0, 1);
-      bg_unlock();
+      bg_adm_unlock();
       return YES;
    }
    if (result) {
-      bg_unlock();
+      bg_adm_unlock();
       return [self bgAdmissionReject:[NSString stringWithFormat:@"imported destination %u BEGIN refused (%d); no writes replayed",surface,result]];
    }
    _tgen[_tcount]=generation; _tepoch[_tcount]=epoch; _tsurf[_tcount++]=surface;
@@ -166,7 +177,7 @@ bg_suspended_event(int force)
    bg_pending_writers[vacant].owner=[_writeOwner retain];
    bg_pending_writers[vacant].generation=generation;
    bg_tl_ticket(_tlcb, generation, epoch, _committed ? 1 : 0);
-   bg_unlock();
+   bg_adm_unlock();
    return YES;
 }
 - (void)bgTicketFor:(id)texture

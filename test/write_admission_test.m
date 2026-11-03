@@ -41,6 +41,7 @@ static int test_ticket_end(uint64_t generation,uint64_t epoch,int abort) {
    ticket_end_generation=generation; ticket_end_epoch=epoch;
    return 0;
 }
+static void bg_tl_ticket(uint32_t cb,uint64_t g,uint64_t e,int deferred) { (void)cb; (void)g; (void)e; (void)deferred; }
 static void reset_ticket_end_stats(void) {
    ticket_end_calls=ticket_end_aborts=0; ticket_end_generation=ticket_end_epoch=0;
 }
@@ -64,7 +65,7 @@ static void reset_ticket_end_stats(void) {
    uint64_t _tgen[32],_tepoch[32]; uint32_t _tsurf[32]; unsigned _tcount;
    uint32_t _dsurf[32]; unsigned _dcount, _ucount;   // deferred, and admitted unticketed
    BOOL _admissionFailed,_committed; BGWriteOwner *_writeOwner;
-   NSError *_error; dispatch_group_t _done;
+   NSError *_error; dispatch_group_t _done; uint32_t _tlcb;
 }
 - (BOOL)bgAdmissionReject:(NSString *)reason;
 - (BOOL)bgAdmitRaw:(struct rwa_texture *)texture;
@@ -361,6 +362,30 @@ int main(void) { @autoreleasepool {
    assert(ticket_end_calls==2 && registry_total()==0);
    [again release];
 
+   // M8: completion releases its registry entries without bg_lock, so it never
+   // waits for another command buffer's replay that holds the context.
+   BGMTLCommandBuffer *done_cb=[[BGMTLCommandBuffer alloc]init];
+   t[0].refused=0;
+   assert([done_cb bgAdmitRaw:&t[0]] && registry_total()==1);
+   [done_cb commitPending];
+   dispatch_semaphore_t held=dispatch_semaphore_create(0), finish=dispatch_semaphore_create(0);
+   dispatch_async(dispatch_get_global_queue(0,0),^{
+      bg_lock(); dispatch_semaphore_signal(held);
+      dispatch_semaphore_wait(finish,DISPATCH_TIME_FOREVER); bg_unlock();
+   });
+   dispatch_semaphore_wait(held,DISPATCH_TIME_FOREVER);
+   dispatch_semaphore_t released=dispatch_semaphore_create(0);
+   dispatch_async(dispatch_get_global_queue(0,0),^{
+      done_cb->_tcount=0; [done_cb bgReleaseAdmissionOwners]; dispatch_semaphore_signal(released);
+   });
+   assert(!dispatch_semaphore_wait(released,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC)));
    assert(registry_total()==0);
-   puts("PASS: legacy admission + deferred encode/replay (ticket, unticketed, EBUSY, ENOTSUP, replay-discovered, 32 cap with unticketed, uncommitted ownership, one retry, reticket log, sealed-surface reuse, diagnostics)");
+   dispatch_semaphore_signal(finish);
+   bg_lock(); bg_unlock();   // the holder has let go
+   dispatch_group_leave(done_cb->_done);
+   [done_cb release];
+   dispatch_release(held); dispatch_release(finish); dispatch_release(released);
+
+   assert(registry_total()==0);
+   puts("PASS: release without bg_lock; legacy admission + deferred encode/replay (ticket, unticketed, EBUSY, ENOTSUP, replay-discovered, 32 cap with unticketed, uncommitted ownership, one retry, reticket log, sealed-surface reuse, diagnostics)");
 } }
