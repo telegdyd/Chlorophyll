@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include "air_metal.h"
 #include "bg_refusal_log.h"
+#include "bg_timeline.h"
 
 // ---- the private bases (names only; their layouts are Metal's) -----------------------------------------------------
 @interface _MTLDevice : NSObject
@@ -453,6 +454,7 @@ bg_install_fallback(Class c)
    BOOL _ticketDrainFailed; // retain kernel protection if submitted writes could not be drained
    BOOL _admissionFailed, _committed;
    BGWriteOwner *_writeOwner;
+   uint32_t _tlcb;           // M8 timeline CB id, 0 when the ring is off/not armed
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (void)bgTicketFor:(id)texture;
@@ -1201,6 +1203,7 @@ static void *bg_replay_bytes(id b) { return [b isKindOfClass:[BGMTLBuffer class]
    if (!_writeOwner) { [self release]; return nil; }
    _status = 1;   // MTLCommandBufferStatusEnqueued
    if (bg_timing()) bg_tm(BG_TM_CREATE, 0, 0, 0);
+   _tlcb = bg_tl_create();
    return self;
 }
 - (void)dealloc
@@ -1444,6 +1447,7 @@ bg_sync_commit(void)
 {
    bgmtl_note_committed();
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   bg_tl_event(BG_TL_COMMIT_ENTER, _tlcb, (uint64_t)[_work count], 0);
    dispatch_group_enter(_done);
    dispatch_group_enter(_sched);
    // A registry observer may wait as soon as committed is published. Enter both
@@ -1480,6 +1484,8 @@ bg_sync_commit(void)
 {
    BG_TRACE("commit: %lu recorded commands\n", (unsigned long)[_work count]);
    uint64_t t_replay = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   bg_tl_event(BG_TL_REPLAY_BEGIN, _tlcb,
+               (bg_async_replay() && !bg_trace() && !bg_sync_commit()) ? 1 : 0, bg_tl_tid());
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    char why[512] = { 0 };
    bg_lock();
@@ -1718,9 +1724,11 @@ bg_sync_commit(void)
    // current; requiring seqno 0 too keeps another thread's failure from
    // failing this CB.
    uint64_t submit_errors0 = rwa_submit_failures();
+   bg_tl_event(BG_TL_SUBMIT_BEGIN, _tlcb, 0, 0);
    struct rwa_fence *fence = rwa_flush([dev rwa]);
    uint32_t kseqno = fence ? rwa_fence_seqno([dev rwa], fence) : 0;
    BOOL submit_failed = fence && !kseqno && rwa_submit_failures() != submit_errors0;
+   bg_tl_event(BG_TL_SUBMIT_END, _tlcb, kseqno, submit_failed ? 1 : 0);
    if (submit_failed)
       [self bgFailWith:@"GPU submit failed; command buffer did not run" code:3];
    if (_tcount) {   // jasmine: seal this command buffer's render tickets with its submit (bgTicketFor)
@@ -1739,12 +1747,16 @@ bg_sync_commit(void)
    rwa_pass_profile_end();
    rwa_state_profile_end(); // Include the ticket's deferred-submit drain in the inventory.
    uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   bg_tl_event(BG_TL_REPLAY_END, _tlcb, (uint64_t)(uint32_t)_status, 0);
    bg_unlock();
    dispatch_group_leave(_sched);
-   if (!defer_scheduled)
+   if (!defer_scheduled) {
+      bg_tl_event(BG_TL_SCHEDULED_RUN, _tlcb, BG_TL_Q_REPLAY, bg_tl_tid());
       [self bgDeliverHandlers:_scheduled completed:NO];
+   }
    if (bg_trace() || bg_sync_commit()) {
-      if (bg_fence_wait(dev, fence, why, sizeof(why)) != 0)
+      int fence_rc = bg_fence_wait(dev, fence, why, sizeof(why));
+      if (fence_rc != 0)
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5)
          @synchronized (self) { _status = 4; }
@@ -1752,7 +1764,10 @@ bg_sync_commit(void)
          unsigned nd = 0;
          for (BGWork *w in _work)
             if (w->kind == BG_WORK_DRAW) nd++;
-         bg_perf_note(t_begin, t_flushed, clock_gettime_nsec_np(CLOCK_MONOTONIC), nd);
+         uint64_t t_waited = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+         bg_tl_event(BG_TL_FENCE_OBSERVED, _tlcb, (uint64_t)(fence_rc != 0),
+                     (t_waited - t_flushed) / 1000);
+         bg_perf_note(t_begin, t_flushed, t_waited, nd);
       }
       rwa_fence_release([dev rwa], fence);
       [self bgReleaseAdmissionOwners];
@@ -1768,11 +1783,14 @@ bg_sync_commit(void)
    dispatch_async(completion, ^{
       @autoreleasepool {
          char w2[512] = { 0 };
-         if (bg_fence_wait(dev, fence, w2, sizeof(w2)) != 0)
+         int fence_rc = bg_fence_wait(dev, fence, w2, sizeof(w2));
+         if (fence_rc != 0)
             [self bgFailWith:[NSString stringWithUTF8String:w2] code:3];
          else if (_status != 5)
             @synchronized (self) { _status = 4; }   // Completed: the fence has been paid
          uint64_t t_fence = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+         bg_tl_event(BG_TL_FENCE_OBSERVED, _tlcb, (uint64_t)(fence_rc != 0),
+                     (t_fence - t_flushed) / 1000);
          rwa_fence_release([dev rwa], fence);
          [self bgReleaseAdmissionOwners];
          [self bgCompleteFrom:t_begin];
@@ -1788,6 +1806,9 @@ bg_sync_commit(void)
 {
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    (void)dev;
+   if (bg_defer_scheduled())
+      bg_tl_event(BG_TL_SCHEDULED_RUN, _tlcb,
+                  (bg_trace() || bg_sync_commit()) ? BG_TL_Q_INLINE : BG_TL_Q_COMPLETION, bg_tl_tid());
    [self bgDeliverHandlers:_scheduled completed:NO];    // left here by the compositor's deferral (see commit)
    // what the GPU wrote into an IOSurface becomes visible to the compositor before the drawable is presented
    // In the compositor (backboardd, BGMTL_BB) the IOSurfaces drawn into are its own framebuffers: the GPU writes DRAM, the display
@@ -1914,6 +1935,7 @@ bg_sync_commit(void)
    if (_status == 4)
       bgmtl_note_completed();
    if (_status == 4) {
+      bg_tl_event(BG_TL_PRESENT_ENTER, _tlcb, (uint64_t)[_presents count], bg_tl_tid());
       for (NSArray *p in _presents) {
          id dr = p[0];
          double at = [p[1] doubleValue], after = [p[2] doubleValue];
@@ -1921,9 +1943,15 @@ bg_sync_commit(void)
          else if (after > 0 && [dr respondsToSelector:@selector(presentAfterMinimumDuration:)]) [dr presentAfterMinimumDuration:after];
          else [dr present];
       }
+      bg_tl_event(BG_TL_PRESENT_POST, _tlcb, 0, (uint64_t)[_presents count]);
    }
    [_presents removeAllObjects];
+   // Read before the handlers run: a completed handler may drop the last reference to self.
+   uint32_t tlcb = _tlcb;
+   uint64_t tlstatus = (uint32_t)_status;
    [self bgDeliverHandlers:_completed completed:YES];
+   bg_tl_completed(tlcb, tlstatus,
+                   (bg_trace() || bg_sync_commit()) ? BG_TL_Q_INLINE : BG_TL_Q_COMPLETION);
 }
 
 - (void)waitUntilCompleted

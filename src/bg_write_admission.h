@@ -96,11 +96,13 @@ bg_suspended_event(int force)
             bg_pending_writers[n].generation=generation;
             ++bg_suspended_reticketed;
             bg_suspended_event(1);
+            bg_tl_ticket(_tlcb, generation, epoch, 1);
          } else if (result == -EAGAIN) {
             _dsurf[d]=_dsurf[--_dcount];
             ++_ucount;   // deferred -> unticketed: the total stays the same
             ++bg_suspended_unticketed;
             bg_suspended_event(0);
+            bg_tl_ticket(_tlcb, 0, 0, 1);
          } else {
             _dsurf[d]=_dsurf[--_dcount];
             bg_unlock();
@@ -151,6 +153,7 @@ bg_suspended_event(int force)
       if (_committed) { ++_ucount; ++bg_suspended_unticketed; }
       else { _dsurf[_dcount++]=surface; ++bg_suspended_deferred; }
       bg_suspended_event(0);
+      bg_tl_ticket(_tlcb, 0, 0, 1);
       bg_unlock();
       return YES;
    }
@@ -162,6 +165,7 @@ bg_suspended_event(int force)
    bg_pending_writers[vacant].surface=surface;
    bg_pending_writers[vacant].owner=[_writeOwner retain];
    bg_pending_writers[vacant].generation=generation;
+   bg_tl_ticket(_tlcb, generation, epoch, _committed ? 1 : 0);
    bg_unlock();
    return YES;
 }
