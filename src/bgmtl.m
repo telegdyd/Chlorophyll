@@ -686,6 +686,7 @@ bg_install_fallback(Class c)
 - (struct rwa_texture *)rwaAdmissionTexture;
 - (void)bgShadowLocked;   // jasmine: compositor render targets over an IOSurface draw in a shared shadow
 - (struct rwa_texture *)rwaSurfaceTexture;   // jasmine: the imported IOSurface itself (under a shadow too), or NULL
+- (struct rwa_texture *)rwaTextureAny;       // M9 timeline: the surface, else the private texture; no sync
 - (struct rwa_texture *)rwaTextureSampled;  // also cleans the CPU cache of a surface another process wrote since
 @end
 
@@ -1730,7 +1731,7 @@ bg_sync_commit(void)
          pass_open = YES;
          for (unsigned i = 0; i < 8; i++) if (w->color[i]) {
             struct rwa_dram_info d;
-            if (rwa_texture_dram_info([(BGMTLTexture *)w->color[i] rwaSurfaceTexture], &d) == 0) {
+            if (rwa_texture_dram_info([(BGMTLTexture *)w->color[i] rwaTextureAny], &d) == 0) {
                unsigned load = (unsigned)((w->pass_info[12] >> (i * 4)) & 15);
                unsigned store = (unsigned)((w->pass_info[13] >> (i * 4)) & 15);
                bg_tl_pass_attach(_tlcb, pass_id, 0, &d, load, store);
@@ -1739,7 +1740,7 @@ bg_sync_commit(void)
          }
          if (w->depth) {
             struct rwa_dram_info d;
-            if (rwa_texture_dram_info([(BGMTLTexture *)w->depth rwaSurfaceTexture], &d) == 0) {
+            if (rwa_texture_dram_info([(BGMTLTexture *)w->depth rwaTextureAny], &d) == 0) {
                bg_tl_pass_attach(_tlcb, pass_id, 1, &d,
                                  (unsigned)w->pass_info[16], (unsigned)w->pass_info[17]);
                pass_atts++;
@@ -1776,9 +1777,9 @@ bg_sync_commit(void)
          struct rwa_dram_info si = { .class = RWA_DRAM_OTHER };
          struct rwa_dram_info di = { .class = RWA_DRAM_OTHER };
          if ([w->src isKindOfClass:[BGMTLTexture class]])
-            rwa_texture_dram_info([(BGMTLTexture *)w->src rwaSurfaceTexture], &si);
+            rwa_texture_dram_info([(BGMTLTexture *)w->src rwaTextureAny], &si);
          if ([w->dst isKindOfClass:[BGMTLTexture class]])
-            rwa_texture_dram_info([(BGMTLTexture *)w->dst rwaSurfaceTexture], &di);
+            rwa_texture_dram_info([(BGMTLTexture *)w->dst rwaTextureAny], &di);
          unsigned kind = w->kind == BG_WORK_TEXCOPY ? 1 : w->kind == BG_WORK_BUF2TEX ? 2 :
                          w->kind == BG_WORK_TEX2BUF ? 3 : w->kind == BG_WORK_COPY ? 4 :
                          w->kind == BG_WORK_FILL ? 5 : w->kind == BG_WORK_MIPMAPS ? 6 : 7;
@@ -2606,6 +2607,7 @@ bg_shadow_release(struct rwa_texture *sh)
  * did not hold (motion jumped back and forth). Opt-in since the render tickets (BGMTL_SHADOW=1; step 7 r17: no band and
  * no tearing without it, 6 MB less copied per frame). Caller holds bg_lock. */
 - (struct rwa_texture *)rwaSurfaceTexture { return _surfTex ? _surfTex : (_surface ? _tex : NULL); }
+- (struct rwa_texture *)rwaTextureAny { return _surfTex ? _surfTex : _tex; }
 - (struct rwa_texture *)rwaAdmissionTexture { return _tex; }
 - (void)bgShadowLocked
 {
