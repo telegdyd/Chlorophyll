@@ -2307,6 +2307,17 @@ caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, siz
    return true;
 }
 
+size_t
+rwa_texture_region_bytes(const struct rwa_texture *texture, const unsigned size[3], size_t stride)
+{
+   enum pipe_format f = texture->res->format;
+   size_t row = (size_t)util_format_get_nblocksx(f, size[0]) * util_format_get_blocksize(f);
+   size_t rows = util_format_get_nblocksy(f, size[1]);
+   if (!stride) stride = row;
+   if (stride < row || !rows) return 0;
+   return (rows - 1) * stride + row;
+}
+
 int
 rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                   const unsigned origin[3], const unsigned size[3], const void *bytes,
@@ -4866,11 +4877,42 @@ rwa_finish(struct rwa_device *device, char *why, size_t why_size)
 /* Chlorophyll: asynchronous completion. rwa_flush submits what the context holds and returns its fence (NULL when nothing
  * was queued); rwa_fence_wait may be called from ANOTHER thread, since it uses only the screen (fence_finish with no
  * context), which is how a command buffer's completion runs off the encoding thread; rwa_fence_release drops it. */
+extern uint64_t darwin_submit_errors;   /* darwin_pipe.c */
+
+uint64_t
+rwa_submit_failures(void)
+{
+   return __atomic_load_n(&darwin_submit_errors, __ATOMIC_ACQUIRE);
+}
+
 struct rwa_fence *
 rwa_flush(struct rwa_device *device)
 {
    struct pipe_fence_handle *fence = NULL;
+   /* TEST ONLY (P26): fail the next Metal submit as the -EIO ioctl path does,
+    * before the kernel. The winsys ticket-test hook cleans up the submit list;
+    * never arm this in the compositor. */
+   static int submit_error_armed;
+   const char *test = getenv("BGMTL_TEST_SUBMIT_ERROR");
+   int armed = test && test[0] == '1' && !getenv("BGMTL_BB") &&
+               !__atomic_exchange_n(&submit_error_armed, 1, __ATOMIC_ACQ_REL);
+   char old_pipeline[32] = {0}, old_ticket_test[32] = {0};
+   if (armed) {
+      const char *p = getenv("SWEETCA_PIPELINE"), *t = getenv("SWEETCA_TICKET_TEST");
+      if (p) snprintf(old_pipeline, sizeof(old_pipeline), "%s", p);
+      if (t) snprintf(old_ticket_test, sizeof(old_ticket_test), "%s", t);
+      setenv("SWEETCA_PIPELINE", "2", 1);
+      setenv("SWEETCA_TICKET_TEST", "submit-error", 1);
+   }
    device->pipe->flush(device->pipe, &fence, 0);
+   if (armed) {
+      if (fence)   // the submit may run on the queue thread: let it see the hook
+         (void)device->screen->fence_finish(device->screen, device->pipe, fence, 0);
+      if (old_pipeline[0]) setenv("SWEETCA_PIPELINE", old_pipeline, 1);
+      else unsetenv("SWEETCA_PIPELINE");
+      if (old_ticket_test[0]) setenv("SWEETCA_TICKET_TEST", old_ticket_test, 1);
+      else unsetenv("SWEETCA_TICKET_TEST");
+   }
    return (struct rwa_fence *)fence;
 }
 

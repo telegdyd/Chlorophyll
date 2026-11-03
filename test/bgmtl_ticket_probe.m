@@ -28,6 +28,7 @@ extern id bgmtl_create_device(void);
 - (struct rwa_texture *)rwaSurfaceTexture;
 @end
 
+#define KIO_RETURN_ABORTED ((int)0xe00002eb)   // kIOReturnAborted
 static io_connect_t framebuffer;
 static int power(unsigned state)
 {
@@ -46,6 +47,15 @@ static int clear(struct rwa_device *dev, struct rwa_texture *texture,
    int result=!seq;
    if (cancel_after_submit) result |= power(0) || power(1);
    int seal=rwa_ticket_end(dev,generation,epoch,0,seq);
+   if (cancel_after_submit) {
+      // j0127: a cancelled frame's proven submit is ACKed by SEAL. The same
+      // seqno is idempotent; a different one is a stale rejection, not Busy.
+      int again=rwa_ticket_end(dev,generation,epoch,0,seq);
+      int stale=rwa_ticket_end(dev,generation,epoch,0,seq+1);
+      printf("  cancelled ACK: repeat 0x%x stale 0x%x\n",again,stale);
+      result |= again != 0;
+      result |= stale != KIO_RETURN_ABORTED;
+   }
    int wait=rwa_fence_wait(dev,f,why,sizeof(why));
    printf("  generation %llu epoch %llu submit %u: seal 0x%x wait %d\n",
           (unsigned long long)generation,(unsigned long long)epoch,seq,seal,wait);
@@ -102,7 +112,7 @@ int main(int argc,char **argv)
       failed |= power(1)!=0;
       [texture release]; if (surface) CFRelease(surface); [device release];
       IOServiceClose(framebuffer);
-      puts(failed ? "FAIL: ticket epoch recovery" : "PASS: normal/pre-submit/post-submit epochs, pending reuse rejection, same-backing recovery pixels");
+      puts(failed ? "FAIL: ticket epoch recovery" : "PASS: normal/pre-submit/post-submit epochs, pending reuse rejection, same-backing recovery pixels, cancelled ACK idempotence");
       return failed ? 1 : 0;
    }
 }

@@ -62,7 +62,7 @@ static void reset_ticket_end_stats(void) {
 @interface BGMTLCommandBuffer : NSObject {
  @public
    uint64_t _tgen[32],_tepoch[32]; uint32_t _tsurf[32]; unsigned _tcount;
-   uint32_t _dsurf[32]; unsigned _dcount;   // deferred while the presenter is suspended
+   uint32_t _dsurf[32]; unsigned _dcount, _ucount;   // deferred, and admitted unticketed
    BOOL _admissionFailed,_committed; BGWriteOwner *_writeOwner;
    NSError *_error; dispatch_group_t _done;
 }
@@ -94,7 +94,7 @@ static void reset_ticket_end_stats(void) {
 - (void)retire {
    bg_lock();
    for(unsigned i=0;i<_tcount;i++) if(_tgen[i]) test_ticket_end(_tgen[i],_tepoch[i],0);
-   _tcount=0; _dcount=0;
+   _tcount=0; _dcount=0; _ucount=0;
    [self bgReleaseAdmissionOwners];
    bg_unlock();
    if(_committed) dispatch_group_leave(_done);
@@ -244,7 +244,7 @@ int main(void) { @autoreleasepool {
    assert([cb bgAdmitRaw:&t[0]] && cb->_dcount==1 && cb->_tcount==0);
    [cb commitPending]; t[0].refused=-EBUSY;
    assert(![cb bgAdmitRaw:&t[0]] && cb->_admissionFailed && cb->_error);
-   assert(t[0].attempts==2 && registry_owned(cb->_writeOwner)==1);
+   assert(t[0].attempts==2 && cb->_dcount==0 && registry_owned(cb->_writeOwner)==1);
    assert(bg_suspended_reticketed==0 && bg_suspended_unticketed==0);
    // The recorded clear/dispatch is never reached when _admissionFailed is set.
    [cb retire];
@@ -310,6 +310,57 @@ int main(void) { @autoreleasepool {
    assert(ticket_end_calls==1 && registry_total()==0);
    [deferred release]; t[0].refused=0;
 
+   /* Unticketed admissions consume the same 32-destination cap: the deferred
+    * move keeps the total, a new replay destination adds one, the next fails. */
+   reset_ticket_end_stats(); reset_suspended_stats();
+   for(unsigned i=0;i<31;i++){ t[i].refused=-EAGAIN; t[i].attempts=0; }
+   cb=[BGMTLCommandBuffer new];
+   for(unsigned i=0;i<31;i++)assert([cb bgAdmitRaw:&t[i]] && !cb->_admissionFailed);
+   assert(cb->_tcount==0 && cb->_dcount==31 && cb->_ucount==0);
+   [cb commitPending];
+   assert([cb bgAdmitRaw:&t[0]] && t[0].attempts==2);   // deferred -> unticketed
+   assert(cb->_dcount==30 && cb->_ucount==1);
+   t[31].refused=-EAGAIN; t[31].attempts=0;
+   assert([cb bgAdmitRaw:&t[31]] && !cb->_admissionFailed);   // replay-discovered
+   assert(cb->_dcount==30 && cb->_ucount==2 && t[31].attempts==1);
+   t[32].refused=-EAGAIN; t[32].attempts=0;
+   assert(![cb bgAdmitRaw:&t[32]] && cb->_admissionFailed && cb->_error);
+   assert(t[32].attempts==0 && cb->_dcount==30 && cb->_ucount==2);
+   [cb retire];
+   assert(ticket_end_calls==0 && registry_total()==0);
+   [cb release];
+   for(unsigned i=0;i<33;i++)t[i].refused=0;
+
+   /* A replay reticket is rare enough to log before the 100th suspended event. */
+   reset_ticket_end_stats(); reset_suspended_stats();
+   t[0].refused=-EAGAIN; t[0].attempts=0;
+   cb=[BGMTLCommandBuffer new];
+   assert([cb bgAdmitRaw:&t[0]] && cb->_dcount==1);
+   assert(bg_suspended_events==1);
+   [cb commitPending]; t[0].refused=0;
+   assert([cb bgAdmitRaw:&t[0]] && cb->_dcount==0 && cb->_tcount==1);
+   assert(bg_suspended_reticketed==1 && bg_suspended_events==2);
+   assert(!strcmp(suspended_line(),"render tickets: display suspended: 1 deferred, 1 ticketed at replay, 0 unticketed\n"));
+   [cb retire];
    assert(registry_total()==0);
-   puts("PASS: legacy admission + deferred encode/replay (ticket, unticketed, EBUSY, ENOTSUP, replay-discovered, 32 cap, uncommitted ownership, one retry, diagnostics)");
+   [cb release]; t[0].refused=0;
+
+   /* A sealed/released producer leaves no wait behind: the same surface opens a
+    * fresh generation immediately. */
+   reset_ticket_end_stats(); reset_suspended_stats();
+   BGMTLCommandBuffer *first=[BGMTLCommandBuffer new], *again=[BGMTLCommandBuffer new];
+   t[0].refused=0; t[0].attempts=0;
+   assert([first bgAdmitRaw:&t[0]] && first->_tcount==1);
+   uint64_t first_generation=first->_tgen[0];
+   [first commitPending]; [first retire];
+   assert(ticket_end_calls==1 && registry_total()==0);
+   [first release];
+   assert([again bgAdmitRaw:&t[0]] && again->_tcount==1);
+   assert(t[0].attempts==2 && again->_tgen[0]!=first_generation);
+   [again commitPending]; [again retire];
+   assert(ticket_end_calls==2 && registry_total()==0);
+   [again release];
+
+   assert(registry_total()==0);
+   puts("PASS: legacy admission + deferred encode/replay (ticket, unticketed, EBUSY, ENOTSUP, replay-discovered, 32 cap with unticketed, uncommitted ownership, one retry, reticket log, sealed-surface reuse, diagnostics)");
 } }

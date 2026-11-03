@@ -192,6 +192,10 @@ struct rwa_texture *rwa_texture_from_surface(struct rwa_device *device,
  * region is given in texels and `stride` in bytes per row of the caller's memory; a stride
  * of 0 means tightly packed. 0, or -1 and a sentence.
  */
+/* Bytes of caller memory a 2D region of `size` texels spans at `stride` (0 = packed):
+ * every row but the last at stride, the last only as wide as the region. 0 when the
+ * stride is shorter than a row or the region is empty. */
+size_t rwa_texture_region_bytes(const struct rwa_texture *texture, const unsigned size[3], size_t stride);
 int rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
 		      const unsigned origin[3], const unsigned size[3], const void *bytes,
 		      size_t stride, char *why, size_t why_size);
@@ -600,6 +604,9 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
 struct rwa_fence;
 struct rwa_fence *rwa_flush(struct rwa_device *device);
+/* Monotonic process count of darwin submit failures; a delta across rwa_flush
+ * is that submit failing before the kernel accepted it. */
+uint64_t rwa_submit_failures(void);
 int rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why, size_t why_size);
 void rwa_fence_release(struct rwa_device *device, struct rwa_fence *fence);
 /* jasmine: the kernel's render tickets (j0110) for an imported IOSurface the GPU is about to draw: the display shows it

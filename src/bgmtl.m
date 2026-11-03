@@ -27,6 +27,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <time.h>
+#include <mach/mach.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -201,6 +202,34 @@ static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 #include "bg_upload_profile.h"
 #include "bg_nocopy_cache.h"
 
+// jasmine: caller memory (newBufferWithBytesNoCopy, newTextureWithBytesNoCopy) is read at replay. Inline that is inside
+// commit; async it is later, on the replay worker, and CoreAnimation can unmap a layer buffer (VM_MEMORY_LAYERKIT) whose
+// MTLBuffer we still retain: run9 faulted reading one such linear-texture source one byte past a live mapping. Async
+// replay reads through our own shared alias of the pages instead, which keeps them mapped until the object is freed.
+// The bytes stay the caller's (no copy); a failed remap falls back to the caller's pointer.
+static int bg_async_replay(void);
+struct bg_pin { vm_address_t base; vm_size_t size; };
+static const void *
+bg_pin_caller(const void *p, size_t length, struct bg_pin *pin)
+{
+   pin->base = 0; pin->size = 0;
+   if (!p || !length || !bg_async_replay()) return p;
+   vm_address_t start = trunc_page((vm_address_t)p), alias = 0;
+   vm_size_t size = round_page((vm_address_t)p + length) - start;
+   vm_prot_t cur, max;
+   if (vm_remap(mach_task_self(), &alias, size, 0, VM_FLAGS_ANYWHERE, mach_task_self(), start, FALSE,
+                &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS)
+      return p;
+   pin->base = alias; pin->size = size;
+   return (const uint8_t *)alias + ((vm_address_t)p - start);
+}
+static void
+bg_unpin(struct bg_pin *pin)
+{
+   if (pin->size) vm_deallocate(mach_task_self(), pin->base, pin->size);
+   pin->base = 0; pin->size = 0;
+}
+
 #define BG_MAX_BINDINGS 16
 
 // provided by the injection dylib (gpu/metal/inject), absent in the test tools
@@ -368,8 +397,11 @@ bg_install_fallback(Class c)
    void *_contents;
    NSUInteger _length;
    void *_mapped;                               // the GPU memory when _contents is a caller's (newBufferWithBytesNoCopy)
+   const void *_source;                         // where replay reads _contents: our alias of the caller's pages (bg_pin)
+   struct bg_pin _pin;
    void (^_deallocator)(void *, NSUInteger);
 }
+- (void *)bgReplayBytes;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device length:(NSUInteger)length;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device bytesNoCopy:(void *)p length:(NSUInteger)length deallocator:(void (^)(void *, NSUInteger))dealloc;
 - (struct rwa_buffer *)rwaBuffer;
@@ -417,7 +449,7 @@ bg_install_fallback(Class c)
    uint32_t _tsurf[32];
    unsigned _tcount;
    uint32_t _dsurf[32];                                      // destinations deferred while the presenter was suspended
-   unsigned _dcount;
+   unsigned _dcount, _ucount;                                // _ucount: deferred/replay destinations admitted unticketed
    BOOL _ticketDrainFailed; // retain kernel protection if submitted writes could not be drained
    BOOL _admissionFailed, _committed;
    BGWriteOwner *_writeOwner;
@@ -467,6 +499,8 @@ bg_install_fallback(Class c)
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
    NSUInteger _linOff, _linBpr;
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
+   void *_ncCaller;      // the caller's pointer itself (for its deallocator); _ncBytes may be our alias (bg_pin)
+   struct bg_pin _ncPin;
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
    struct bg_nc_cache _ncCache;
@@ -874,7 +908,8 @@ bg_air_slice(NSData *d)
       [t release];
       return nil;
    }
-   t->_ncBytes = p;
+   t->_ncCaller = p;
+   t->_ncBytes = bg_pin_caller(p, length, &t->_ncPin);
    t->_ncLength = length;
    t->_ncDealloc = dealloc ? Block_copy(dealloc) : NULL;
    return t;
@@ -1073,16 +1108,21 @@ bg_air_slice(NSData *d)
    _mapped = _contents;
    _contents = p;
    _deallocator = dealloc ? Block_copy(dealloc) : NULL;
+   _source = bg_pin_caller(p, length, &_pin);
    memcpy(_mapped, p, length);
    return self;
 }
 - (void)dealloc
 {
    if (_buf) { bg_lock(); rwa_buffer_destroy(_buf); bg_unlock(); }
+   bg_unpin(&_pin);
    if (_deallocator) { _deallocator(_contents, _length); Block_release(_deallocator); }
    [super dealloc];
 }
-- (struct rwa_buffer *)rwaBuffer { if (_mapped && _contents) memcpy(_mapped, _contents, _length); return _buf; }
+- (void *)bgReplayBytes { return _mapped && _source ? (void *)_source : _contents; }
+// A buffer outside this library (none is expected) is read through its own -contents.
+static void *bg_replay_bytes(id b) { return [b isKindOfClass:[BGMTLBuffer class]] ? [(BGMTLBuffer *)b bgReplayBytes] : [(id<MTLBuffer>)b contents]; }
+- (struct rwa_buffer *)rwaBuffer { if (_mapped && _source) memcpy(_mapped, _source, _length); return _buf; }
 - (struct rwa_buffer *)rwaAdmissionBuffer { return _buf; }
 - (void *)contents { return _contents; }
 - (NSUInteger)length { return _length; }
@@ -1280,10 +1320,10 @@ static int bg_ticket_wait(void *context)
    } else if (w->kind == BG_WORK_BUF2TEX) {
       MTLRegion dr = { { w->t_dorg[0], w->t_dorg[1], w->t_dorg[2] }, { w->t_size[0], w->t_size[1], w->t_size[2] } };
       [(BGMTLTexture *)w->dst replaceRegion:dr mipmapLevel:w->t_dlevel slice:w->t_dslice
-                                  withBytes:(uint8_t *)[(BGMTLBuffer *)w->src contents] + w->src_off bytesPerRow:w->t_bpr bytesPerImage:w->t_bpi];
+                                  withBytes:(uint8_t *)bg_replay_bytes(w->src) + w->src_off bytesPerRow:w->t_bpr bytesPerImage:w->t_bpi];
    } else {
       MTLRegion sr = { { w->t_sorg[0], w->t_sorg[1], w->t_sorg[2] }, { w->t_size[0], w->t_size[1], w->t_size[2] } };
-      [(BGMTLTexture *)w->src getBytes:(uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off bytesPerRow:w->t_bpr bytesPerImage:w->t_bpi
+      [(BGMTLTexture *)w->src getBytes:(uint8_t *)bg_replay_bytes(w->dst) + w->dst_off bytesPerRow:w->t_bpr bytesPerImage:w->t_bpi
                             fromRegion:sr mipmapLevel:w->t_slevel slice:w->t_sslice];
    }
 }
@@ -1410,7 +1450,17 @@ bg_sync_commit(void)
    // groups first, so it cannot mistake the pre-submit CB for a completed owner.
    bg_lock(); _committed = _writeOwner->committed = YES; bg_unlock();
    @synchronized (self) { if (!_admissionFailed) _status = 2; }   // Committed, or an explicit admission Error
-   if (bg_async_replay() && !bg_trace() && !bg_sync_commit()) {
+   // One positive replay-mode line per process, only where it can be read on the console.
+   static int replay_logged;
+   int async = bg_async_replay(), sync = bg_sync_commit(), trace = bg_trace();
+   if ((getenv("BGMTL_BB") || getenv("BGMTL_ASYNC")) &&
+       !__atomic_exchange_n(&replay_logged, 1, __ATOMIC_ACQ_REL)) {
+      if (async && !trace && !sync)
+         BG_LOG("BGMTL replay: async (chlorophyll.replay)\n");
+      else
+         BG_LOG("BGMTL replay: inline (async=%d sync=%d trace=%d)\n", async, sync, trace);
+   }
+   if (async && !trace && !sync) {
       static dispatch_queue_t replay;
       static dispatch_once_t once;
       dispatch_once(&once, ^{
@@ -1607,9 +1657,9 @@ bg_sync_commit(void)
          if (w->kind == BG_WORK_TEXCOPY || w->kind == BG_WORK_BUF2TEX || w->kind == BG_WORK_TEX2BUF) {
             [self bgApplyTextureBlit:w];
          } else if (w->kind == BG_WORK_COPY)
-            memmove((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, (uint8_t *)[(BGMTLBuffer *)w->src contents] + w->src_off, w->size);
+            memmove((uint8_t *)bg_replay_bytes(w->dst) + w->dst_off, (uint8_t *)bg_replay_bytes(w->src) + w->src_off, w->size);
          else
-            memset((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, w->fill, w->size);
+            memset((uint8_t *)bg_replay_bytes(w->dst) + w->dst_off, w->fill, w->size);
          bg_refresh_epoch = ++bg_refresh_epochs;   // CPU memory may have changed under a texture
       }
       // Any operation that can write a texture invalidates its CPU comparison snapshot.
@@ -1661,9 +1711,20 @@ bg_sync_commit(void)
    @synchronized (self) { if (_status != 5 && !defer_scheduled) _status = 3; }   // Scheduled
    // Even an error after an earlier draw must drain its recorded GPU work.
    // Otherwise ABORT would release the ticket while that work remained queued.
+   // The pipe flush returns void, so a failed submit is visible only as a new
+   // darwin submit error and a zero kernel seqno: without this check the
+   // zero-kfence fence "waits" trivially and the CB completes although nothing
+   // ran. rwa_fence_seqno drains the submit queue first, so the counter is
+   // current; requiring seqno 0 too keeps another thread's failure from
+   // failing this CB.
+   uint64_t submit_errors0 = rwa_submit_failures();
    struct rwa_fence *fence = rwa_flush([dev rwa]);
+   uint32_t kseqno = fence ? rwa_fence_seqno([dev rwa], fence) : 0;
+   BOOL submit_failed = fence && !kseqno && rwa_submit_failures() != submit_errors0;
+   if (submit_failed)
+      [self bgFailWith:@"GPU submit failed; command buffer did not run" code:3];
    if (_tcount) {   // jasmine: seal this command buffer's render tickets with its submit (bgTicketFor)
-      uint32_t seqno = !_admissionFailed && fence ? rwa_fence_seqno([dev rwa], fence) : 0;
+      uint32_t seqno = !_admissionFailed && !submit_failed ? kseqno : 0;
       struct bg_ticket_drain drain = { dev, fence, why, sizeof(why), _admissionFailed };
       if (bg_ticket_retire(_tgen, _tepoch, &_tcount, seqno, &drain,
                            bg_ticket_end, bg_ticket_wait)) {
@@ -1671,7 +1732,10 @@ bg_sync_commit(void)
          [self bgFailWith:@"render ticket acknowledgement failed" code:3];
       }
    }
-   [self bgReleaseAdmissionOwners];
+   // Admission entries are released at completion, not here: the kernel keeps a sealed
+   // ticket's surface busy until its submit retires, so a next writer released at replay
+   // end raced the GPU and got -EBUSY (P25, 2 of 20 inline). Kept until completion, the
+   // entry makes that writer take the one bounded wait on this producer instead.
    rwa_pass_profile_end();
    rwa_state_profile_end(); // Include the ticket's deferred-submit drain in the inventory.
    uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -1691,6 +1755,7 @@ bg_sync_commit(void)
          bg_perf_note(t_begin, t_flushed, clock_gettime_nsec_np(CLOCK_MONOTONIC), nd);
       }
       rwa_fence_release([dev rwa], fence);
+      [self bgReleaseAdmissionOwners];
       [self bgCompleteFrom:t_begin];
       dispatch_group_leave(_done);
       return;
@@ -1709,6 +1774,7 @@ bg_sync_commit(void)
             @synchronized (self) { _status = 4; }   // Completed: the fence has been paid
          uint64_t t_fence = clock_gettime_nsec_np(CLOCK_MONOTONIC);
          rwa_fence_release([dev rwa], fence);
+         [self bgReleaseAdmissionOwners];
          [self bgCompleteFrom:t_begin];
          dispatch_group_leave(_done);
          if (bg_timing()) bg_tm(BG_TM_DONE, t_flushed, t_fence, clock_gettime_nsec_np(CLOCK_MONOTONIC));
@@ -2189,7 +2255,8 @@ bg_shadow_release(struct rwa_texture *sh)
    if (_surface) CFRelease(_surface);
    if (_copySurface) CFRelease(_copySurface);
    [_linSrc release];
-   if (_ncDealloc) { _ncDealloc((void *)_ncBytes, _ncLength); Block_release(_ncDealloc); }
+   bg_unpin(&_ncPin);
+   if (_ncDealloc) { _ncDealloc(_ncCaller, _ncLength); Block_release(_ncDealloc); }
    [super dealloc];
 }
 - (void *)iosurface { return (void *)(_surface ? _surface : _copySurface); }
@@ -2315,9 +2382,18 @@ bg_shadow_release(struct rwa_texture *sh)
       bg_lock();
       char why[256] = { 0 };
       const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
-      const void *bytes = (const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff;
-      int rc = rwa_texture_write(_tex, 0, 0, o, sz, bytes, (unsigned)_linBpr, why, sizeof(why));
+      const void *bytes = (const uint8_t *)bg_replay_bytes(_linSrc) + _linOff;
       size_t length = [(BGMTLBuffer *)_linSrc length];
+      // The descriptor is the caller's claim; the buffer's length is the fact. A region
+      // past the end would be read from whatever follows it (an async replay crash on a
+      // CA layer buffer), so refuse the refresh instead.
+      size_t need = rwa_texture_region_bytes(_tex, sz, _linBpr);
+      int rc = -1;
+      if (_linOff > length || !need || need > length - _linOff)
+         snprintf(why, sizeof(why), "%ux%u region at offset %zu, %zu bytes per row spans %zu bytes of a %zu-byte buffer",
+                  sz[0], sz[1], (size_t)_linOff, (size_t)_linBpr, need, length);
+      else
+         rc = rwa_texture_write(_tex, 0, 0, o, sz, bytes, (unsigned)_linBpr, why, sizeof(why));
       [self bgUploadNote:0 bytes:bytes length:_linOff < length ? length - _linOff : 0 status:rc];
       if (rc != 0) BG_LOG("linear texture refresh: %s\n", why);
       bg_unlock();

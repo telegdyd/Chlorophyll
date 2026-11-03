@@ -12,7 +12,8 @@
  * destination is admitted unticketed and relies on the swap-time gpuSeqno capture,
  * whose submit precedes scheduled/swap. A destination first discovered at replay
  * follows the same unticketed rule. Ownership (uncommitted, replay-time, unknown or
- * quarantined owner), the 32-destination/1024-entry capacity, a stale epoch and
+ * quarantined owner), the 32-destination (ticketed, deferred or unticketed) and
+ * 1024-entry registry capacity, a stale epoch and
  * tickets-off (-ENOTSUP) or any other BEGIN result still fail the whole CB before any
  * recorded work; only the bit-3 display-unavailable case is deferred. */
 #ifndef BG_LOG
@@ -27,9 +28,10 @@ static struct { unsigned surface; BGWriteOwner *owner; uint64_t generation; }
 static unsigned bg_suspended_events, bg_suspended_deferred, bg_suspended_reticketed,
                 bg_suspended_unticketed;
 static void
-bg_suspended_event(void)
+bg_suspended_event(int force)
 {
-   if (++bg_suspended_events == 1 || bg_suspended_events % 100 == 0)
+   unsigned n = ++bg_suspended_events;
+   if (force || n == 1 || n % 100 == 0)   // a rare replay reticket is always visible
       BG_LOG("render tickets: display suspended: %u deferred, %u ticketed at replay, %u unticketed\n",
              bg_suspended_deferred, bg_suspended_reticketed, bg_suspended_unticketed);
 }
@@ -93,14 +95,17 @@ bg_suspended_event(void)
             _tgen[_tcount]=generation; _tepoch[_tcount]=epoch; _tsurf[_tcount++]=surface;
             bg_pending_writers[n].generation=generation;
             ++bg_suspended_reticketed;
+            bg_suspended_event(1);
          } else if (result == -EAGAIN) {
             _dsurf[d]=_dsurf[--_dcount];
+            ++_ucount;   // deferred -> unticketed: the total stays the same
             ++bg_suspended_unticketed;
+            bg_suspended_event(0);
          } else {
+            _dsurf[d]=_dsurf[--_dcount];
             bg_unlock();
             return [self bgAdmissionReject:[NSString stringWithFormat:@"imported destination %u BEGIN refused (%d); no writes replayed",surface,result]];
          }
-         bg_suspended_event();
          bg_unlock();
          return YES;
       }
@@ -132,7 +137,7 @@ bg_suspended_event(void)
          }
       }
    }
-   if (_tcount + _dcount == BG_MAX_WRITE_DESTINATIONS || vacant == BG_MAX_PENDING_WRITERS) {
+   if (_tcount + _dcount + _ucount >= BG_MAX_WRITE_DESTINATIONS || vacant == BG_MAX_PENDING_WRITERS) {
       bg_unlock(); return [self bgAdmissionReject:@"imported destination admission capacity exceeded"];
    }
    uint64_t generation=0,epoch=0;
@@ -143,9 +148,9 @@ bg_suspended_event(void)
       bg_pending_writers[vacant].surface=surface;
       bg_pending_writers[vacant].owner=[_writeOwner retain];
       bg_pending_writers[vacant].generation=0;
-      if (_committed) ++bg_suspended_unticketed;
+      if (_committed) { ++_ucount; ++bg_suspended_unticketed; }
       else { _dsurf[_dcount++]=surface; ++bg_suspended_deferred; }
-      bg_suspended_event();
+      bg_suspended_event(0);
       bg_unlock();
       return YES;
    }

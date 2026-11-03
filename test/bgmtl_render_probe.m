@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Spike 3: textures, samplers and a render pass on BGMTLDevice (test process only, nothing registered).
-//   bgmtl_render_probe KERNELS.metallib RENDER.metallib [--bb] [--upload-cache] [--display-off] [--display-wake-wait=FILE]
-// P23 is the display-suspended deferred-admission case; see README-display-off-admission.md for its runner.
+//   bgmtl_render_probe KERNELS.metallib RENDER.metallib [--bb] [--upload-cache] [--display-off]
+//       [--display-wake-wait=FILE] [--cancelled-seal-wait=FILE] [--pending-reuse] [--submit-error]
+// P23 is the display-suspended deferred-admission case; P24-P26 are the M7 closing cases:
+// see README-display-off-admission.md and README-m7-closing.md for their runners.
 // P1-P3 compute with textures (read, sample through a sampler, write), P4 a coloured triangle with analytic pixel checks,
 // P5 a textured quad (nearest sampler) against the texture magnified and flipped by Metal's rules.
 #import <Foundation/Foundation.h>
@@ -36,6 +38,9 @@ static id g_dev, g_queue;
 // wait on after the CB is encoded and before it is committed.
 static int g_p23_display_off;
 static const char *g_p23_wake_wait;
+// P24-P26: one mode per run; 0 runs the existing P0-P23 suite.
+static int g_only_mode;
+static const char *g_p24_wait;
 
 @interface NSObject (BGNoCopyProbe)
 - (id)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length
@@ -98,12 +103,22 @@ static BOOL flat_pixel(id texture, const uint8_t expected[4]) {
    for(unsigned i=0;i<sizeof(pixels);i++)if(pixels[i]!=expected[i%4])return NO;
    return YES;
 }
-static void admission_clear(id cb,id target) {
+static void admission_clear_rgba(id cb,id target,double r,double g,double b,double a) {
    MTLRenderPassDescriptor *d=[MTLRenderPassDescriptor renderPassDescriptor];
    d.colorAttachments[0].texture=target;d.colorAttachments[0].loadAction=MTLLoadActionClear;
    d.colorAttachments[0].storeAction=MTLStoreActionStore;
-   d.colorAttachments[0].clearColor=MTLClearColorMake(1,0,0,1);
+   d.colorAttachments[0].clearColor=MTLClearColorMake(r,g,b,a);
    [[cb renderCommandEncoderWithDescriptor:d]endEncoding];
+}
+static void admission_clear(id cb,id target) { admission_clear_rgba(cb,target,1,0,0,1); }
+// A 16x16 BGRA imported target; *surface is owned by the caller.
+static id imported_target(IOSurfaceRef *surface) {
+   const unsigned n=16;
+   *surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@(n),(id)kIOSurfaceHeight:@(n),
+      (id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@(n*4),(id)kIOSurfacePixelFormat:@(0x42475241u)});
+   MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:n height:n mipmapped:NO];
+   d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;d.storageMode=MTLStorageModeShared;
+   return *surface?[g_dev newTextureWithDescriptor:d iosurface:*surface plane:0]:nil;
 }
 // P23 runner handshake: a file marker after encoding and a file the runner
 // creates after it has powered the display back on. No power ioctl here.
@@ -125,6 +140,142 @@ static BOOL p23_wait_file(const char *path,unsigned milliseconds) {
    }
    return access(path,F_OK)==0;
 }
+
+#ifndef BGMTL_REGISTERED_PROBE
+// P24: encode a ticketed clear, commit after the runner powers the display off
+// (the display epoch cancels the SEAL; j0127 ACKs the proven submit), then reuse
+// the same backing after wake under a new epoch.
+static void
+p24_cancelled_seal(const char *base)
+{
+   @autoreleasepool {
+      const uint8_t green[]={0,255,0,255}, red[]={0,0,255,255};
+      IOSurfaceRef ts=NULL, ss=NULL;
+      id target=imported_target(&ts), scratch=imported_target(&ss), cb=nil, cb2=nil;
+      char encoded[512]={0},off[512]={0},committed[512]={0},wake[512]={0};
+      uint64_t encode_gen=0,encode_epoch=0,post_gen=0,post_epoch=0;
+      BOOL offed=NO, woken=NO;
+      int pre, post=0;
+      BOOL paths=base && p23_signal_path(encoded,sizeof(encoded),".encoded") &&
+                 p23_signal_path(off,sizeof(off),".off") &&
+                 p23_signal_path(committed,sizeof(committed),".committed") &&
+                 p23_signal_path(wake,sizeof(wake),".wake");
+      if(!target || !scratch || !paths) { CHECK(0,"P24 needs two imported targets and --cancelled-seal-wait=FILE"); goto done; }
+      unlink(encoded); unlink(off); unlink(committed); unlink(wake);
+      pre=rwa_texture_ticket_begin([scratch rwaSurfaceTexture],&encode_gen,&encode_epoch);
+      if(pre) { SKIP("P24 needs the display on at entry (BEGIN %d)",pre); goto done; }
+      CHECK(rwa_ticket_end([g_dev rwa],encode_gen,encode_epoch,1,0)==0,"P24 precheck ticket abort");
+      cb=[g_queue commandBuffer];
+      admission_clear_rgba(cb,target,green[2]/255.0,green[1]/255.0,green[0]/255.0,1);
+      CHECK(p23_write_file(encoded),"P24 write %s",encoded);
+      offed=p23_wait_file(off,60000);
+      CHECK(offed,"P24 runner power0 signal %s within 60 s",off);
+      if(!offed) goto done;
+      [cb commit]; [cb waitUntilCompleted];
+      CHECK([cb status]==MTLCommandBufferStatusCompleted && ![cb error],
+            "P24 cancelled SEAL CB must complete, status=%ld error=%s",(long)[cb status],
+            [cb error]?[[[cb error] localizedDescription]UTF8String]:"none");
+      CHECK(p23_write_file(committed),"P24 write %s",committed);
+      woken=p23_wait_file(wake,60000);
+      CHECK(woken,"P24 runner power1 signal %s within 60 s",wake);
+      if(!woken) goto done;
+      post=rwa_texture_ticket_begin([scratch rwaSurfaceTexture],&post_gen,&post_epoch);
+      if(!post && rwa_ticket_end([g_dev rwa],post_gen,post_epoch,1,0))
+         printf("  warning: P24 could not abort the post-wake probe ticket\n");
+      CHECK(post==0,"P24 display did not accept tickets after wake (BEGIN %d)",post);
+      printf("  P24 epochs: encode=%llu post-wake=%llu\n",(unsigned long long)encode_epoch,(unsigned long long)post_epoch);
+      CHECK(post==0 && post_epoch!=encode_epoch,"P24 epoch must advance across power0/power1");
+      cb2=[g_queue commandBuffer];
+      admission_clear_rgba(cb2,target,red[2]/255.0,red[1]/255.0,red[0]/255.0,1);
+      [cb2 commit]; [cb2 waitUntilCompleted];
+      CHECK([cb2 status]==MTLCommandBufferStatusCompleted && ![cb2 error] && flat_pixel(target,red),
+            "P24 same-surface reuse after cancelled ACK, status=%ld error=%s",(long)[cb2 status],
+            [cb2 error]?[[[cb2 error] localizedDescription]UTF8String]:"none");
+done:
+      [target release]; [scratch release];
+      if(ts) CFRelease(ts); if(ss) CFRelease(ss);
+   }
+}
+
+// P25: a committed producer and an immediately encoded consumer on the same
+// imported surface, in FIFO completion order; then the uncommitted-owner refusal.
+static void
+p25_pending_reuse(void)
+{
+   @autoreleasepool {
+      const uint8_t green[]={0,255,0,255}, red[]={0,0,255,255};
+      IOSurfaceRef s=NULL;
+      id target=imported_target(&s);
+      if(!target) { CHECK(0,"P25 needs an imported target"); return; }
+      unsigned bad=0;
+      for(unsigned i=0;i<20;i++) {
+         const uint8_t *c1=(i&1)?red:green, *c2=(i&1)?green:red;
+         __block int order=0, first_order=-1, second_order=-1;
+         id cb1=[g_queue commandBuffer], cb2=[g_queue commandBuffer];
+         admission_clear_rgba(cb1,target,c1[2]/255.0,c1[1]/255.0,c1[0]/255.0,1);
+         [cb1 addCompletedHandler:^(id b){ (void)b; first_order=__atomic_fetch_add(&order,1,__ATOMIC_RELAXED); }];
+         [cb1 commit];
+         admission_clear_rgba(cb2,target,c2[2]/255.0,c2[1]/255.0,c2[0]/255.0,1);
+         [cb2 addCompletedHandler:^(id b){ (void)b; second_order=__atomic_fetch_add(&order,1,__ATOMIC_RELAXED); }];
+         [cb2 commit];
+         [cb1 waitUntilCompleted]; [cb2 waitUntilCompleted];
+         if([cb1 status]!=4 || [cb1 error] || [cb2 status]!=4 || [cb2 error] ||
+            !flat_pixel(target,c2) || first_order<0 || second_order<0 || first_order>=second_order) bad++;
+      }
+      CHECK(!bad,"P25 20 pending-reuse iterations: %u bad",bad);
+      IOSurfaceRef s2=NULL;
+      id target2=imported_target(&s2);
+      if(!target2) { CHECK(0,"P25 variant needs an imported target"); [target release]; if(s) CFRelease(s); return; }
+      id cba=[g_queue commandBuffer], cbb=[g_queue commandBuffer];
+      admission_clear_rgba(cba,target2,green[2]/255.0,green[1]/255.0,green[0]/255.0,1);
+      admission_clear_rgba(cbb,target2,red[2]/255.0,red[1]/255.0,red[0]/255.0,1);
+      [cbb commit]; [cbb waitUntilCompleted];
+      [cba commit]; [cba waitUntilCompleted];
+      const char *why=[cbb error]?[[[cbb error] localizedDescription]UTF8String]:"";
+      CHECK([cbb status]==MTLCommandBufferStatusError && strstr(why,"uncommitted"),
+            "P25 uncommitted reuse must refuse CB2, status=%ld error=%s",(long)[cbb status],why);
+      CHECK([cba status]==MTLCommandBufferStatusCompleted && ![cba error] && flat_pixel(target2,green),
+            "P25 original producer must still complete with its pixels, status=%ld",(long)[cba status]);
+      [target2 release]; if(s2) CFRelease(s2);
+      [target release]; if(s) CFRelease(s);
+   }
+}
+
+// P26: the test-only submit failure must fail the CB, ABORT its ticket, and leave
+// the next imported and plain submissions working.
+static void
+p26_submit_error(void)
+{
+   @autoreleasepool {
+      if(getenv("BGMTL_BB")) { SKIP("P26 submit-error hook is ignored in the compositor (BGMTL_BB)"); return; }
+      const uint8_t green[]={0,255,0,255}, red[]={0,0,255,255};
+      IOSurfaceRef s=NULL;
+      id target=imported_target(&s);
+      if(!target) { CHECK(0,"P26 needs an imported target"); return; }
+      setenv("BGMTL_TEST_SUBMIT_ERROR","1",1);
+      id cb=[g_queue commandBuffer];
+      admission_clear_rgba(cb,target,green[2]/255.0,green[1]/255.0,green[0]/255.0,1);
+      [cb commit]; [cb waitUntilCompleted];
+      CHECK([cb status]==MTLCommandBufferStatusError && [cb error],
+            "P26 failed submit must be CB Error with an error, status=%ld",(long)[cb status]);
+      id cb2=[g_queue commandBuffer];
+      admission_clear_rgba(cb2,target,red[2]/255.0,red[1]/255.0,red[0]/255.0,1);
+      [cb2 commit]; [cb2 waitUntilCompleted];
+      CHECK([cb2 status]==MTLCommandBufferStatusCompleted && ![cb2 error] && flat_pixel(target,red),
+            "P26 next CB must reuse the ABORTed ticket and write red, status=%ld error=%s",(long)[cb2 status],
+            [cb2 error]?[[[cb2 error] localizedDescription]UTF8String]:"none");
+      id plain=tex2d(MTLPixelFormatBGRA8Unorm,16,16,MTLTextureUsageRenderTarget);
+      id cb3=[g_queue commandBuffer];
+      admission_clear_rgba(cb3,plain,green[2]/255.0,green[1]/255.0,green[0]/255.0,1);
+      [cb3 commit]; [cb3 waitUntilCompleted];
+      CHECK(plain && [cb3 status]==MTLCommandBufferStatusCompleted && ![cb3 error] && flat_pixel(plain,green),
+            "P26 plain texture CB must succeed, status=%ld error=%s",(long)[cb3 status],
+            [cb3 error]?[[[cb3 error] localizedDescription]UTF8String]:"none");
+      [plain release];
+      [target release]; if(s) CFRelease(s);
+   }
+}
+#endif
 
 int
 main(int argc, char **argv)
@@ -156,8 +307,14 @@ main(int argc, char **argv)
             g_p23_wake_wait = argv[i] + 20;
             g_p23_display_off = 1;
          }
+         // P24-P26 run only their own probe; see README-m7-closing.md.
+         if (!strncmp(argv[i], "--cancelled-seal-wait=", 22)) {
+            g_only_mode = 24; g_p24_wait = argv[i] + 22; g_p23_wake_wait = g_p24_wait;
+         }
+         if (!strcmp(argv[i], "--pending-reuse")) g_only_mode = 25;
+         if (!strcmp(argv[i], "--submit-error")) g_only_mode = 26;
       }
-      if (argc < 3) { printf("usage: bgmtl_render_probe kernels.metallib render.metallib [--bb] [--upload-cache] [--display-off] [--display-wake-wait=FILE]\n"); return 2; }
+      if (argc < 3) { printf("usage: bgmtl_render_probe kernels.metallib render.metallib [--bb] [--upload-cache] [--display-off] [--display-wake-wait=FILE] [--cancelled-seal-wait=FILE] [--pending-reuse] [--submit-error]\n"); return 2; }
       printf("== BGMTLDevice textures/render probe (iOS %s)\n", [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String]);
       g_dev = bgmtl_create_device();
 #ifdef BGMTL_REGISTERED_PROBE
@@ -170,6 +327,16 @@ main(int argc, char **argv)
       g_queue = [g_dev newCommandQueue];
       id klib = load_lib(argv[1]), rlib = load_lib(argv[2]);
       if (!g_dev || !g_queue || !klib || !rlib) return 3;
+
+#ifndef BGMTL_REGISTERED_PROBE
+      if (g_only_mode) {
+         if (g_only_mode == 24) p24_cancelled_seal(g_p24_wait);
+         else if (g_only_mode == 25) p25_pending_reuse();
+         else if (g_only_mode == 26) p26_submit_error();
+         printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
+         return g_fail ? 1 : 0;
+      }
+#endif
 
       // ---- P1: texture read in a kernel (RGBA32Float 8x8) ----
       printf("== P1 bg_tex_read\n");
