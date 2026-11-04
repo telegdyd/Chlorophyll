@@ -3,9 +3,9 @@
  * removes its entries under bg_adm_mutex. An unresolved terminal entry is quarantined
  * (surface remains set, owner NULL), never a dangling object pointer.
  *
- * Locking (M8). The table and the suspended counters are guarded by bg_adm_mutex.
- * Admission also needs bg_lock (its BEGIN reaches the context) and always takes
- * bg_lock first, then bg_adm_mutex, holding both across check + BEGIN + insert.
+ * Locking (M8, M10 C). The table and the suspended counters are guarded by bg_adm_mutex,
+ * held across check + BEGIN + insert. Encode-time admission takes only bg_adm_mutex
+ * (M10 C, see bg_adm_lock); replay-time admission runs under the replay's bg_lock.
  * Release and quarantine take only bg_adm_mutex: completion used to wait on
  * bg_lock for the whole replay of the next command buffer (fence->completed p50
  * 9.9 ms in the M8 captures) just to walk this table. Nothing under
@@ -36,8 +36,15 @@
 static struct { unsigned surface; BGWriteOwner *owner; uint64_t generation; }
    bg_pending_writers[BG_MAX_PENDING_WRITERS];
 static pthread_mutex_t bg_adm_mutex = PTHREAD_MUTEX_INITIALIZER;
-static void bg_adm_lock(void) { bg_lock(); pthread_mutex_lock(&bg_adm_mutex); }
-static void bg_adm_unlock(void) { pthread_mutex_unlock(&bg_adm_mutex); bg_unlock(); }
+/* M10 C: admission no longer takes bg_lock. BEGIN is two IOConnect calls on the device
+ * port (darwin_ticket_begin) and the BO handle is read under fd_screen_lock
+ * (rwa_texture_ticket_begin); the table, the counters and every committed flag it reads
+ * are under bg_adm_mutex. With bg_lock first, encode-time admission waited behind the
+ * whole replay of the previous command buffer (21 waits, 127 ms per 8 s capture). A
+ * replay-time admission still runs inside the replay's bg_lock; the order stays
+ * bg_lock -> bg_adm_mutex and nothing under bg_adm_mutex takes bg_lock. */
+static void bg_adm_lock(void) { pthread_mutex_lock(&bg_adm_mutex); }
+static void bg_adm_unlock(void) { pthread_mutex_unlock(&bg_adm_mutex); }
 /* Process counters for suspended admission; first event and every 100th are logged,
  * so a long display sleep cannot flood the console. Called under bg_adm_mutex. */
 static unsigned bg_suspended_events, bg_suspended_deferred, bg_suspended_reticketed,

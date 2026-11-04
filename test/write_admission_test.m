@@ -88,7 +88,8 @@ static void reset_ticket_end_stats(void) {
 }
 #include "../src/bg_write_admission.h"
 - (void)commitPending {
-   bg_lock(); _committed=_writeOwner->committed=YES; dispatch_group_enter(_done); bg_unlock();
+   pthread_mutex_lock(&bg_adm_mutex); _committed=_writeOwner->committed=YES; pthread_mutex_unlock(&bg_adm_mutex);
+   dispatch_group_enter(_done);
 }
 // The real retire seals each nonzero generation, then releases registry entries.
 // Generation 0 is a deferred/unticketed destination: no BEGIN to seal.
@@ -386,6 +387,28 @@ int main(void) { @autoreleasepool {
    [done_cb release];
    dispatch_release(held); dispatch_release(finish); dispatch_release(released);
 
+   // M10 C: encode-time admission takes only bg_adm_mutex, so it completes while
+   // another command buffer's replay holds bg_lock.
+   BGMTLCommandBuffer *enc_cb=[[BGMTLCommandBuffer alloc]init];
+   held=dispatch_semaphore_create(0); finish=dispatch_semaphore_create(0);
+   dispatch_async(dispatch_get_global_queue(0,0),^{
+      bg_lock(); dispatch_semaphore_signal(held);
+      dispatch_semaphore_wait(finish,DISPATCH_TIME_FOREVER); bg_unlock();
+   });
+   dispatch_semaphore_wait(held,DISPATCH_TIME_FOREVER);
+   dispatch_semaphore_t admitted=dispatch_semaphore_create(0);
+   __block BOOL admit_ok=NO; struct rwa_texture *t0=&t[0];
+   dispatch_async(dispatch_get_global_queue(0,0),^{
+      admit_ok=[enc_cb bgAdmitRaw:t0]; dispatch_semaphore_signal(admitted);
+   });
+   assert(!dispatch_semaphore_wait(admitted,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC)));
+   assert(admit_ok && registry_total()==1 && enc_cb->_tcount==1);
+   dispatch_semaphore_signal(finish);
+   bg_lock(); bg_unlock();
+   [enc_cb commitPending]; [enc_cb retire];
+   [enc_cb release];
+   dispatch_release(held); dispatch_release(finish); dispatch_release(admitted);
+
    assert(registry_total()==0);
-   puts("PASS: release without bg_lock; legacy admission + deferred encode/replay (ticket, unticketed, EBUSY, ENOTSUP, replay-discovered, 32 cap with unticketed, uncommitted ownership, one retry, reticket log, sealed-surface reuse, diagnostics)");
+   puts("PASS: encode admission without bg_lock; release without bg_lock; legacy admission + deferred encode/replay (ticket, unticketed, EBUSY, ENOTSUP, replay-discovered, 32 cap with unticketed, uncommitted ownership, one retry, reticket log, sealed-surface reuse, diagnostics)");
 } }

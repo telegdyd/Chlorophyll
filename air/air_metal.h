@@ -241,6 +241,11 @@ int rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer
 int rwa_texture_read_unlocked(struct rwa_texture *texture, unsigned level, unsigned layer,
 			      const unsigned origin[3], const unsigned size[3], void *bytes,
 			      size_t stride, char *why, size_t why_size);
+/* The no-context upload fast path (-replaceRegion), same return codes; gates as the
+ * readback plus: no open batch references the resource and the GPU is done with its BO. */
+int rwa_texture_write_unlocked(struct rwa_texture *texture, unsigned level, unsigned layer,
+                               const unsigned origin[3], const unsigned size[3], const void *bytes,
+                               size_t stride, char *why, size_t why_size);
 
 /* CPU no-copy images: tightly packed 2D mip levels, with optional allocation padding
  * after the last level. Validate the entire chain before reading any caller bytes.

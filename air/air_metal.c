@@ -2976,6 +2976,88 @@ rwa_texture_read_unlocked(struct rwa_texture *texture, unsigned level, unsigned 
 }
 
 /*
+ * The unlocked linear upload used by -[BGMTLTexture replaceRegion:] (M10 B): the
+ * mirror of rwa_texture_read_unlocked.  The compositor's -replaceRegion otherwise
+ * waits on bg_lock behind a whole command-buffer replay (up to ~30 ms).  Metal
+ * leaves a CPU write to a texture an uncompleted command buffer uses undefined, so
+ * an idle, linear, single-sample, uncompressed 2D resource that no open batch
+ * references can be written through its BO without the pipe_context: the gates
+ * and the BO ref are taken under fd_screen_lock, and a BO the GPU still uses
+ * (FD_BO_PREP_NOSYNC) is left to the locked path, which may shadow it instead of
+ * waiting.  Any gate failure returns RWA_READ_UNLOCKED_NOT_ELIGIBLE.
+ */
+int
+rwa_texture_write_unlocked(struct rwa_texture *texture, unsigned level, unsigned layer,
+                           const unsigned origin[3], const unsigned size[3], const void *bytes,
+                           size_t stride, char *why, size_t why_size)
+{
+   /* lifetime_collecting: the M5 access log is written under bg_lock only. */
+   if (!texture || !texture->res || !bytes || texture->device->software || lifetime_collecting()) {
+      say(why, why_size, "unlocked upload: no texture, source or GPU, or lifetime profiling");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   enum pipe_format f = texture->res->format;
+   if (texture->res->target != PIPE_TEXTURE_2D || format_is_depth_stencil(f) ||
+       texture->res->nr_samples > 1 || util_format_is_compressed(f) ||
+       util_format_get_blockwidth(f) != 1 || util_format_get_blockheight(f) != 1 ||
+       (bgr5a1_exchanged && f == PIPE_FORMAT_B5G5R5A1_UNORM)) {
+      say(why, why_size, "unlocked upload: not a plain single-sample 2D colour texture");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+
+   struct pipe_box box;
+   size_t row;
+   if (!texture_box(texture, level, layer, origin, size, &box, why, why_size) ||
+       !caller_stride(texture, &box, stride, &row, why, why_size))
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+
+   struct fd_screen *screen = fd_screen(texture->device->screen);
+   struct fd_resource *rsc = fd_resource(texture->res);
+   const size_t bsize = util_format_get_blocksize(f);
+   const size_t texel_row = (size_t)box.width * bsize;
+   uint32_t pitch, offset;
+   struct fd_bo *bo;
+
+   fd_screen_lock(screen);
+   if (fd_resource_tile_mode(texture->res, level) || fd_resource_ubwc_enabled(rsc, level) ||
+       rsc->track->write_batch || rsc->track->batch_mask || !(bo = rsc->bo)) {
+      fd_screen_unlock(screen);
+      say(why, why_size, "unlocked upload: tiled/UBWC resource, open batch, or no BO");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   pitch = fd_resource_pitch(rsc, level);
+   offset = fd_resource_offset(rsc, level, box.z);
+   if (pitch < texel_row ||
+       (size_t)offset + (size_t)box.y * pitch + (size_t)box.x * bsize +
+          (size_t)(box.height - 1) * pitch + texel_row > fd_bo_size(bo)) {
+      fd_screen_unlock(screen);
+      say(why, why_size, "unlocked upload: level/slice does not fit the BO");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   fd_bo_ref(bo);
+   fd_screen_unlock(screen);
+
+   if (fd_bo_cpu_prep(bo, NULL, FD_BO_PREP_WRITE | FD_BO_PREP_NOSYNC)) {
+      fd_bo_del(bo);
+      say(why, why_size, "unlocked upload: the GPU still uses the BO");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   uint8_t *map = fd_bo_map(bo);
+   if (!map) {
+      fd_bo_del(bo);
+      say(why, why_size, "unlocked upload: BO map failed");
+      return RWA_READ_UNLOCKED_NOT_ELIGIBLE;
+   }
+   const uint8_t *src = bytes;
+   for (int y = 0; y < box.height; y++)
+      memcpy(map + offset + (size_t)(box.y + y) * pitch + (size_t)box.x * bsize,
+             src + (size_t)y * row, texel_row);
+   rsc->valid = true;
+   fd_bo_del(bo);
+   return 0;
+}
+
+/*
  * What a depth/stencil texture holds, one aspect at a time (air_metal.h).
  *
  * The decoding is Mesa's own for the format and not arithmetic written here. That is
@@ -5441,7 +5523,12 @@ rwa_texture_ticket_begin(struct rwa_texture *texture, uint64_t *generation, uint
 {
    if (!texture || !texture->imported || !texture->res || texture->device->software)
       return -ENOTSUP;
+   /* Admission calls this without bg_lock (M10 C): read the BO under the screen lock,
+    * which fd_try_shadow_resource holds when it swaps rsc->bo. */
+   struct fd_screen *screen = fd_screen(texture->device->screen);
+   fd_screen_lock(screen);
    uint32_t handle = fd_resource(texture->res)->bo->handle;
+   fd_screen_unlock(screen);
    return darwin_ticket_begin(fd_screen(texture->device->screen)->dev, &handle, 1, generation, epoch);
 }
 

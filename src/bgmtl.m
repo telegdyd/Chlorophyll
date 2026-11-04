@@ -1764,7 +1764,8 @@ bg_sync_commit(void)
    dispatch_group_enter(_sched);
    // A registry observer may wait as soon as committed is published. Enter both
    // groups first, so it cannot mistake the pre-submit CB for a completed owner.
-   bg_lock(); _committed = _writeOwner->committed = YES; bg_unlock();
+   // Read by admission under bg_adm_mutex only (M10 C).
+   pthread_mutex_lock(&bg_adm_mutex); _committed = _writeOwner->committed = YES; pthread_mutex_unlock(&bg_adm_mutex);
    @synchronized (self) { if (!_admissionFailed) _status = 2; }   // Committed, or an explicit admission Error
    // One positive replay-mode line per process, only where it can be read on the console.
    static int replay_logged;
@@ -2949,6 +2950,23 @@ bg_texture_shape_from_descriptor(struct rwa_texture_shape *shape, MTLTextureDesc
    unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
    unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
    char why[256] = { 0 };
+   /* M10 B: a plain texture (not over an IOSurface, a shadow, a surface copy or CPU
+    * memory) is written through its idle linear BO without bg_lock, which the replay
+    * holds for a whole command buffer. Anything else, or a busy BO, takes the lock. */
+   static int unlocked_on = -1;
+   if (unlocked_on < 0) {
+      const char *v = getenv("BGMTL_UNLOCKED_UPLOAD");
+      unlocked_on = !(v && v[0] == '0');
+   }
+   if (unlocked_on && _tex && !_surface && !_surfTex && !_copySurface && !_linSrc && !_ncBytes && !_aliasBuf) {
+      static int fast_logged, slow_logged;
+      if (rwa_texture_write_unlocked(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) == 0) {
+         if (!__atomic_exchange_n(&fast_logged, 1, __ATOMIC_ACQ_REL)) BG_LOG("replaceRegion: unlocked linear fast path\n");
+         return;
+      }
+      if (!__atomic_exchange_n(&slow_logged, 1, __ATOMIC_ACQ_REL)) BG_LOG("replaceRegion: locked fallback: %s\n", why);
+      why[0] = 0;
+   }
    bg_lock();
    [self bgInvalidateUploadCache];
    if (rwa_texture_write(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("replaceRegion: %s\n", why);
