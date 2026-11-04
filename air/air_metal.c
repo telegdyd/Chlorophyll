@@ -8423,9 +8423,15 @@ extern int fd_mesa_debug __attribute__((weak_import));
 static bool
 fd5_feedback_barrier(struct pipe_context *pipe) in_dt
 {
-   static int on = -1;
-   static unsigned kept, refused[4];
+   static int on = -1, ubwc_ok = -1;
+   static unsigned kept, kept_ubwc, refused[4];
    if (on < 0) on = !(getenv("RWA_FB_BARRIER") && getenv("RWA_FB_BARRIER")[0] == '0');
+   /* M11: UBWC colour attachments (BGMTL_UBWC=1 since M9) stay in the batch too. The exclusion came with the port from
+    * libsweetca, where a5xx had no UBWC; since M9 every CA intermediate is UBWC, so every fetch flushed the context
+    * (netlog "0 kept"). PC_CCU_FLUSH_COLOR_TS writes colour and its flags back, the UCHE invalidate drops stale texels,
+    * and the fetch view samples through the flags (patch 0032). RWA_FB_BARRIER_UBWC=0 restores the flush. */
+   if (ubwc_ok < 0) ubwc_ok = !(getenv("RWA_FB_BARRIER_UBWC") && getenv("RWA_FB_BARRIER_UBWC")[0] == '0');
+   bool ubwc_att = false;
    struct fd_context *ctx = fd_context(pipe);
    struct fd_batch *batch = ctx->batch;
    int why = -1;
@@ -8446,9 +8452,14 @@ fd5_feedback_barrier(struct pipe_context *pipe) in_dt
          if (!s->texture)
             continue;
          if (s->level || s->first_layer || s->last_layer || s->texture->target != PIPE_TEXTURE_2D ||
-             s->texture->nr_samples > 1 || fd_resource_ubwc_enabled(fd_resource(s->texture), 0) ||
-             util_format_is_compressed(s->format) || util_format_is_depth_or_stencil(s->format))
+             s->texture->nr_samples > 1 || util_format_is_compressed(s->format) ||
+             util_format_is_depth_or_stencil(s->format))
             why = 3;
+         else if (fd_resource_ubwc_enabled(fd_resource(s->texture), 0)) {
+            if (!ubwc_ok)
+               why = 3;
+            ubwc_att = true;
+         }
       }
    }
    if (why >= 0) {
@@ -8479,9 +8490,11 @@ fd5_feedback_barrier(struct pipe_context *pipe) in_dt
    fd5_event_write(batch, ring, PC_CCU_INVALIDATE_COLOR, false);
    fd5_cache_flush(batch, ring);   /* UCHE invalidate, then wait for idle */
    fd_batch_needs_flush(batch);
-   if (++kept == 1 || kept % 20000 == 0)
-      fprintf(stderr, "libbgair: feedback barrier kept in the batch (%u; %u/%u/%u/%u flushed)\n", kept, refused[0],
-              refused[1], refused[2], refused[3]);
+   if (ubwc_att)
+      kept_ubwc++;
+   if (++kept == 1 || kept % 20000 == 0 || (ubwc_att && kept_ubwc == 1))
+      fprintf(stderr, "libbgair: feedback barrier kept in the batch (%u, %u UBWC; %u/%u/%u/%u flushed)\n", kept,
+              kept_ubwc, refused[0], refused[1], refused[2], refused[3]);
    return true;
 }
 #endif
